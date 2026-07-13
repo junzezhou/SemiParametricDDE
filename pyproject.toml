@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semidde"
+version = "0.1.0"
+description = "Semi-parametric and copula Deep Discrete Encoder models"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "SemiDDE contributors" }
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "joblib",
+]
+
+[project.optional-dependencies]
+init = [
+  "factor-analyzer",
+]
+dev = [
+  "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

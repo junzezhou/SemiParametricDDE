@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+build/
+dist/
+src/*.egg-info/
+src/semidde.egg-info/
+.ipynb_checkpoints/
+
+tmp/
