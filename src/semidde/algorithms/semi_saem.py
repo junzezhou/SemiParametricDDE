@@ -22,62 +22,10 @@ Python list indexing (0-based):
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import logsumexp as _logsumexp
-from semidde.utils import binary, g_est_rversion
+from semidde.utils import TLP, binary, logistic, patterns_to_int, thres, g_est_rversion
 from .normal_init_semi import Normal_init_semi
- 
- 
-# ============================================================
-#  Utility functions
-# ============================================================
- 
-def logistic(x):
-    """Numerically stable sigmoid."""
-    x = np.asarray(x, dtype=float)
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
- 
- 
-def TLP(x, tau):
-    return np.sum(np.minimum(np.abs(x) / tau, 1.0))
- 
- 
-def thres(B, tau):
-    return B * (np.abs(B) >= tau)
- 
- 
-def binary(indices, n_bits):
-    """Integer indices → (M, n_bits) binary matrix (MSB first)."""
-    indices = np.asarray(indices, dtype=np.int64)
-    shifts = np.arange(n_bits - 1, -1, -1, dtype=np.int64)
-    return ((indices[:, None] >> shifts) & 1).astype(float)
- 
- 
-def patterns_to_int(A):
-    """(M, K) binary matrix → (M,) int64  (MSB-first, K ≤ 62)."""
-    A = np.asarray(A, dtype=np.int64)
-    K = A.shape[1]
-    weights = np.int64(1) << np.arange(K - 1, -1, -1, dtype=np.int64)
-    return A @ weights
- 
- 
-# ============================================================
-#  Negative log-likelihood factories
-# ============================================================
- 
-def _make_obs_negloglik(Xj, A1_samples, N, K1, C):
-    def f(x):
-        eta = np.tensordot(A1_samples, x, axes=([1], [0]))
-        return np.sum((Xj[:, None] - eta) ** 2) / C
-    return f
- 
- 
-def _make_bern_negloglik(Yk, A_upper_samples, N, K_upper, C):
-    def f(x):
-        eta = np.tensordot(A_upper_samples, x, axes=([1], [0]))
-        eta = np.clip(eta, -500, 500)
-        return -(np.sum(Yk * eta) - np.sum(np.log(1.0 + np.exp(eta)))) / C
-    return f
- 
- 
+  
+  
 # MARK: Original SA objective accumulation built a nested closure chain, so each
 # objective evaluation became more expensive as the SAEM inner iteration grew.
 # def _sa_accumulate(f_old, f_new, t):
@@ -242,15 +190,10 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
         gamma_update = np.zeros(J)
         for j in range(J):
             Xj = X[:, j]
-            # MARK: Original code accumulated closures, causing objective
-            # evaluation time to grow with the number of inner SAEM iterations.
-            # f_loglik = _make_obs_negloglik(Xj, A_samples[0], N, K[0], C)
-            # f_acc_obs[j] = _sa_accumulate(f_acc_obs[j], f_loglik, t)
-            # _fj, _pen = f_acc_obs[j], pen_list[0]
             f_acc_obs[j].update(A_samples[0], t)
             _fj, _pen = f_acc_obs[j], pen_list[0]
             def obj(x, __fj=_fj, __pen=_pen):
-                return __fj(x) + __pen * TLP(x[1:], tau)
+                return __fj(x) + (__pen / tau) * TLP(x[1:], tau)
             bounds = [(-bound_val, bound_val)] * (K[0] + 1)
             res = minimize(obj, B_list[0][j, :], method='L-BFGS-B',
                            bounds=bounds, options={'maxiter': 10})
@@ -264,21 +207,11 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
             B_d_upd = np.zeros_like(B_list[d_idx])
             for k in range(n_rows):
                 Yk = A_samples[d_idx - 1][:, k + 1, :]
-                # MARK: Original code accumulated Bernoulli objectives as nested
-                # closures. The replacement stores running averages of pattern
-                # counts and successes, yielding the same logistic objective with
-                # constant evaluation cost per optimizer call.
-                # f_loglik = _make_bern_negloglik(
-                #     Yk, A_samples[d_idx], N, K[d_idx], C)
-                # bidx = d_idx - 1
-                # f_acc_bern[bidx][k] = _sa_accumulate(
-                #     f_acc_bern[bidx][k], f_loglik, t)
-                # _fk, _pen = f_acc_bern[bidx][k], pen_list[d_idx]
                 bidx = d_idx - 1
                 f_acc_bern[bidx][k].update(Yk, A_samples[d_idx], t)
                 _fk, _pen = f_acc_bern[bidx][k], pen_list[d_idx]
                 def obj(x, __fk=_fk, __pen=_pen):
-                    return __fk(x) + __pen * TLP(x[1:], tau)
+                    return __fk(x) + (__pen / tau) * TLP(x[1:], tau)
                 bounds = [(-bound_val, bound_val)] * (K[d_idx] + 1)
                 res = minimize(obj, B_list[d_idx][k, :], method='L-BFGS-B',
                                bounds=bounds, options={'maxiter': 10})

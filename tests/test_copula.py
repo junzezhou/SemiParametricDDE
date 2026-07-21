@@ -1,10 +1,10 @@
 import numpy as np
 import pytest
 
-from semidde.algorithms.copula_D import (
-    fit_copula_dde_D,
-    normal_initialize_copula_dde_D,
-    prepare_rank_likelihood_inputs_D,
+from semidde.algorithms.copula import (
+    fit_copula_dde,
+    normal_initialize_copula_dde,
+    prepare_rank_likelihood_inputs,
 )
 from semidde.copula import format_estimates_D, implied_Z_moments_D, rescale_B1_D
 from semidde.simulation import generate_X_Cop_marg_emp_D
@@ -26,7 +26,7 @@ def _make_parameters(J, K_list, seed=123):
 
 
 @pytest.mark.parametrize("K_list", [[2], [6, 2], [18, 6, 2]])
-def test_generate_copula_D_shapes(K_list):
+def test_generate_copula_shapes(K_list):
     J = max(6, 3 * K_list[0])
     N = 20
     prop, B_list, gamma = _make_parameters(J, K_list)
@@ -47,7 +47,7 @@ def test_generate_copula_D_shapes(K_list):
 
 
 @pytest.mark.parametrize("K_list", [[2], [6, 2], [18, 6, 2]])
-def test_fit_copula_dde_D_fixed_smoke(K_list):
+def test_fit_copula_dde_fixed_smoke(K_list):
     J = max(6, 3 * K_list[0])
     N = 18
     prop, B_list, gamma = _make_parameters(J, K_list)
@@ -59,10 +59,10 @@ def test_fit_copula_dde_D_fixed_smoke(K_list):
         B_list=B_list,
         random_state=43,
     )
-    Z, R, Rlevels = prepare_rank_likelihood_inputs_D(sim["X"])
-    init = normal_initialize_copula_dde_D(sim["X"], K_list, Z=Z)
+    Z, R, Rlevels = prepare_rank_likelihood_inputs(sim["X"])
+    init = normal_initialize_copula_dde(sim["X"], K_list, Z=Z)
 
-    result = fit_copula_dde_D(
+    result = fit_copula_dde(
         sim["X"],
         K_list=K_list,
         dimension_method="fixed",
@@ -90,7 +90,7 @@ def test_fit_copula_dde_D_fixed_smoke(K_list):
     assert result.gamma.shape == (J,)
 
 
-def test_normal_initialize_copula_dde_D_and_default_fit(capsys):
+def test_normal_initialize_copula_dde_and_default_fit(capsys):
     J = 18
     N = 28
     K_list = [6, 2]
@@ -103,16 +103,16 @@ def test_normal_initialize_copula_dde_D_and_default_fit(capsys):
         B_list=B_list,
         random_state=45,
     )
-    Z, R, Rlevels = prepare_rank_likelihood_inputs_D(sim["X"])
+    Z, R, Rlevels = prepare_rank_likelihood_inputs(sim["X"])
 
-    init = normal_initialize_copula_dde_D(sim["X"], K_list, Z=Z)
+    init = normal_initialize_copula_dde(sim["X"], K_list, Z=Z)
     assert [B.shape for B in init["B_list"]] == [B.shape for B in B_list]
     assert [A.shape for A in init["A_list"]] == [(N, k) for k in K_list]
     assert init["prop"].shape == (K_list[-1],)
     assert init["gamma"].shape == (J,)
     assert init["used_oracle"] is False
 
-    result = fit_copula_dde_D(
+    result = fit_copula_dde(
         sim["X"],
         K_list=K_list,
         dimension_method="fixed",
@@ -130,10 +130,10 @@ def test_normal_initialize_copula_dde_D_and_default_fit(capsys):
     )
     assert [B.shape for B in result.B_list] == [B.shape for B in B_list]
     assert [A.shape for A in result.A_list] == [(N, k) for k in K_list]
-    assert "CopDDE initialization: triggered using initialize='data'." in capsys.readouterr().out
+    assert "CopDDE initialization:" not in capsys.readouterr().out
 
 
-def test_fit_copula_dde_D_csp_uses_canonical_kernel():
+def test_fit_copula_dde_csp_uses_canonical_kernel():
     J = 54
     N = 20
     K_list = [18, 6, 2]
@@ -146,10 +146,10 @@ def test_fit_copula_dde_D_csp_uses_canonical_kernel():
         B_list=B_list,
         random_state=46,
     )
-    Z, R, Rlevels = prepare_rank_likelihood_inputs_D(sim["X"])
-    init = normal_initialize_copula_dde_D(sim["X"], K_list, Z=Z)
+    Z, R, Rlevels = prepare_rank_likelihood_inputs(sim["X"])
+    init = normal_initialize_copula_dde(sim["X"], K_list, Z=Z)
 
-    result = fit_copula_dde_D(
+    result = fit_copula_dde(
         sim["X"],
         K_list=K_list,
         dimension_method="csp",
@@ -168,9 +168,12 @@ def test_fit_copula_dde_D_csp_uses_canonical_kernel():
         verbose=False,
         optimizer_maxiter=2,
     )
-    assert result.diagnostics["backend"] == "csp_D"
+    assert result.diagnostics["backend"] == "csp"
     assert result.diagnostics["threshold_rule"] == "first_two_layers"
     assert result.diagnostics["num_active"].shape == (len(K_list),)
+    assert result.diagnostics["original_K_list"] == tuple(K_list)
+    assert result.diagnostics["K_list"] == tuple(B.shape[1] - 1 for B in result.B_list)
+    assert "active_columns_original_index" in result.diagnostics
     assert "trace" not in result.raw
 
 

@@ -406,7 +406,7 @@ def main() -> None:
     args = parse_args()
     _ensure_semidde_on_path()
     from semidde import select_hyperparameters
-    from semidde.algorithms.copula_D import normal_initialize_copula_dde_D
+    from semidde.algorithms.copula import normal_initialize_copula_dde
     from semidde.copula import simulate_gaussian_mixture
 
     data = load_b5_data(args.sav_path)
@@ -415,7 +415,7 @@ def main() -> None:
         data.X_filled.shape[1],
         random_state=int(args.random_state),
     )
-    init = normal_initialize_copula_dde_D(
+    init = normal_initialize_copula_dde(
         data.X_filled,
         data.K_list,
         Z=Z_init,

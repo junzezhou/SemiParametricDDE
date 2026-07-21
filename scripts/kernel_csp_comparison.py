@@ -15,7 +15,7 @@ SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from semidde.algorithms.copula_D import normal_initialize_copula_dde_D
+from semidde.algorithms.copula import normal_initialize_copula_dde
 from semidde.copula import rescale_B1_D, simulate_gaussian_mixture
 from semidde.simulation import generate_X_Cop_marg_emp_D
 
@@ -175,7 +175,7 @@ def initialize_state(scenario, N, rep_index, seed_base):
     X = generated["X"]
     R, Rlevels = compute_rank_matrix(X)
     Z_init = simulate_gaussian_mixture(X, int(scenario["J"]), random_state=seed)
-    init = normal_initialize_copula_dde_D(
+    init = normal_initialize_copula_dde(
         X,
         scenario["K_fit"],
         Z=Z_init,

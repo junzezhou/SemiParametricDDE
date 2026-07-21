@@ -26,6 +26,7 @@ def fit_semidde(Y, *, K_list=None, dimension_method="fixed", **kwargs: Any) -> D
 
     init_keys = ["X_in", "prop_in", "B_list_in", "gamma_in", "A_list_in"]
     needs_initialization = any(name not in kwargs for name in init_keys)
+    verbose = bool(kwargs.get("verbose", True))
     initialize = kwargs.pop("initialize", "data")
     legacy_mode = kwargs.pop("initialization_mode", kwargs.pop("init_mode", None))
     if legacy_mode is not None:
@@ -47,7 +48,8 @@ def fit_semidde(Y, *, K_list=None, dimension_method="fixed", **kwargs: Any) -> D
         epsilon = kwargs.pop("epsilon", 1e-4)
         X_init = rank_gaussianize_columns(Y)
         if initialization_mode == "oracle":
-            print("SemiDDE initialization: triggered using initialize='oracle'.")
+            if verbose:
+                print("SemiDDE initialization: triggered using initialize='oracle'.")
             B_list_true = kwargs.pop("B_list_true")
             G_list_true = kwargs.pop("G_list_true")
             prop, B_list, gamma, A_list, _ = Normal_init_semi(
@@ -63,7 +65,8 @@ def fit_semidde(Y, *, K_list=None, dimension_method="fixed", **kwargs: Any) -> D
                 kwargs.setdefault("final_refit_B_list_true", B_list_true)
                 kwargs.setdefault("final_refit_G_list_true", G_list_true)
         elif initialization_mode == "data":
-            print("SemiDDE initialization: triggered using initialize='data'.")
+            if verbose:
+                print("SemiDDE initialization: triggered using initialize='data'.")
             if kwargs.get("final_refit", False):
                 raise ValueError("final_refit=True requires initialize='oracle'.")
             prop, B_list, gamma, A_list, _ = Normal_init_semi(
@@ -74,7 +77,8 @@ def fit_semidde(Y, *, K_list=None, dimension_method="fixed", **kwargs: Any) -> D
                 mode="data",
             )
         elif initialization_mode == "none":
-            print("SemiDDE initialization: not triggered; initialized arguments are incomplete.")
+            if verbose:
+                print("SemiDDE initialization: not triggered; initialized arguments are incomplete.")
             pass
         else:
             raise ValueError("initialize must be 'data' or 'oracle'.")
@@ -85,7 +89,8 @@ def fit_semidde(Y, *, K_list=None, dimension_method="fixed", **kwargs: Any) -> D
             kwargs.setdefault("gamma_in", gamma)
             kwargs.setdefault("A_list_in", A_list)
     else:
-        print("SemiDDE initialization: not triggered; using supplied initialized arguments.")
+        if verbose:
+            print("SemiDDE initialization: not triggered; using supplied initialized arguments.")
 
     required = ["X_in", "prop_in", "B_list_in", "gamma_in", "pen_list", "tau", "A_list_in", "tol", "C"]
     missing = [name for name in required if name not in kwargs]

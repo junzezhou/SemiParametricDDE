@@ -97,7 +97,7 @@ def test_fit_semidde_initialize_data_mode_smoke(capsys):
 
     assert result.prop.shape == (2,)
     assert [A.shape for A in result.A_list] == [(N, 6), (N, 2)]
-    assert "SemiDDE initialization: triggered using initialize='data'." in capsys.readouterr().out
+    assert "SemiDDE initialization:" not in capsys.readouterr().out
 
 
 def test_fit_semidde_complete_initial_values_bypass_initialize_method(capsys):
@@ -132,4 +132,4 @@ def test_fit_semidde_complete_initial_values_bypass_initialize_method(capsys):
     )
 
     assert result.prop.shape == (2,)
-    assert "SemiDDE initialization: not triggered" in capsys.readouterr().out
+    assert "SemiDDE initialization:" not in capsys.readouterr().out
