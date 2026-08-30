@@ -1,13 +1,13 @@
 import numpy as np
 import pytest
 
-from semidde.algorithms.copula import (
+from dde.algorithms.copula import (
     fit_copula_dde,
     normal_initialize_copula_dde,
     prepare_rank_likelihood_inputs,
 )
-from semidde.copula import format_estimates_D, implied_Z_moments_D, rescale_B1_D
-from semidde.simulation import generate_X_Cop_marg_emp_D
+from dde.copula import format_estimates_D, implied_Z_moments_D, rescale_B1_D
+from dde.simulation import generate_X_Cop_marg_emp_D
 
 
 def _make_parameters(J, K_list, seed=123):

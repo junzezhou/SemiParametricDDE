@@ -65,6 +65,7 @@ def compress_csp_result_components(
     A_list,
     diagnostics: Dict[str, Any] | None = None,
     raw: Any = None,
+    active_masks=None,
     active_tol: float = 1e-12,
     min_active: bool = True,
 ) -> Dict[str, Any]:
@@ -89,7 +90,23 @@ def compress_csp_result_components(
         }
 
     original_K_list = tuple(int(B.shape[1] - 1) for B in B_arrays)
-    masks, forced = _active_masks_from_B(B_arrays, active_tol=active_tol, min_active=min_active)
+    if active_masks is None:
+        masks, forced = _active_masks_from_B(
+            B_arrays, active_tol=active_tol, min_active=min_active
+        )
+    else:
+        if len(active_masks) != len(B_arrays):
+            raise ValueError("active_masks length must match B_list length.")
+        masks = []
+        for d, (mask, B) in enumerate(zip(active_masks, B_arrays)):
+            mask_array = np.asarray(mask, dtype=bool).reshape(-1)
+            expected = B.shape[1] - 1
+            if mask_array.shape != (expected,):
+                raise ValueError(
+                    f"active_masks[{d}] shape {mask_array.shape} must be {(expected,)}."
+                )
+            masks.append(mask_array.copy())
+        forced = [False] * len(B_arrays)
     active_index = {
         f"layer_{d + 1}": (np.flatnonzero(mask) + 1).astype(int).tolist()
         for d, mask in enumerate(masks)

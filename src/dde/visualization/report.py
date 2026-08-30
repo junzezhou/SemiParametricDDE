@@ -7,7 +7,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
-from semidde.results import DDEResult
+from dde.results import DDEResult
 
 
 MODEL_CONFIG = {
@@ -38,8 +38,8 @@ def _deps():
     import os
     import tempfile
 
-    os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "semidde-matplotlib"))
-    os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "semidde-cache"))
+    os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "dde-matplotlib"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "dde-cache"))
     try:
         import matplotlib
 
@@ -49,7 +49,7 @@ def _deps():
     except ImportError as exc:  # pragma: no cover - depends on optional install
         raise ImportError(
             "SemiDDE visualization requires the optional dependencies "
-            "`matplotlib` and `pandas`. Install with `pip install semidde[viz]` "
+            "`matplotlib` and `pandas`. Install with `pip install dde[viz]` "
             "or install those packages directly."
         ) from exc
     return plt, pd

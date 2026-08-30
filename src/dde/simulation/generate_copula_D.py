@@ -9,7 +9,7 @@ from scipy.special import expit
 from scipy.stats import gamma as gamma_dist
 from scipy.stats import poisson, rankdata
 
-from semidde.utils import validate_dde_lists
+from dde.utils import validate_dde_lists
 
 
 def _as_rng(random_state=None) -> np.random.Generator:
@@ -119,4 +119,3 @@ def generate_X_Cop_marg_emp_D(
 
 
 __all__ = ["generate_X_Cop_marg_emp_D", "simulate_latent_layers_D"]
-

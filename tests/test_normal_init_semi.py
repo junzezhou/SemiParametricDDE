@@ -1,8 +1,12 @@
 import numpy as np
 
-from semidde.algorithms.normal_init_semi import Normal_init_semi, rank_gaussianize_columns
-from semidde.algorithms.semi import fit_semidde
-from semidde.simulation import generate_X_normal
+from dde.algorithms.normal_init_semi import (
+    Normal_init_semi,
+    _normal_residual_variance,
+    rank_gaussianize_columns,
+)
+from dde.algorithms.semi import fit_semidde
+from dde.simulation import generate_X_normal
 
 
 def _make_normal_params(J, K_list, seed=321):
@@ -35,6 +39,17 @@ def test_rank_gaussianize_columns_shape_and_finiteness():
     assert X0[1, 1] == 0.0
 
 
+def test_chunked_initial_residual_variance_matches_single_block():
+    rng = np.random.default_rng(1013)
+    N, J, K = 31, 19, 5
+    X = rng.normal(size=(N, J))
+    A = rng.integers(0, 2, size=(N, K), dtype=np.uint8)
+    B = rng.normal(size=(J, K + 1))
+    expected = _normal_residual_variance(X, A, B, row_chunk_size=None)
+    actual = _normal_residual_variance(X, A, B, row_chunk_size=7)
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
 def test_normal_init_semi_shapes_D1_to_D3():
     for K_list in ([2], [3, 1], [6, 2], [18, 6, 2]):
         N, J = 40, max(12, 3 * K_list[0])
@@ -50,6 +65,7 @@ def test_normal_init_semi_shapes_D1_to_D3():
         assert prop.shape == (K_list[-1],)
         assert gamma.shape == (J,)
         assert [A.shape for A in A_list] == [(N, k) for k in K_list]
+        assert all(A.dtype == np.uint8 for A in A_list)
         expected_B = [(J, K_list[0] + 1)] + [
             (K_list[d - 1], K_list[d] + 1) for d in range(1, len(K_list))
         ]
@@ -73,6 +89,7 @@ def test_normal_init_semi_data_mode_does_not_need_oracle():
     assert prop.shape == (K_list[-1],)
     assert gamma.shape == (J,)
     assert [A.shape for A in A_list] == [(N, k) for k in K_list]
+    assert all(A.dtype == np.uint8 for A in A_list)
     assert [B.shape for B in B_list] == [(J, 7), (6, 3)]
     assert err_G_list == [None, None]
 

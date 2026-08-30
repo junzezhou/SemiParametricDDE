@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.special import expit
 
-from semidde.utils import validate_dde_lists
+from dde.utils import validate_dde_lists
 
 
 def _binary_configurations(k: int) -> np.ndarray:
@@ -103,4 +103,3 @@ def rescale_B1_D(prop, B_list, gamma, emp=False, Z=None):
 
 
 __all__ = ["implied_Z_moments_D", "iter_latent_configurations_D", "rescale_B1_D"]
-

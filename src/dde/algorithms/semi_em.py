@@ -4,9 +4,9 @@ from scipy.special import expit, logit, logsumexp
 from scipy.optimize import minimize
 from scipy.stats import norm
 
-from semidde.utils import TLP, binary, compute_propA_U, g_est_rversion, thres
-from semidde.algorithms.f1_saem import F_1_SAEM
-from semidde.algorithms.f2_saem import F_2_SAEM
+from dde.utils import TLP, binary, compute_propA_U, g_est_rversion, thres
+from dde.algorithms.f1_saem import F_1_SAEM
+from dde.algorithms.f2_saem import F_2_SAEM
 
 
 def _logistic(x):

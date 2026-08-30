@@ -7,10 +7,10 @@ from typing import Any, Optional, Sequence
 import numpy as np
 from scipy.stats import norm, rankdata
 
-from semidde.copula import simulate_gaussian_mixture
-from semidde.results import DDEResult
-from semidde.utils import validate_dde_lists
-from semidde.utils.result_compression import compress_csp_result_components
+from dde.copula import simulate_gaussian_mixture
+from dde.results import DDEResult
+from dde.utils import validate_dde_lists
+from dde.utils.result_compression import compress_csp_result_components
 
 from .get_SAEM_RL_CSP_D import get_SAEM_RL_CSP_D
 from .get_SAEM_RL_D import get_SAEM_RL_D
@@ -219,6 +219,7 @@ def fit_copula_dde(
 
     return DDEResult(
         model="copula",
+        K_list=list(diagnostics["K_list"]),
         prop=raw["prop"],
         B_list=raw["B_list"],
         gamma=raw["gamma"],

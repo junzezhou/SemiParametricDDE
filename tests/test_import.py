@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from semidde import DDEResult, fit
-from semidde.utils import TLP, binary, logistic, thres
+from dde import DDEResult, fit
+from dde.utils import TLP, binary, logistic, thres
 
 
 def test_public_imports():

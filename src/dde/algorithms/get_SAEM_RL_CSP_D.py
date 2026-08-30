@@ -22,8 +22,10 @@ from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import minimize
-from scipy.special import expit, gammaln
+from scipy.special import expit
 from scipy.stats import norm
+
+from .csp import update_csp_layer
 
 try:
     from joblib import Parallel, delayed
@@ -33,7 +35,6 @@ except Exception:  # pragma: no cover
 
 
 _EPS_PROB = 1e-12
-_FLOAT_TINY = np.finfo(float).tiny
 
 
 @dataclass(frozen=True)
@@ -363,47 +364,7 @@ def _optimize_logistic_layer(
     return np.vstack(_maybe_parallel_map(solve_row, range(K_child), n_jobs))
 
 
-def _update_csp_layer(B_d, omega, theta_inf, theta_slab, num_rows):
-    Kd = B_d.shape[1] - 1
-    L = Kd + 1
-    abs_sum = np.sum(np.abs(B_d[:, 1:]), axis=0)
-    log_dens_spike = -num_rows * np.log(2.0 * theta_inf) - abs_sum / theta_inf
-    log_dens_slab = (
-        np.log(5.0)
-        - num_rows * np.log(2.0)
-        + gammaln(1.0 + num_rows)
-        - (1.0 + num_rows) * np.log(5.0 + abs_sum)
-    )
-    log_omega = np.log(np.maximum(omega, _FLOAT_TINY))
-
-    prob_mat = np.empty((Kd, L), dtype=float)
-    for h in range(Kd):
-        log_probs = log_omega.copy()
-        log_probs[: h + 1] += log_dens_spike[h]
-        log_probs[h + 1 :] += log_dens_slab[h]
-        probs = np.exp(log_probs - np.max(log_probs))
-        prob_mat[h, :] = probs / np.sum(probs)
-
-    z = np.argmax(prob_mat, axis=1) + 1
-    alpha = Kd
-    v = np.zeros(L, dtype=float)
-    for ell in range(1, Kd + 1):
-        n_l = np.sum(z == ell)
-        n_gtl = np.sum(z > ell)
-        v[ell - 1] = np.random.beta(1.0 + n_l, alpha + n_gtl)
-    v[L - 1] = 1.0
-    omega = v * np.concatenate(([1.0], np.cumprod(1.0 - v[:-1])))
-
-    theta_slab = theta_slab.copy()
-    for h in range(Kd):
-        if z[h] > (h + 1):
-            shape_post = 1.0 + num_rows
-            rate_post = 5.0 + np.sum(np.abs(B_d[:, h + 1]))
-            theta_slab[h] = 1.0 / np.random.gamma(shape_post, 1.0 / rate_post)
-
-    theta_col = np.where(z <= np.arange(1, Kd + 1), theta_inf, theta_slab)
-    theta = np.broadcast_to(theta_col[None, :], (B_d.shape[0], Kd)).copy()
-    return z, theta, theta_slab, omega
+_update_csp_layer = update_csp_layer
 
 
 def get_SAEM_RL_CSP_D(

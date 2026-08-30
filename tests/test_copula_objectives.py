@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.special import expit
 
-import semidde.algorithms.get_SAEM_RL_CSP_D as copula_csp_D
+import dde.algorithms.get_SAEM_RL_CSP_D as copula_csp_D
 
 
 def test_copula_d_gaussian_objective_value_and_gradient():

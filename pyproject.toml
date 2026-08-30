@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "semidde"
+name = "dde"
 version = "0.1.0"
-description = "Semi-parametric and copula Deep Discrete Encoder models"
+description = "Deep Discrete Encoder models"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
-  { name = "SemiDDE contributors" }
+  { name = "DDE contributors" }
 ]
 dependencies = [
   "numpy",

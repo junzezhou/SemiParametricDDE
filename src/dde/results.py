@@ -8,7 +8,7 @@ import numpy as np
 
 @dataclass
 class DDEResult:
-    """Standard result object returned by :func:`semidde.fit`.
+    """Standard result object returned by :func:`dde.fit`.
 
     The algorithm-specific raw return value is kept in ``raw`` so that the
     first package version stays faithful to the research implementations while
@@ -16,6 +16,7 @@ class DDEResult:
     """
 
     model: str
+    K_list: Optional[List[int]] = None
     prop: Optional[np.ndarray] = None
     B_list: Optional[List[np.ndarray]] = None
     gamma: Optional[np.ndarray] = None
@@ -23,4 +24,3 @@ class DDEResult:
     transformed: Optional[np.ndarray] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     raw: Any = None
-

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
-from semidde.results import DDEResult
+from dde.results import DDEResult
 
 from .report import (
     plot_latent_profiles,

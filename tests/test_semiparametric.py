@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.stats import norm
 
-from semidde.utils.semiparametric import g_est_rversion
+from dde.utils.semiparametric import g_est_rversion
 
 
 def legacy_g_est_rversion(y, z, n, p, K, pro0, delta0):

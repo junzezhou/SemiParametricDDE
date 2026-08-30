@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from semidde.results import DDEResult
+from dde.results import DDEResult
 
 from .normal_init_semi import Normal_init_semi, rank_gaussianize_columns
 from .semi_em import get_EM_est
@@ -103,6 +103,7 @@ def fit_semidde(Y, *, K_list=None, dimension_method="fixed", **kwargs: Any) -> D
     X, prop, B_list, gamma, A_list, itera = get_SAEM_semiparametricv1(Y=Y, **kwargs)
     return DDEResult(
         model="semi",
+        K_list=[int(B.shape[1] - 1) for B in B_list],
         prop=prop,
         B_list=B_list,
         gamma=gamma,

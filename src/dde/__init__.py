@@ -1,4 +1,4 @@
-"""Public API for the semidde package."""
+"""Public API for the dde package."""
 
 from .api import fit
 from .model_selection import (

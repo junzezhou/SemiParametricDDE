@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from semidde.copula.rescale_b1_cop_D import rescale_B1_D
-from semidde.utils import validate_dde_lists
-from semidde.utils.munkres import munkres
+from dde.copula.rescale_b1_cop_D import rescale_B1_D
+from dde.utils import validate_dde_lists
+from dde.utils.munkres import munkres
 
 
 def _assignment_from_cost(costmat: np.ndarray) -> np.ndarray:
@@ -86,4 +86,3 @@ def format_estimates_D(
 
 
 __all__ = ["format_estimates_D"]
-

@@ -1,9 +1,9 @@
 import numpy as np
 
-from semidde.results import DDEResult
-from semidde.visualization import visualization_report
-from semidde.visualization.copula import make_copula_visualization_report
-from semidde.visualization.semi import make_semi_visualization_report
+from dde.results import DDEResult
+from dde.visualization import visualization_report
+from dde.visualization.copula import make_copula_visualization_report
+from dde.visualization.semi import make_semi_visualization_report
 
 
 def _result(model):

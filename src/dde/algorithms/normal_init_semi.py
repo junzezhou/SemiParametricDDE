@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.sparse.linalg import svds as truncated_svds
 from scipy.linalg import svd
-from semidde.utils import logit, thres
+from dde.utils import logit, thres
 from scipy.optimize import linear_sum_assignment
 from scipy.stats import rankdata, norm
 from sklearn.cluster import KMeans
@@ -86,7 +86,7 @@ def _truncated_svd(M, k):
     # scipy.sparse.linalg.svds requires k < min(m, n)
     if k < min(m, n) - 1:
         try:
-            U, S, Vt = truncated_svds(M.astype(np.float64), k=k)
+            U, S, Vt = truncated_svds(np.asarray(M, dtype=np.float64), k=k)
             # svds returns in ascending order; flip to descending
             idx = np.argsort(-S)
             return U[:, idx], S[idx], Vt[idx, :]
@@ -95,6 +95,24 @@ def _truncated_svd(M, k):
     # fallback: full SVD, then truncate
     U, S, Vt = svd(M, full_matrices=False)
     return U[:, :k], S[:k], Vt[:k, :]
+
+
+def _normal_residual_variance(X, A, B, row_chunk_size=2048):
+    """Columnwise residual variance without a full N-by-J residual copy."""
+    X = np.asarray(X, dtype=float)
+    N = X.shape[0]
+    if row_chunk_size is None or N <= int(row_chunk_size):
+        design = np.column_stack([np.ones(N), A])
+        return np.mean((X - design @ B.T) ** 2, axis=0)
+
+    row_chunk_size = max(1, int(row_chunk_size))
+    residual_sum_squares = np.zeros(X.shape[1], dtype=float)
+    for start in range(0, N, row_chunk_size):
+        stop = min(start + row_chunk_size, N)
+        design = np.column_stack([np.ones(stop - start), A[start:stop]])
+        residual = X[start:stop] - design @ B.T
+        residual_sum_squares += np.sum(residual ** 2, axis=0)
+    return residual_sum_squares / N
 
 
 def Normal_init_semi(
@@ -184,7 +202,7 @@ def Normal_init_semi(
     # estimate A1 via least-squares projection (robust to rank deficiency)
     BtB = B1_est.T @ B1_est
     A1_est_nonbin = X_centered @ _safe_lstsq(BtB, B1_est.T).T
-    A1_est = (A1_est_nonbin > 0).astype(float)
+    A1_est = (A1_est_nonbin > 0).astype(np.uint8)
     G1_est = (B1_est != 0)
 
     # re-estimate B1 via least-squares
@@ -194,10 +212,12 @@ def Normal_init_semi(
     b1 = (np.mean(X, axis=0).reshape(-1, 1)
           - B1_re_est @ np.mean(A1_est, axis=0).reshape(-1, 1))
     B_list_ini[0] = np.hstack([b1, B1_re_est])
-    gamma_ini = np.mean(
-        (X - np.hstack([np.ones((N, 1)), A1_est]) @ B_list_ini[0].T) ** 2, axis=0
-    )
+    gamma_ini = _normal_residual_variance(X, A1_est, B_list_ini[0])
     A_list_ini[0] = A1_est   # (N, K1)
+
+    # These arrays are specific to the first-layer spectral fit and otherwise
+    # remain live for the duration of the recursive initialization.
+    del X_centered, A1_est_nonbin, A1_centered
 
     # ============================================================
     # Layers d = 2, ..., D:  logit(A_{d-1}) -> A_d
@@ -212,10 +232,10 @@ def Normal_init_semi(
         U_sv, S_sv, Vt_sv = _truncated_svd(A_prev, n_sv)
         m = max(Kd1 + 1, int(np.sum(S_sv > 1.01 * np.sqrt(N))))
         m = min(m, len(S_sv))
-        A_top_m  = U_sv[:, :m] @ np.diag(S_sv[:m]) @ Vt_sv[:m, :]
-        A_trunc  = np.clip(A_top_m, epsilon, 1 - epsilon)
-        A_inv    = logit(A_trunc)                                   # (N, Kd)
-        A_inv_adj = A_inv - np.mean(A_inv, axis=0, keepdims=True)
+        A_top_m = U_sv[:, :m] @ np.diag(S_sv[:m]) @ Vt_sv[:m, :]
+        np.clip(A_top_m, epsilon, 1 - epsilon, out=A_top_m)
+        A_inv_adj = logit(A_top_m)
+        A_inv_adj -= np.mean(A_inv_adj, axis=0, keepdims=True)
 
         # --- Truncated SVD of logit-transformed layer ---
         n_sv2 = min(Kd1 + 1, min(N, Kd))
@@ -231,7 +251,7 @@ def Normal_init_semi(
 
             BdtBd = Bd_est.T @ Bd_est
             Ad_est = A_inv_adj @ _safe_lstsq(BdtBd, Bd_est.T).T
-            Ad_est = (Ad_est > 0).astype(float)
+            Ad_est = (Ad_est > 0).astype(np.uint8)
             Ad_centered = Ad_est - np.mean(Ad_est, axis=0, keepdims=True)
             Bd_re_est = _safe_proj(Ad_centered, A_inv_adj).T / 2
             if not use_oracle:
@@ -254,7 +274,7 @@ def Normal_init_semi(
             # estimate Ad via robust projection
             BdtBd = Bd_est.T @ Bd_est
             Ad_est = A_inv_adj @ _safe_lstsq(BdtBd, Bd_est.T).T
-            Ad_est = (Ad_est > 0).astype(float)
+            Ad_est = (Ad_est > 0).astype(np.uint8)
 
             # re-estimate Bd via least-squares
             Ad_centered = Ad_est - np.mean(Ad_est, axis=0, keepdims=True)

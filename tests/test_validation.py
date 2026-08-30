@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from semidde.utils import DDEListShape, validate_K_list_identifiability, validate_dde_lists
+from dde.utils import DDEListShape, validate_K_list_identifiability, validate_dde_lists
 
 
 def test_validate_dde_lists_accepts_three_layers():

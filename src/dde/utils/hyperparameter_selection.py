@@ -11,12 +11,12 @@ from scipy.stats import rankdata
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 
-from semidde.algorithms.copula import prepare_rank_likelihood_inputs
-from semidde.algorithms.normal_init_semi import _rotate_varimax, rank_gaussianize_columns
-from semidde.algorithms.semi_saem import binary, compute_marginal_pmf_A1
-from semidde.results import DDEResult
-from semidde.simulation import simulate_latent_layers_D
-from semidde.utils import logit, thres, validate_K_list_identifiability
+from dde.algorithms.copula import prepare_rank_likelihood_inputs
+from dde.algorithms.normal_init_semi import _rotate_varimax, rank_gaussianize_columns
+from dde.algorithms.semi_saem import binary, compute_marginal_pmf_A1
+from dde.results import DDEResult
+from dde.simulation import simulate_latent_layers_D
+from dde.utils import logit, thres, validate_K_list_identifiability
 
 
 def _singular_values(M: np.ndarray) -> np.ndarray:

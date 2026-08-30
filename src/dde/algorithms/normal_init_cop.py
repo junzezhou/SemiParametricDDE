@@ -12,7 +12,7 @@ import numpy as np
 from scipy.linalg import svd
 from scipy.special import logit
 
-from semidde.utils import thres, validate_dde_lists
+from dde.utils import thres, validate_dde_lists
 
 
 def _right_inverse_xtx(X):

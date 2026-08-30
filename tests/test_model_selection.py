@@ -1,6 +1,6 @@
 import numpy as np
 
-from semidde import (
+from dde import (
     auto_grid,
     auto_grid_copula_csp,
     auto_grid_copula_fixed,
@@ -12,9 +12,9 @@ from semidde import (
     select_hyperparameters,
     simulate_copula_predictive,
 )
-from semidde.results import DDEResult
-from semidde.simulation import generate_X_normal
-from semidde.simulation import generate_X_Cop_marg_emp_D
+from dde.results import DDEResult
+from dde.simulation import generate_X_normal
+from dde.simulation import generate_X_Cop_marg_emp_D
 
 
 def _parameters(J, K_list, seed=123):
