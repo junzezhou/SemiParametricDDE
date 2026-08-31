@@ -63,6 +63,13 @@ def fit_dde_normal(
     convergence_mean_tol: float = 0.01,
     width_stability_window: int = 10,
     csp_min_iter: int = 30,
+    mcem_stagewise: bool = False,
+    mcem_stage_min_iter: int = 20,
+    mcem_stage_width_window: int = 10,
+    mcem_stage_freeze_deeper: bool = True,
+    mcem_penalty_strength=1.0,
+    mcem_stage_reinitialize_next: bool = False,
+    mcem_stage_spectral_gap_threshold=None,
     csp_backend: str = "mcem",
     burn: int = 5,
     estep_row_chunk_size: int = 2048,
@@ -247,6 +254,17 @@ def fit_dde_normal(
             width_stability_window=width_stability_window,
             min_iter=csp_min_iter,
         )
+    else:
+        csp_options.update(
+            convergence_mean_tol=convergence_mean_tol,
+            stagewise=bool(mcem_stagewise),
+            stage_min_iter=mcem_stage_min_iter,
+            stage_width_window=mcem_stage_width_window,
+            stage_freeze_deeper=bool(mcem_stage_freeze_deeper),
+            penalty_strength=mcem_penalty_strength,
+            stage_reinitialize_next=bool(mcem_stage_reinitialize_next),
+            stage_spectral_gap_threshold=mcem_stage_spectral_gap_threshold,
+        )
     raw = csp_kernel(
         X,
         prop,
@@ -290,6 +308,22 @@ def fit_dde_normal(
         "relative_history": raw["relative_history"],
         "temperature": raw["temperature"],
     }
+    if backend == "mcem":
+        diagnostics.update(
+            {
+                "stagewise": raw["stagewise"],
+                "stage_transitions": raw["stage_transitions"],
+                "final_stage": raw["final_stage"],
+                "stage_freeze_deeper": raw["stage_freeze_deeper"],
+                "penalty_strength": raw["penalty_strength"],
+                "stage_reinitialize_next": raw["stage_reinitialize_next"],
+                "stage_spectral_gap_threshold": raw[
+                    "stage_spectral_gap_threshold"
+                ],
+                "stage_reinitializations": raw["stage_reinitializations"],
+                "stage_caps": raw["stage_caps"],
+            }
+        )
     if backend == "saem":
         diagnostics.update(
             {

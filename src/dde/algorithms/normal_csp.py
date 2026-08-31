@@ -13,6 +13,7 @@ import numpy as np
 from scipy.special import expit
 
 from .csp import csp_active_mask, update_csp_layer
+from .normal_init_semi import initialize_binary_parent
 from .semi_saem import (
     _ObservedNormalAccumulator,
     _compute_bernoulli_probabilities_normal,
@@ -85,6 +86,93 @@ def _largest_eigenvalue_psd(matrix: np.ndarray) -> float:
     if matrix.size == 0:
         return 0.0
     return max(float(np.linalg.eigvalsh(matrix)[-1]), 0.0)
+
+
+def _spectral_parent_width(A_prev, cap, minimum_gap):
+    """Select a parent start width only when a clear covariance gap exists."""
+    cap = int(cap)
+    centered = np.asarray(A_prev, dtype=float)
+    centered = centered - np.mean(centered, axis=0, keepdims=True)
+    singular_values = np.linalg.svd(centered, compute_uv=False)
+    normalized = singular_values / np.sqrt(centered.shape[0])
+    if minimum_gap is None or cap < 2 or normalized.size <= cap:
+        return cap, normalized[: cap + 1], None
+
+    gaps = normalized[:cap] / np.maximum(normalized[1 : cap + 1], 1e-12)
+    gap_index = int(np.argmax(gaps))
+    largest_gap = float(gaps[gap_index])
+    selected = gap_index + 1 if largest_gap >= minimum_gap else cap
+    return selected, normalized[: cap + 1], largest_gap
+
+
+def _reinitialize_staged_parent(
+    layer,
+    prop,
+    B_list,
+    A_list,
+    active_masks,
+    allocation,
+    penalty_scale,
+    slab_scale,
+    omega,
+    stage_caps,
+    spike_scales,
+    spectral_gap_threshold,
+):
+    """Rebuild one waiting parent at its child-implied identifiable cap."""
+    child_indices = np.flatnonzero(active_masks[layer - 1])
+    cap = min(B_list[layer].shape[1] - 1, child_indices.size // 3)
+    if cap < 1:
+        raise ValueError(
+            "staged CSP selected too few child coordinates for another layer."
+        )
+    child_states = A_list[layer - 1][:, child_indices]
+    initial_width, singular_values, largest_gap = _spectral_parent_width(
+        child_states, cap, spectral_gap_threshold
+    )
+    B_small, A_parent = initialize_binary_parent(
+        child_states, initial_width
+    )
+
+    B_new = np.zeros_like(B_list[layer])
+    B_new[child_indices, 0] = B_small[:, 0]
+    B_new[
+        np.ix_(child_indices, np.arange(1, initial_width + 1))
+    ] = B_small[:, 1:]
+    B_list[layer] = B_new
+    A_new = np.zeros_like(A_list[layer])
+    A_new[:, :initial_width] = A_parent
+    A_list[layer] = A_new
+
+    stage_caps[layer] = cap
+    active_masks[layer] = (
+        np.arange(active_masks[layer].size) < initial_width
+    )
+    allocation[layer] = np.where(
+        active_masks[layer],
+        active_masks[layer].size + 1,
+        np.arange(1, active_masks[layer].size + 1),
+    )
+    slab_scale[layer] = np.ones_like(slab_scale[layer])
+    omega[layer] = np.ones_like(omega[layer]) / omega[layer].size
+    penalty_scale[layer] = np.broadcast_to(
+        np.where(active_masks[layer], 1.0, spike_scales[layer])[None, :],
+        penalty_scale[layer].shape,
+    ).copy()
+
+    if layer == len(B_list) - 1:
+        prop_new = np.full_like(prop, 0.5, dtype=float)
+        prop_new[:initial_width] = np.mean(A_parent, axis=0)
+        prop = prop_new
+    else:
+        B_list[layer + 1] = np.zeros_like(B_list[layer + 1])
+    return prop, {
+        "layer": layer + 1,
+        "structural_cap": cap,
+        "initial_width": initial_width,
+        "singular_values": tuple(float(value) for value in singular_values),
+        "largest_gap": largest_gap,
+    }
 
 
 def _solve_gaussian_weighted_l1_from_statistics(
@@ -327,7 +415,15 @@ def fit_normal_csp_mcem(
     temperature: float,
     threshold: float,
     convergence_tol: float = 0.005,
+    convergence_mean_tol: float = 0.01,
     convergence_window: int = 7,
+    stagewise: bool = False,
+    stage_min_iter: int = 20,
+    stage_width_window: int = 10,
+    stage_freeze_deeper: bool = True,
+    penalty_strength=1.0,
+    stage_reinitialize_next: bool = False,
+    stage_spectral_gap_threshold=None,
     burn: int = 5,
     optimizer_maxiter: int = 100,
     optimizer_tol: float = 1e-6,
@@ -337,7 +433,13 @@ def fit_normal_csp_mcem(
     keep_trace: bool = False,
     verbose: bool = True,
 ):
-    """Fit maximal-width Normal DDE parameters under layer-wise CSP priors."""
+    """Fit maximal-width Normal DDE parameters under layer-wise CSP priors.
+
+    ``stagewise`` is a Normal-MCEM development mode.  It activates CSP from
+    the observed-side layer toward the deepest layer, and advances only after
+    the current layer's width has been stable for a full window.  Deeper
+    layers remain all-slab and are not hard-thresholded while waiting.
+    """
     X = np.asarray(X, dtype=float)
     prop = np.asarray(prop_in, dtype=float).reshape(-1).copy()
     B_list = [np.asarray(B, dtype=float).copy() for B in B_list_in]
@@ -350,15 +452,28 @@ def fit_normal_csp_mcem(
     C = int(C)
     max_iter = int(max_iter)
     convergence_window = int(convergence_window)
+    stage_min_iter = int(stage_min_iter)
+    stage_width_window = int(stage_width_window)
     burn = int(burn)
     optimizer_maxiter = int(optimizer_maxiter)
     temperature = float(temperature)
     threshold = float(threshold)
+    convergence_tol = float(convergence_tol)
+    convergence_mean_tol = float(convergence_mean_tol)
+    if stage_spectral_gap_threshold is not None:
+        stage_spectral_gap_threshold = float(stage_spectral_gap_threshold)
     if C < 1 or max_iter < 1:
         raise ValueError("C and max_iter must be positive integers.")
-    if convergence_window < 1 or burn < 0 or optimizer_maxiter < 1:
+    if (
+        convergence_window < 1
+        or stage_min_iter < 1
+        or stage_width_window < 1
+        or burn < 0
+        or optimizer_maxiter < 1
+    ):
         raise ValueError(
-            "convergence_window and optimizer_maxiter must be positive, and burn nonnegative."
+            "convergence_window, stage_min_iter, stage_width_window, and "
+            "optimizer_maxiter must be positive, and burn nonnegative."
         )
     if not np.isfinite(temperature) or not 0.0 < temperature <= 1.0:
         raise ValueError("temperature must lie in (0, 1].")
@@ -366,24 +481,68 @@ def fit_normal_csp_mcem(
         raise ValueError("threshold must be finite and positive.")
     if not np.isfinite(convergence_tol) or convergence_tol < 0:
         raise ValueError("convergence_tol must be finite and nonnegative.")
+    if not np.isfinite(convergence_mean_tol) or convergence_mean_tol < 0:
+        raise ValueError(
+            "convergence_mean_tol must be finite and nonnegative."
+        )
+    if (
+        stage_spectral_gap_threshold is not None
+        and (
+            not np.isfinite(stage_spectral_gap_threshold)
+            or stage_spectral_gap_threshold <= 1.0
+        )
+    ):
+        raise ValueError(
+            "stage_spectral_gap_threshold must be finite and greater than 1."
+        )
 
     spike_scales = _validate_spike_scales(t_spike, D)
+    penalty_strengths = np.asarray(penalty_strength, dtype=float).reshape(-1)
+    if penalty_strengths.size == 1:
+        penalty_strengths = np.repeat(penalty_strengths.item(), D)
+    if penalty_strengths.size != D:
+        raise ValueError(
+            "penalty_strength must be a scalar or a length-D sequence."
+        )
+    if (
+        not np.all(np.isfinite(penalty_strengths))
+        or np.any(penalty_strengths <= 0)
+    ):
+        raise ValueError("penalty_strength entries must be finite and positive.")
     rng = _as_rng(random_state)
     slab_scale = [np.ones(Kd, dtype=float) for Kd in K]
     omega = [np.ones(Kd + 1, dtype=float) / (Kd + 1) for Kd in K]
-    allocation = [np.full(Kd, np.floor(Kd / 2), dtype=int) for Kd in K]
-    penalty_scale = [
-        np.full((J if d == 0 else K[d - 1], K[d]), spike_scales[d])
-        for d in range(D)
-    ]
+    if stagewise:
+        allocation = [np.full(Kd, Kd + 1, dtype=int) for Kd in K]
+        penalty_scale = [
+            np.ones((J if d == 0 else K[d - 1], K[d]), dtype=float)
+            for d in range(D)
+        ]
+    else:
+        allocation = [
+            np.full(Kd, np.floor(Kd / 2), dtype=int) for Kd in K
+        ]
+        penalty_scale = [
+            np.full(
+                (J if d == 0 else K[d - 1], K[d]), spike_scales[d]
+            )
+            for d in range(D)
+        ]
     active_masks = [np.ones(Kd, dtype=bool) for Kd in K]
     num_active = np.asarray(K, dtype=int)
     relative_history = [[] for _ in range(D)]
     trace = [] if keep_trace else None
     current_temperature = temperature
+    active_stage = 0 if stagewise else D - 1
+    stage_iteration = 0
+    stage_width_history = []
+    stage_transitions = []
+    stage_reinitializations = []
+    stage_caps = np.asarray(K, dtype=int)
 
     iterations = 0
     while iterations < max_iter:
+        iteration_stage = active_stage
         probabilities = _compute_bernoulli_probabilities_normal(
             X,
             prop,
@@ -394,8 +553,12 @@ def fit_normal_csp_mcem(
             temperature=current_temperature,
         )
         A_samples = _sample_latent_layers(probabilities, C, rng)
+        for d in range(D):
+            if stage_caps[d] < K[d]:
+                probabilities[d][:, stage_caps[d] :] = 0.0
+                A_samples[d][:, stage_caps[d] + 1 :, :] = 0
 
-        for d in range(D - 1, -1, -1):
+        for d in range(iteration_stage, -1, -1):
             num_rows = J if d == 0 else int(num_active[d - 1])
             (
                 allocation[d],
@@ -410,8 +573,18 @@ def fit_normal_csp_mcem(
                 num_rows,
                 rng=rng,
             )
+            penalty_scale[d] /= penalty_strengths[d]
+            if stage_caps[d] < K[d]:
+                ineligible = np.arange(K[d]) >= stage_caps[d]
+                allocation[d][ineligible] = np.arange(1, K[d] + 1)[
+                    ineligible
+                ]
+                penalty_scale[d][:, ineligible] = spike_scales[d]
 
-        prop_update = np.mean(probabilities[-1], axis=0)
+        if stagewise and stage_freeze_deeper and iteration_stage < D - 1:
+            prop_update = prop.copy()
+        else:
+            prop_update = np.mean(probabilities[-1], axis=0)
         B_update = [None] * D
         B_update[0], gamma_update = _solve_gaussian_weighted_l1(
             X,
@@ -425,28 +598,43 @@ def fit_normal_csp_mcem(
             bound=bound_val,
         )
         for d in range(1, D):
-            B_update[d] = _solve_logistic_weighted_l1(
-                A_samples[d - 1],
-                A_samples[d],
-                B_list[d],
-                penalty_scale[d],
-                current_temperature,
-                max_iter=optimizer_maxiter,
-                tol=optimizer_tol,
-                bound=bound_val,
-            )
+            if stagewise and stage_freeze_deeper and d > iteration_stage:
+                B_update[d] = B_list[d].copy()
+            else:
+                B_update[d] = _solve_logistic_weighted_l1(
+                    A_samples[d - 1],
+                    A_samples[d],
+                    B_list[d],
+                    penalty_scale[d],
+                    current_temperature,
+                    max_iter=optimizer_maxiter,
+                    tol=optimizer_tol,
+                    bound=bound_val,
+                )
 
         iterations += 1
+        stage_iteration += 1
         inactive_indices = []
         for d in range(D):
-            active_masks[d] = csp_active_mask(allocation[d])
+            if not stagewise or d <= active_stage:
+                active_masks[d] = csp_active_mask(allocation[d])
+                active_masks[d][stage_caps[d] :] = False
+            else:
+                active_masks[d] = np.ones(K[d], dtype=bool)
             inactive = np.flatnonzero(~active_masks[d])
             inactive_indices.append(inactive)
             num_active[d] = int(np.sum(active_masks[d]))
 
-        for d in range(min(2, D)):
+        thresholded_layers = min(2, D)
+        if stagewise:
+            thresholded_layers = min(thresholded_layers, iteration_stage + 1)
+        for d in range(thresholded_layers):
             slopes = B_update[d][:, 1:]
             slopes[np.abs(slopes) < threshold] = 0.0
+
+        for d in range(D):
+            if stage_caps[d] < K[d]:
+                B_update[d][:, stage_caps[d] + 1 :] = 0.0
 
         for d in range(D - 1):
             if inactive_indices[d].size:
@@ -458,7 +646,7 @@ def fit_normal_csp_mcem(
                 current_temperature + 0.01 * ((iterations - burn) - 1),
             )
 
-        stop_now = True
+        stop_now = not stagewise or active_stage == D - 1
         current_relative = []
         for d in range(D):
             relative = np.linalg.norm(
@@ -468,15 +656,48 @@ def fit_normal_csp_mcem(
             current_relative.append(float(relative))
             if (
                 len(relative_history[d]) < convergence_window
+                or np.mean(relative_history[d][-convergence_window:])
+                >= convergence_mean_tol
                 or np.std(relative_history[d][-convergence_window:])
                 >= convergence_tol
             ):
+                stop_now = False
+
+        stage_advanced = False
+        if stagewise:
+            stage_width_history.append(int(num_active[active_stage]))
+            stable_current_width = (
+                len(stage_width_history) >= stage_width_window
+                and len(set(stage_width_history[-stage_width_window:])) == 1
+            )
+            if (
+                active_stage < D - 1
+                and stage_iteration >= stage_min_iter
+                and stable_current_width
+            ):
+                previous_stage = active_stage
+                active_stage += 1
+                stage_iteration = 0
+                stage_width_history = []
+                stage_advanced = True
+                stage_transitions.append(
+                    {
+                        "iteration": iterations,
+                        "from_layer": previous_stage + 1,
+                        "to_layer": active_stage + 1,
+                        "widths": tuple(int(value) for value in num_active),
+                    }
+                )
+            if active_stage < D - 1:
                 stop_now = False
 
         if keep_trace:
             trace.append(
                 {
                     "iteration": iterations,
+                    "active_stage": active_stage + 1,
+                    "stage_iteration": stage_iteration,
+                    "stage_advanced": stage_advanced,
                     "num_active": num_active.copy(),
                     "allocation": [value.copy() for value in allocation],
                     "omega": [value.copy() for value in omega],
@@ -498,10 +719,30 @@ def fit_normal_csp_mcem(
         B_list = [B.copy() for B in B_update]
         gamma = gamma_update.copy()
         prop = prop_update.copy()
+        if stage_advanced and stage_reinitialize_next:
+            prop, reinitialization = _reinitialize_staged_parent(
+                active_stage,
+                prop,
+                B_list,
+                A_list,
+                active_masks,
+                allocation,
+                penalty_scale,
+                slab_scale,
+                omega,
+                stage_caps,
+                spike_scales,
+                stage_spectral_gap_threshold,
+            )
+            stage_reinitializations.append(reinitialization)
+            num_active[active_stage] = int(
+                np.sum(active_masks[active_stage])
+            )
 
         if verbose:
             print(
-                f"CSP-MCEM iteration {iterations}, active={num_active.tolist()}, "
+                f"CSP-MCEM iteration {iterations}, stage={active_stage + 1}, "
+                f"active={num_active.tolist()}, "
                 f"max relative change={max(current_relative):.4g}"
             )
         if stop_now:
@@ -524,6 +765,15 @@ def fit_normal_csp_mcem(
         "active_masks": [value.copy() for value in active_masks],
         "num_active": num_active.copy(),
         "iterations": iterations,
+        "stagewise": bool(stagewise),
+        "stage_transitions": tuple(stage_transitions),
+        "final_stage": active_stage + 1,
+        "stage_freeze_deeper": bool(stage_freeze_deeper),
+        "penalty_strength": tuple(float(value) for value in penalty_strengths),
+        "stage_reinitialize_next": bool(stage_reinitialize_next),
+        "stage_spectral_gap_threshold": stage_spectral_gap_threshold,
+        "stage_reinitializations": tuple(stage_reinitializations),
+        "stage_caps": tuple(int(value) for value in stage_caps),
         "temperature": float(current_temperature),
         "relative_history": [tuple(values) for values in relative_history],
         "trace": trace,
@@ -893,6 +1143,8 @@ __all__ = [
     "_solve_gaussian_weighted_l1_from_statistics",
     "_solve_logistic_weighted_l1",
     "_solve_logistic_weighted_l1_from_accumulator",
+    "_solve_logistic_weighted_l1_mean_field",
+    "_resample_top_layer_systematic",
     "_canonicalize_csp_layer_order",
     "fit_normal_csp_mcem",
     "fit_normal_csp_saem",

@@ -106,6 +106,25 @@ def _scenario_d2():
     }
 
 
+def _scenario_d2_sparse_deep():
+    """D=2 falsification case whose top width is below its structural cap."""
+    scenario = _scenario_d2()
+    K_true = (scenario["K_true"][0], 2)
+    B2_slope = _deep_loading(K_true[0], K_true[1], 4.0)
+    scenario.update(
+        name="d2_j50_sparse_deep",
+        K_true=K_true,
+        B_true=[
+            scenario["B_true"][0],
+            np.column_stack(
+                [np.full(K_true[0], -2.0), B2_slope]
+            ),
+        ],
+        prop=np.full(K_true[-1], 0.5),
+    )
+    return scenario
+
+
 def _scenario_d3():
     J = 108
     K_true = (18, 6, 2)
@@ -317,6 +336,13 @@ def _run_one(
     keep_trace=False,
     csp_backend="saem",
     csp_min_iter=30,
+    mcem_stagewise=False,
+    mcem_stage_min_iter=20,
+    mcem_stage_width_window=10,
+    mcem_stage_reinitialize_next=False,
+    mcem_stage_spectral_gap_threshold=None,
+    mcem_first_penalty_power=0.0,
+    mcem_top_spike_multiplier=1.0,
 ):
     group, N, replicate, init_mode, multiplier, temperature, threshold_name = configuration
     data_seed = seed_base + 100_000 * scenario["D"] + 1_000 * N + replicate
@@ -333,6 +359,10 @@ def _run_one(
         )
     prop0, B0, gamma0, A0 = initialization_cache[initialization_key]
     t_spike = scenario["base_t_spike"] * multiplier
+    if csp_backend == "mcem":
+        t_spike[-1] *= float(mcem_top_spike_multiplier)
+    penalty_strength = np.ones(scenario["D"], dtype=float)
+    penalty_strength[0] = (N / 500.0) ** float(mcem_first_penalty_power)
     initial_counts, _ = _allocation_counts(
         B0, t_spike, scenario["K_max"], init_seed + 500
     )
@@ -369,6 +399,14 @@ def _run_one(
         keep_trace=keep_trace,
         csp_backend=csp_backend,
         csp_min_iter=csp_min_iter,
+        mcem_stagewise=mcem_stagewise,
+        mcem_stage_min_iter=mcem_stage_min_iter,
+        mcem_stage_width_window=mcem_stage_width_window,
+        mcem_stage_reinitialize_next=mcem_stage_reinitialize_next,
+        mcem_stage_spectral_gap_threshold=(
+            mcem_stage_spectral_gap_threshold
+        ),
+        mcem_penalty_strength=penalty_strength,
         verbose=False,
     )
     elapsed = time.perf_counter() - started
@@ -400,8 +438,31 @@ def _run_one(
         "threshold_name": threshold_name,
         "tau": tau,
         "mc_samples": mc_samples,
+        "max_iter_budget": max_iter,
+        "optimizer_maxiter": optimizer_maxiter,
         "csp_backend": csp_backend,
         "csp_min_iter": csp_min_iter,
+        "mcem_stagewise": int(mcem_stagewise),
+        "mcem_stage_min_iter": mcem_stage_min_iter,
+        "mcem_stage_width_window": mcem_stage_width_window,
+        "mcem_stage_reinitialize_next": int(mcem_stage_reinitialize_next),
+        "mcem_stage_spectral_gap_threshold": (
+            mcem_stage_spectral_gap_threshold
+            if mcem_stage_spectral_gap_threshold is not None
+            else ""
+        ),
+        "mcem_first_penalty_power": mcem_first_penalty_power,
+        "mcem_top_spike_multiplier": mcem_top_spike_multiplier,
+        "mcem_penalty_strength": json.dumps(penalty_strength.tolist()),
+        "stage_transitions": json.dumps(
+            result.diagnostics.get("stage_transitions", ())
+        ),
+        "stage_caps": json.dumps(
+            result.diagnostics.get("stage_caps", scenario["K_max"])
+        ),
+        "stage_reinitializations": json.dumps(
+            result.diagnostics.get("stage_reinitializations", ())
+        ),
         "K_true": json.dumps(list(scenario["K_true"])),
         "K_max": json.dumps(list(scenario["K_max"])),
         "K_initial_allocation": json.dumps(list(initial_counts)),
@@ -505,6 +566,10 @@ def _read_csv(path):
         "omega_trace",
         "allocation_input_column_l1_trace",
         "updated_column_l1_trace",
+        "mcem_penalty_strength",
+        "stage_transitions",
+        "stage_caps",
+        "stage_reinitializations",
     }
     with path.open(newline="") as stream:
         records = list(csv.DictReader(stream))
@@ -530,8 +595,21 @@ def _record_configuration_key(record):
         float(record["temperature"]),
         record["threshold_name"],
         int(float(record["mc_samples"])),
+        int(float(record.get("max_iter_budget", 0))),
+        int(float(record.get("optimizer_maxiter", 0))),
         record.get("csp_backend", "mcem"),
         int(float(record.get("csp_min_iter", 0))),
+        int(float(record.get("mcem_stagewise", 0))),
+        int(float(record.get("mcem_stage_min_iter", 20))),
+        int(float(record.get("mcem_stage_width_window", 10))),
+        int(float(record.get("mcem_stage_reinitialize_next", 0))),
+        (
+            float(record["mcem_stage_spectral_gap_threshold"])
+            if record.get("mcem_stage_spectral_gap_threshold") not in (None, "")
+            else None
+        ),
+        float(record.get("mcem_first_penalty_power", 0.0)),
+        float(record.get("mcem_top_spike_multiplier", 1.0)),
     )
 
 
@@ -539,8 +617,17 @@ def _target_configuration_key(
     scenario,
     configuration,
     mc_samples,
+    max_iter,
+    optimizer_maxiter,
     csp_backend,
     csp_min_iter,
+    mcem_stagewise,
+    mcem_stage_min_iter,
+    mcem_stage_width_window,
+    mcem_stage_reinitialize_next,
+    mcem_stage_spectral_gap_threshold,
+    mcem_first_penalty_power,
+    mcem_top_spike_multiplier,
 ):
     group, N, replicate, init_mode, multiplier, temperature, threshold_name = configuration
     return (
@@ -553,8 +640,21 @@ def _target_configuration_key(
         float(temperature),
         threshold_name,
         int(mc_samples),
+        int(max_iter),
+        int(optimizer_maxiter),
         str(csp_backend),
         int(csp_min_iter),
+        int(mcem_stagewise),
+        int(mcem_stage_min_iter),
+        int(mcem_stage_width_window),
+        int(mcem_stage_reinitialize_next),
+        (
+            float(mcem_stage_spectral_gap_threshold)
+            if mcem_stage_spectral_gap_threshold is not None
+            else None
+        ),
+        float(mcem_first_penalty_power),
+        float(mcem_top_spike_multiplier),
     )
 
 
@@ -627,6 +727,15 @@ def main():
         "--csp-backend", choices=("saem", "mcem"), default="saem"
     )
     parser.add_argument("--csp-min-iter", type=int, default=30)
+    parser.add_argument("--mcem-stagewise", action="store_true")
+    parser.add_argument("--mcem-stage-min-iter", type=int, default=20)
+    parser.add_argument("--mcem-stage-width-window", type=int, default=10)
+    parser.add_argument("--mcem-stage-reinitialize-next", action="store_true")
+    parser.add_argument(
+        "--mcem-stage-spectral-gap-threshold", type=float, default=None
+    )
+    parser.add_argument("--mcem-first-penalty-power", type=float, default=0.0)
+    parser.add_argument("--mcem-top-spike-multiplier", type=float, default=1.0)
     parser.add_argument("--seed-base", type=int, default=20260828)
     parser.add_argument(
         "--keep-trace",
@@ -653,7 +762,7 @@ def main():
     parser.add_argument(
         "--scenarios",
         nargs="+",
-        choices=("d2_j50", "d3_j108"),
+        choices=("d2_j50", "d2_j50_sparse_deep", "d3_j108"),
         default=["d2_j50", "d3_j108"],
     )
     parser.add_argument(
@@ -672,7 +781,11 @@ def main():
 
     scenarios = [
         scenario
-        for scenario in (_scenario_d2(), _scenario_d3())
+        for scenario in (
+            _scenario_d2(),
+            _scenario_d2_sparse_deep(),
+            _scenario_d3(),
+        )
         if scenario["name"] in args.scenarios
     ]
     allowed_groups = set(args.groups)
@@ -711,8 +824,17 @@ def main():
             scenario,
             configuration,
             args.mc_samples,
+            args.max_iter,
+            args.optimizer_maxiter,
             args.csp_backend,
             args.csp_min_iter,
+            args.mcem_stagewise,
+            args.mcem_stage_min_iter,
+            args.mcem_stage_width_window,
+            args.mcem_stage_reinitialize_next,
+            args.mcem_stage_spectral_gap_threshold,
+            args.mcem_first_penalty_power,
+            args.mcem_top_spike_multiplier,
         )
         in completed_keys
         for scenario in scenarios
@@ -724,8 +846,17 @@ def main():
                 scenario,
                 configuration,
                 args.mc_samples,
+                args.max_iter,
+                args.optimizer_maxiter,
                 args.csp_backend,
                 args.csp_min_iter,
+                args.mcem_stagewise,
+                args.mcem_stage_min_iter,
+                args.mcem_stage_width_window,
+                args.mcem_stage_reinitialize_next,
+                args.mcem_stage_spectral_gap_threshold,
+                args.mcem_first_penalty_power,
+                args.mcem_top_spike_multiplier,
             )
             if configuration_key in completed_keys:
                 continue
@@ -741,6 +872,15 @@ def main():
                 keep_trace=args.keep_trace,
                 csp_backend=args.csp_backend,
                 csp_min_iter=args.csp_min_iter,
+                mcem_stagewise=args.mcem_stagewise,
+                mcem_stage_min_iter=args.mcem_stage_min_iter,
+                mcem_stage_width_window=args.mcem_stage_width_window,
+                mcem_stage_reinitialize_next=args.mcem_stage_reinitialize_next,
+                mcem_stage_spectral_gap_threshold=(
+                    args.mcem_stage_spectral_gap_threshold
+                ),
+                mcem_first_penalty_power=args.mcem_first_penalty_power,
+                mcem_top_spike_multiplier=args.mcem_top_spike_multiplier,
             )
             records.append(record)
             completed_keys.add(configuration_key)
@@ -765,6 +905,15 @@ def main():
         "mc_samples": args.mc_samples,
         "csp_backend": args.csp_backend,
         "csp_min_iter": args.csp_min_iter,
+        "mcem_stagewise": args.mcem_stagewise,
+        "mcem_stage_min_iter": args.mcem_stage_min_iter,
+        "mcem_stage_width_window": args.mcem_stage_width_window,
+        "mcem_stage_reinitialize_next": args.mcem_stage_reinitialize_next,
+        "mcem_stage_spectral_gap_threshold": (
+            args.mcem_stage_spectral_gap_threshold
+        ),
+        "mcem_first_penalty_power": args.mcem_first_penalty_power,
+        "mcem_top_spike_multiplier": args.mcem_top_spike_multiplier,
         "seed_base": args.seed_base,
         "keep_trace": args.keep_trace,
         "scenarios_selected": args.scenarios,

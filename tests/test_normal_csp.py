@@ -8,8 +8,11 @@ from dde.algorithms.normal_csp import (
     _solve_gaussian_weighted_l1_from_statistics,
     _solve_logistic_weighted_l1,
     _solve_logistic_weighted_l1_from_accumulator,
+    _spectral_parent_width,
+    fit_normal_csp_mcem,
     fit_normal_csp_saem,
 )
+from dde.algorithms.normal_init_semi import initialize_binary_parent
 from dde.algorithms.semi_saem import (
     _ObservedNormalAccumulator,
     _compute_bernoulli_probabilities_normal,
@@ -202,6 +205,76 @@ def test_two_step_sa_statistics_are_the_arithmetic_mean_of_draws():
     np.testing.assert_allclose(
         accumulator.q_all, 0.5 * (first_q + second_q)
     )
+
+
+def test_binary_parent_reinitializer_returns_finite_aligned_shapes():
+    rng = np.random.default_rng(817)
+    child = rng.integers(0, 2, size=(80, 9), dtype=np.uint8)
+
+    B_parent, A_parent = initialize_binary_parent(child, 3)
+
+    assert B_parent.shape == (9, 4)
+    assert A_parent.shape == (80, 3)
+    assert np.all(np.isfinite(B_parent))
+    assert set(np.unique(A_parent)).issubset({0, 1})
+
+
+def test_spectral_parent_width_uses_only_a_clear_gap():
+    rng = np.random.default_rng(820)
+    factors = rng.integers(0, 2, size=(200, 2), dtype=np.uint8)
+    child = np.column_stack(
+        [factors[:, 0]] * 5 + [factors[:, 1]] * 4
+    )
+
+    selected, singular_values, largest_gap = _spectral_parent_width(
+        child, 3, 1.5
+    )
+    conservative, _, no_test_gap = _spectral_parent_width(
+        child, 3, None
+    )
+
+    assert selected == 2
+    assert conservative == 3
+    assert singular_values.shape == (4,)
+    assert largest_gap > 1.5
+    assert no_test_gap is None
+
+
+def test_mcem_staged_reinitialization_enforces_child_implied_cap():
+    rng = np.random.default_rng(818)
+    N, J = 30, 27
+    widths = (9, 4)
+    B1 = np.column_stack(
+        [np.zeros(J), np.full((J, widths[0]), 2.0)]
+    )
+    raw = fit_normal_csp_mcem(
+        rng.normal(size=(N, J)),
+        np.full(widths[-1], 0.5),
+        [B1, rng.normal(scale=0.2, size=(widths[0], widths[1] + 1))],
+        np.ones(J),
+        [
+            rng.integers(0, 2, size=(N, width), dtype=np.uint8)
+            for width in widths
+        ],
+        C=1,
+        max_iter=2,
+        t_spike=[0.01, 0.01],
+        temperature=0.9,
+        threshold=0.3,
+        convergence_tol=0.0,
+        stagewise=True,
+        stage_min_iter=1,
+        stage_width_window=1,
+        stage_reinitialize_next=True,
+        optimizer_maxiter=2,
+        random_state=819,
+        verbose=False,
+    )
+
+    assert raw["stage_caps"] == (9, 3)
+    assert raw["num_active"][1] <= 3
+    np.testing.assert_allclose(raw["B_list"][1][:, 4:], 0.0)
+    np.testing.assert_array_equal(raw["A_list"][1][:, 3:], 0)
 
 
 def test_saem_csp_warmup_starts_fresh_statistics_at_temperature_one():

@@ -115,6 +115,53 @@ def _normal_residual_variance(X, A, B, row_chunk_size=2048):
     return residual_sum_squares / N
 
 
+def initialize_binary_parent(A_prev, K_parent, epsilon=1e-4):
+    """Spectrally initialize one binary parent from active child states."""
+    A_prev = np.asarray(A_prev, dtype=np.uint8)
+    if A_prev.ndim != 2 or A_prev.shape[0] < 1 or A_prev.shape[1] < 1:
+        raise ValueError("A_prev must be a nonempty binary matrix.")
+    K_parent = int(K_parent)
+    if K_parent < 1 or K_parent > A_prev.shape[1]:
+        raise ValueError("K_parent must lie between 1 and A_prev.shape[1].")
+
+    N, K_child = A_prev.shape
+    n_sv = min(K_parent + 2, min(N, K_child))
+    U_sv, S_sv, Vt_sv = _truncated_svd(A_prev, n_sv)
+    m = max(K_parent + 1, int(np.sum(S_sv > 1.01 * np.sqrt(N))))
+    m = min(m, len(S_sv))
+    A_top_m = U_sv[:, :m] @ np.diag(S_sv[:m]) @ Vt_sv[:m, :]
+    np.clip(A_top_m, epsilon, 1.0 - epsilon, out=A_top_m)
+    A_inverse = logit(A_top_m)
+    A_inverse -= np.mean(A_inverse, axis=0, keepdims=True)
+
+    n_sv2 = min(K_parent + 1, min(N, K_child))
+    _, _, Vt_adj = _truncated_svd(A_inverse, n_sv2)
+    if K_parent == 1:
+        B_est = Vt_adj.T[:, :1]
+    else:
+        B_est = thres(
+            _rotate_varimax(Vt_adj.T[:, :K_parent]),
+            1.0 / (3.5 * np.sqrt(K_child)),
+        )
+    sign_flip = np.sign(np.mean(B_est, axis=0))
+    sign_flip[sign_flip == 0] = 1
+    B_est *= sign_flip
+
+    parent_nonbinary = A_inverse @ _safe_lstsq(
+        B_est.T @ B_est, B_est.T
+    ).T
+    A_parent = (parent_nonbinary > 0).astype(np.uint8)
+    parent_centered = A_parent - np.mean(A_parent, axis=0, keepdims=True)
+    B_reestimated = _safe_proj(parent_centered, A_inverse).T / 2.0
+    B_reestimated = thres(B_reestimated * (B_est != 0), 0)
+    intercept = (
+        np.mean(A_inverse, axis=0).reshape(-1, 1)
+        - B_reestimated
+        @ np.mean(A_parent, axis=0).reshape(-1, 1)
+    )
+    return np.hstack([intercept, B_reestimated]), A_parent
+
+
 def Normal_init_semi(
     X,
     K1_max,
@@ -349,6 +396,7 @@ def rank_gaussianize_columns(Y, clip_eps=1e-6, standardize=True):
 
 __all__ = [
     "Normal_init_semi",
+    "initialize_binary_parent",
     "normal_init_semi",
     "rank_gaussianize_columns",
 ]
