@@ -8,11 +8,12 @@ import numpy as np
 def logistic(x):
     """Numerically stable logistic sigmoid."""
     x = np.asarray(x, dtype=float)
-    return np.where(
-        x >= 0,
-        1.0 / (1.0 + np.exp(-x)),
-        np.exp(x) / (1.0 + np.exp(x)),
-    )
+    out = np.empty_like(x)
+    nonnegative = x >= 0
+    out[nonnegative] = 1.0 / (1.0 + np.exp(-x[nonnegative]))
+    exp_x = np.exp(x[~nonnegative])
+    out[~nonnegative] = exp_x / (1.0 + exp_x)
+    return out
 
 
 def logit(x):

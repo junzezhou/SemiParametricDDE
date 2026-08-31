@@ -39,8 +39,8 @@ def _tlp_penalty_value_grad(x, pen, tau):
     active = (np.abs(x) < tau) & (x != 0.0)
     grad[active] = float(pen) * np.sign(x[active])
     return value, grad
-  
-  
+
+
 # MARK: Original SA objective accumulation built a nested closure chain, so each
 # objective evaluation became more expensive as the SAEM inner iteration grew.
 # def _sa_accumulate(f_old, f_new, t):
@@ -194,6 +194,10 @@ class _BernoulliLayerAccumulator:
         grad = self.design.T @ (residual * clip_derivative)
         return value, grad
 
+    def weighted_design_gram(self):
+        """Return the SA-weighted design cross-product for this layer."""
+        return self.design.T @ (self.counts[:, None] * self.design)
+
 
 class _DirectAddressBernoulliLayerAccumulator:
     """Exact dense statistics for layers with few binary parents.
@@ -278,6 +282,10 @@ class _DirectAddressBernoulliLayerAccumulator:
         ).astype(float)
         grad = self.design.T @ (residual * clip_derivative)
         return value, grad
+
+    def weighted_design_gram(self):
+        """Return the SA-weighted design cross-product for this layer."""
+        return self.design.T @ (self.counts[:, None] * self.design)
 
 
 class _BinaryHistoryBernoulliLayerAccumulator:
@@ -441,6 +449,18 @@ class _BinaryHistoryBernoulliLayerAccumulator:
         grad[0] = np.sum(residual)
         grad[1:] = parents.T @ residual
         return value, grad
+
+    def weighted_design_gram(self):
+        """Return the SA-weighted cross-product without expanding a design."""
+        parents = self._parents[:self._size]
+        gram = np.empty((self.K_upper + 1, self.K_upper + 1), dtype=float)
+        gram[0, 0] = self._size
+        parent_sums = np.sum(parents, axis=0)
+        gram[0, 1:] = parent_sums
+        gram[1:, 0] = parent_sums
+        gram[1:, 1:] = parents.T @ parents
+        gram *= self._row_weight
+        return gram
 
 
 _DIRECT_ADDRESS_MAX_BITS = 10

@@ -24,7 +24,16 @@ from dde.algorithms.csp import csp_active_mask, update_csp_layer
 from dde.algorithms.normal_init_semi import Normal_init_semi
 
 
-def _block_loadings(J, K, block_size, positive, negative, seed):
+def _block_loadings(
+    J,
+    K,
+    block_size,
+    positive,
+    negative,
+    seed,
+    *,
+    negative_columns=None,
+):
     rng = np.random.default_rng(seed)
     out = np.zeros((J, K), dtype=float)
     n_blocks = int(np.ceil(J / block_size))
@@ -34,8 +43,11 @@ def _block_loadings(J, K, block_size, positive, negative, seed):
         start = block * block_size
         stop = min((block + 1) * block_size, J)
         positive_column = block
-        choices = np.delete(np.arange(K), positive_column)
-        negative_column = int(rng.choice(choices))
+        if negative_columns is None:
+            choices = np.delete(np.arange(K), positive_column)
+            negative_column = int(rng.choice(choices))
+        else:
+            negative_column = int(negative_columns[block])
         out[start:stop, positive_column] += positive
         out[start:stop, negative_column] -= negative
     return out
@@ -98,9 +110,27 @@ def _scenario_d3():
     J = 108
     K_true = (18, 6, 2)
     K_max = (36, 12, 4)
-    B1_slope = _block_loadings(J, K_true[0], 6, 10.0, 5.0, seed=1)
+    B1_negative_columns = np.array(
+        [4, 14, 10, 13, 2, 16, 14, 9, 4, 17, 1, 17, 4, 1, 8, 4, 4, 5]
+    ) - 1
+    B2_negative_columns = np.array([2, 5, 4, 5, 1, 5]) - 1
+    B1_slope = _block_loadings(
+        J,
+        K_true[0],
+        6,
+        10.0,
+        5.0,
+        seed=1,
+        negative_columns=B1_negative_columns,
+    )
     B2_slope = _block_loadings(
-        K_true[0], K_true[1], 3, 4.0, 4.0 / 3.0, seed=1
+        K_true[0],
+        K_true[1],
+        3,
+        4.0,
+        4.0 / 3.0,
+        seed=1,
+        negative_columns=B2_negative_columns,
     )
     B3_slope = _deep_loading(K_true[1], K_true[2], 4.0)
     return {
@@ -284,6 +314,9 @@ def _run_one(
     seed_base,
     dataset_cache,
     initialization_cache,
+    keep_trace=False,
+    csp_backend="saem",
+    csp_min_iter=30,
 ):
     group, N, replicate, init_mode, multiplier, temperature, threshold_name = configuration
     data_seed = seed_base + 100_000 * scenario["D"] + 1_000 * N + replicate
@@ -333,7 +366,9 @@ def _run_one(
         optimizer_maxiter=optimizer_maxiter,
         optimizer_tol=1e-6,
         random_state=fit_seed,
-        keep_trace=True,
+        keep_trace=keep_trace,
+        csp_backend=csp_backend,
+        csp_min_iter=csp_min_iter,
         verbose=False,
     )
     elapsed = time.perf_counter() - started
@@ -343,7 +378,15 @@ def _run_one(
         for A_est, A_layer_true in zip(result.A_list, A_true)
     )
     trace = result.diagnostics.get("trace", [])
-    first_active = tuple(trace[0]["num_active"].tolist()) if trace else K_fit
+    first_csp_entry = next(
+        (entry for entry in trace if entry.get("phase") == "saem_csp"),
+        trace[0] if trace else None,
+    )
+    first_active = (
+        tuple(first_csp_entry["num_active"].tolist())
+        if first_csp_entry is not None
+        else None
+    )
 
     record = {
         "scenario": scenario["name"],
@@ -357,11 +400,15 @@ def _run_one(
         "threshold_name": threshold_name,
         "tau": tau,
         "mc_samples": mc_samples,
+        "csp_backend": csp_backend,
+        "csp_min_iter": csp_min_iter,
         "K_true": json.dumps(list(scenario["K_true"])),
         "K_max": json.dumps(list(scenario["K_max"])),
         "K_initial_allocation": json.dumps(list(initial_counts)),
         "K_truth_allocation": json.dumps(list(truth_counts)),
-        "K_first_iteration": json.dumps(list(first_active)),
+        "K_first_iteration": (
+            json.dumps(list(first_active)) if first_active is not None else ""
+        ),
         "K_fit": json.dumps(list(K_fit)),
         "K_trace": json.dumps(
             [entry["num_active"].astype(int).tolist() for entry in trace]
@@ -393,13 +440,29 @@ def _run_one(
         "exact_width": int(K_fit == scenario["K_true"]),
         "collapsed_layer": int(any(value == 0 for value in K_fit)),
         "iterations": result.diagnostics["iterations"],
+        "sa_iterations": result.diagnostics.get("sa_iterations", 0),
+        "csp_start_iteration": result.diagnostics.get(
+            "csp_start_iteration", np.nan
+        ),
+        "stopped_by_convergence": int(
+            result.diagnostics.get("stopped_by_convergence", False)
+        ),
+        "hit_max_iter": int(result.diagnostics["iterations"] >= max_iter),
+        "dimension_l1_error": int(
+            sum(
+                abs(fitted - truth)
+                for fitted, truth in zip(K_fit, scenario["K_true"])
+            )
+        ),
         "fit_seconds": elapsed,
     }
     for d in range(scenario["D"]):
         record[f"K{d + 1}_true"] = scenario["K_true"][d]
         record[f"K{d + 1}_initial"] = initial_counts[d]
         record[f"K{d + 1}_truth_allocation"] = truth_counts[d]
-        record[f"K{d + 1}_first"] = first_active[d]
+        record[f"K{d + 1}_first"] = (
+            first_active[d] if first_active is not None else np.nan
+        )
         record[f"K{d + 1}_fit"] = K_fit[d]
         record[f"K{d + 1}_error"] = K_fit[d] - scenario["K_true"][d]
         record[f"A{d + 1}_initial_accuracy"] = initial_A_accuracy[d]
@@ -415,10 +478,90 @@ def _run_one(
 
 def _write_csv(path, records):
     fields = sorted({key for record in records for key in record})
-    with path.open("w", newline="") as stream:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows(records)
+    temporary.replace(path)
+
+
+def _read_csv(path):
+    categorical = {
+        "scenario",
+        "group",
+        "init_mode",
+        "threshold_name",
+        "csp_backend",
+        "t_spike",
+        "K_true",
+        "K_max",
+        "K_initial_allocation",
+        "K_truth_allocation",
+        "K_first_iteration",
+        "K_fit",
+        "K_trace",
+        "allocation_trace",
+        "omega_trace",
+        "allocation_input_column_l1_trace",
+        "updated_column_l1_trace",
+    }
+    with path.open(newline="") as stream:
+        records = list(csv.DictReader(stream))
+    for record in records:
+        for key, value in tuple(record.items()):
+            if key in categorical or key.startswith("B") or value == "":
+                continue
+            try:
+                record[key] = float(value)
+            except ValueError:
+                pass
+    return records
+
+
+def _record_configuration_key(record):
+    return (
+        record["scenario"],
+        record["group"],
+        int(float(record["N"])),
+        int(float(record["replicate"])),
+        record["init_mode"],
+        float(record["spike_multiplier"]),
+        float(record["temperature"]),
+        record["threshold_name"],
+        int(float(record["mc_samples"])),
+        record.get("csp_backend", "mcem"),
+        int(float(record.get("csp_min_iter", 0))),
+    )
+
+
+def _target_configuration_key(
+    scenario,
+    configuration,
+    mc_samples,
+    csp_backend,
+    csp_min_iter,
+):
+    group, N, replicate, init_mode, multiplier, temperature, threshold_name = configuration
+    return (
+        scenario["name"],
+        group,
+        int(N),
+        int(replicate),
+        init_mode,
+        float(multiplier),
+        float(temperature),
+        threshold_name,
+        int(mc_samples),
+        str(csp_backend),
+        int(csp_min_iter),
+    )
+
+
+def _nanmean_or_nan(values):
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    return float(np.mean(values[finite])) if np.any(finite) else float("nan")
 
 
 def _summarize(records):
@@ -432,9 +575,15 @@ def _summarize(records):
         "temperature",
         "threshold_name",
         "mc_samples",
+        "csp_backend",
     )
     for record in records:
-        groups[tuple(record[key] for key in keys)].append(record)
+        groups[
+            tuple(
+                record.get(key, "mcem" if key == "csp_backend" else None)
+                for key in keys
+            )
+        ].append(record)
 
     summary = []
     for key, rows in sorted(groups.items()):
@@ -442,6 +591,10 @@ def _summarize(records):
         item["fits"] = len(rows)
         item["exact_width_rate"] = float(np.mean([row["exact_width"] for row in rows]))
         item["collapse_rate"] = float(np.mean([row["collapsed_layer"] for row in rows]))
+        item["hit_max_iter_rate"] = float(np.mean([row["hit_max_iter"] for row in rows]))
+        item["mean_dimension_l1_error"] = float(
+            np.mean([row["dimension_l1_error"] for row in rows])
+        )
         item["mean_fit_seconds"] = float(np.mean([row["fit_seconds"] for row in rows]))
         D = len(json.loads(rows[0]["K_true"]))
         for d in range(D):
@@ -449,16 +602,14 @@ def _summarize(records):
                 item[f"mean_K{d + 1}_{suffix}"] = float(
                     np.mean([row[f"K{d + 1}_{suffix}"] for row in rows])
                 )
-            item[f"mean_A{d + 1}_initial_accuracy"] = float(
-                np.nanmean([row[f"A{d + 1}_initial_accuracy"] for row in rows])
+            item[f"mean_A{d + 1}_initial_accuracy"] = _nanmean_or_nan(
+                [row[f"A{d + 1}_initial_accuracy"] for row in rows]
             )
-            item[f"mean_A{d + 1}_final_accuracy"] = float(
-                np.nanmean([row[f"A{d + 1}_final_accuracy"] for row in rows])
+            item[f"mean_A{d + 1}_final_accuracy"] = _nanmean_or_nan(
+                [row[f"A{d + 1}_final_accuracy"] for row in rows]
             )
-            item[f"mean_A{d + 1}_max_abs_correlation"] = float(
-                np.nanmean(
-                    [row[f"A{d + 1}_max_abs_correlation"] for row in rows]
-                )
+            item[f"mean_A{d + 1}_max_abs_correlation"] = _nanmean_or_nan(
+                [row[f"A{d + 1}_max_abs_correlation"] for row in rows]
             )
         summary.append(item)
     return summary
@@ -472,7 +623,21 @@ def main():
     parser.add_argument("--max-iter", type=int, default=30)
     parser.add_argument("--optimizer-maxiter", type=int, default=100)
     parser.add_argument("--mc-samples", type=int, default=1)
+    parser.add_argument(
+        "--csp-backend", choices=("saem", "mcem"), default="saem"
+    )
+    parser.add_argument("--csp-min-iter", type=int, default=30)
     parser.add_argument("--seed-base", type=int, default=20260828)
+    parser.add_argument(
+        "--keep-trace",
+        action="store_true",
+        help="Store full per-iteration CSP histories in the fit CSV.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip configurations already checkpointed in the output fit CSV.",
+    )
     parser.add_argument(
         "--spike-multipliers",
         type=float,
@@ -532,17 +697,38 @@ def main():
         ]
         for scenario in scenarios
     }
-    records = []
+    fits_path = args.output_dir / "normal_csp_recovery_fits.csv"
+    records = _read_csv(fits_path) if args.resume and fits_path.exists() else []
+    completed_keys = {_record_configuration_key(record) for record in records}
     dataset_cache = {}
     initialization_cache = {}
     total = sum(
         len(configuration_by_scenario[scenario["name"]])
         for scenario in scenarios
     )
-    completed = 0
-    fits_path = args.output_dir / "normal_csp_recovery_fits.csv"
+    completed = sum(
+        _target_configuration_key(
+            scenario,
+            configuration,
+            args.mc_samples,
+            args.csp_backend,
+            args.csp_min_iter,
+        )
+        in completed_keys
+        for scenario in scenarios
+        for configuration in configuration_by_scenario[scenario["name"]]
+    )
     for scenario in scenarios:
         for configuration in configuration_by_scenario[scenario["name"]]:
+            configuration_key = _target_configuration_key(
+                scenario,
+                configuration,
+                args.mc_samples,
+                args.csp_backend,
+                args.csp_min_iter,
+            )
+            if configuration_key in completed_keys:
+                continue
             record = _run_one(
                 scenario,
                 configuration,
@@ -552,8 +738,12 @@ def main():
                 args.seed_base,
                 dataset_cache,
                 initialization_cache,
+                keep_trace=args.keep_trace,
+                csp_backend=args.csp_backend,
+                csp_min_iter=args.csp_min_iter,
             )
             records.append(record)
+            completed_keys.add(configuration_key)
             _write_csv(fits_path, records)
             completed += 1
             print(
@@ -573,7 +763,10 @@ def main():
         "max_iter": args.max_iter,
         "optimizer_maxiter": args.optimizer_maxiter,
         "mc_samples": args.mc_samples,
+        "csp_backend": args.csp_backend,
+        "csp_min_iter": args.csp_min_iter,
         "seed_base": args.seed_base,
+        "keep_trace": args.keep_trace,
         "scenarios_selected": args.scenarios,
         "groups_selected": args.groups,
         "spike_multipliers_selected": args.spike_multipliers,

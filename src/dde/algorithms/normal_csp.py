@@ -1,22 +1,22 @@
-"""CSP-MAP approximate MCEM for a Normal-observed DDE.
+"""CSP-MAP MCEM and SAEM kernels for a Normal-observed DDE.
 
-This estimator follows the coordinate-ascent MCEM architecture used by the
-package's CopDDE CSP path, without rank-likelihood augmentation.  It reuses the
-vectorized Normal-DDE latent-probability sweep and solves the conditional
-weighted-lasso M-steps with batched proximal gradient updates.
+The legacy kernel follows the coordinate-ascent MCEM architecture used by the
+package's CopDDE CSP path.  The SAEM kernel adds an unpenalized warm-up followed
+by compact running sufficient statistics.  Both work directly on Normal data,
+without rank-likelihood augmentation, and share batched proximal-gradient
+weighted-lasso updates.
 """
 
 from __future__ import annotations
-
-from collections.abc import Sequence
-from typing import Optional
 
 import numpy as np
 from scipy.special import expit
 
 from .csp import csp_active_mask, update_csp_layer
 from .semi_saem import (
+    _ObservedNormalAccumulator,
     _compute_bernoulli_probabilities_normal,
+    _make_bernoulli_layer_accumulator,
     _normal_sample_statistics,
 )
 
@@ -43,6 +43,32 @@ def _validate_spike_scales(t_spike, D: int) -> np.ndarray:
     return scales
 
 
+def _canonicalize_csp_layer_order(prop, B_list, A_list):
+    """Order latent coordinates by loading strength without changing the model.
+
+    The cumulative-shrinkage prior is ordered, whereas spectral/varimax
+    initialization is permutation invariant.  A simultaneous permutation of
+    a layer's incoming columns, persistent states, and outgoing rows preserves
+    every model probability while placing the strongest coordinates first.
+    """
+    prop = np.asarray(prop, dtype=float).copy()
+    B_list = [np.asarray(B, dtype=float).copy() for B in B_list]
+    A_list = [np.asarray(A).copy() for A in A_list]
+    permutations = []
+    D = len(B_list)
+    for d in range(D):
+        strength = np.sum(np.abs(B_list[d][:, 1:]), axis=0)
+        permutation = np.argsort(-strength, kind="stable")
+        permutations.append(permutation)
+        B_list[d][:, 1:] = B_list[d][:, permutation + 1]
+        A_list[d] = A_list[d][:, permutation]
+        if d + 1 < D:
+            B_list[d + 1] = B_list[d + 1][permutation, :]
+        else:
+            prop = prop[permutation]
+    return prop, B_list, A_list, permutations
+
+
 def _sample_latent_layers(ber, C: int, rng) -> list[np.ndarray]:
     samples = []
     for probs in ber:
@@ -61,25 +87,28 @@ def _largest_eigenvalue_psd(matrix: np.ndarray) -> float:
     return max(float(np.linalg.eigvalsh(matrix)[-1]), 0.0)
 
 
-def _solve_gaussian_weighted_l1(
+def _solve_gaussian_weighted_l1_from_statistics(
     X,
-    A_sample,
+    Q,
+    q_all,
     B_start,
     gamma,
     penalty_scale,
     temperature,
     *,
+    mc_samples=1,
     max_iter=100,
     tol=1e-6,
     bound=10.0,
 ):
-    """Batched FISTA update for the Normal observed layer and its variances."""
+    """Batched Normal-layer update from MC or SA sufficient statistics."""
     X = np.asarray(X, dtype=float)
+    Q = np.asarray(Q, dtype=float)
+    q_all = np.asarray(q_all, dtype=float)
     B = np.asarray(B_start, dtype=float).copy()
     gamma = np.maximum(np.asarray(gamma, dtype=float).reshape(-1), 1e-10)
     penalty_scale = np.asarray(penalty_scale, dtype=float)
-    C = int(A_sample.shape[2])
-    Q, q_all = _normal_sample_statistics(X, A_sample)
+    C = int(mc_samples)
 
     largest = _largest_eigenvalue_psd(Q)
     if largest <= 1e-14:
@@ -121,6 +150,35 @@ def _solve_gaussian_weighted_l1(
     N = X.shape[0]
     gamma_update = (1.0 + 0.5 * sse) / (1.0 + 0.5 * N * C + 1.0)
     return B, np.maximum(gamma_update, 1e-10)
+
+
+def _solve_gaussian_weighted_l1(
+    X,
+    A_sample,
+    B_start,
+    gamma,
+    penalty_scale,
+    temperature,
+    *,
+    max_iter=100,
+    tol=1e-6,
+    bound=10.0,
+):
+    """Batched FISTA update for one current Normal Monte Carlo sample."""
+    Q, q_all = _normal_sample_statistics(X, A_sample)
+    return _solve_gaussian_weighted_l1_from_statistics(
+        X,
+        Q,
+        q_all,
+        B_start,
+        gamma,
+        penalty_scale,
+        temperature,
+        mc_samples=A_sample.shape[2],
+        max_iter=max_iter,
+        tol=tol,
+        bound=bound,
+    )
 
 
 def _solve_logistic_weighted_l1(
@@ -166,6 +224,75 @@ def _solve_logistic_weighted_l1(
         gradient = (
             float(temperature) / C
         ) * ((expit(logits) - response).T @ design)
+        candidate = Y - step * gradient
+        candidate[:, 0] = np.clip(candidate[:, 0], -5.0, bound)
+        candidate[:, 1:] = _soft_threshold(
+            candidate[:, 1:], step / penalty_scale
+        )
+        candidate[:, 1:] = np.clip(candidate[:, 1:], -bound, bound)
+
+        relative = np.linalg.norm(candidate - B) / (
+            np.linalg.norm(B) + 1e-12
+        )
+        next_momentum = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * momentum**2))
+        Y = candidate + ((momentum - 1.0) / next_momentum) * (
+            candidate - B
+        )
+        B = candidate
+        momentum = next_momentum
+        if relative <= tol:
+            break
+    return B
+
+
+def _solve_logistic_weighted_l1_from_accumulator(
+    accumulator,
+    B_start,
+    penalty_scale,
+    temperature,
+    *,
+    max_iter=100,
+    tol=1e-6,
+    bound=10.0,
+):
+    """Batched FISTA update from a Bernoulli-layer SA accumulator."""
+    B = np.asarray(B_start, dtype=float).copy()
+    penalty_scale = np.asarray(penalty_scale, dtype=float)
+    gram = accumulator.weighted_design_gram()
+    lipschitz = (
+        float(temperature) * 0.25 * _largest_eigenvalue_psd(gram)
+    )
+    if lipschitz <= 1e-14:
+        B[:, 0] = 0.0
+        B[:, 1:] = 0.0
+        return B
+
+    step = 1.0 / lipschitz
+    Y = B.copy()
+    momentum = 1.0
+    has_grouped_design = all(
+        hasattr(accumulator, name) for name in ("design", "counts", "sum_y")
+    )
+    for _ in range(int(max_iter)):
+        if has_grouped_design:
+            raw_logits = accumulator.design @ Y.T
+            logits = np.clip(raw_logits, -500.0, 500.0)
+            residual = (
+                accumulator.counts[:, None] * expit(logits)
+                - accumulator.sum_y
+            )
+            residual *= (raw_logits > -500.0) & (raw_logits < 500.0)
+            gradient = float(temperature) * (
+                residual.T @ accumulator.design
+            )
+        else:
+            gradient = np.empty_like(Y)
+            for child_index, coefficients in enumerate(Y):
+                _, row_gradient = accumulator.value_and_grad(
+                    child_index, coefficients
+                )
+                gradient[child_index] = float(temperature) * row_gradient
+
         candidate = Y - step * gradient
         candidate[:, 0] = np.clip(candidate[:, 0], -5.0, bound)
         candidate[:, 1:] = _soft_threshold(
@@ -403,8 +530,370 @@ def fit_normal_csp_mcem(
     }
 
 
+def fit_normal_csp_saem(
+    X,
+    prop_in,
+    B_list_in,
+    gamma_in,
+    A_list_in,
+    *,
+    C: int,
+    max_iter: int,
+    t_spike,
+    temperature: float,
+    threshold: float,
+    convergence_tol: float = 0.005,
+    convergence_mean_tol: float = 0.01,
+    convergence_window: int = 7,
+    width_stability_window: int = 10,
+    min_iter: int = 30,
+    burn: int = 5,
+    optimizer_maxiter: int = 100,
+    optimizer_tol: float = 1e-6,
+    bound_val: float = 10.0,
+    estep_row_chunk_size: int = 2048,
+    random_state=None,
+    keep_trace: bool = False,
+    verbose: bool = True,
+):
+    """Fit a Normal DDE with warm-started CSP and SAEM M-steps.
+
+    The annealing phase deliberately performs no CSP allocation: all maximal
+    columns use the slab scale and current-sample MCEM updates.  On the first
+    iteration whose incoming temperature is one, fresh sufficient statistics
+    are created and CSP/SAEM start together.  Consequently no tempered draws
+    enter the stochastic approximation.
+    """
+    X = np.asarray(X, dtype=float)
+    prop = np.asarray(prop_in, dtype=float).reshape(-1).copy()
+    B_list = [np.asarray(B, dtype=float).copy() for B in B_list_in]
+    gamma = np.asarray(gamma_in, dtype=float).reshape(-1).copy()
+    A_list = [np.asarray(A, dtype=np.uint8).copy() for A in A_list_in]
+    D = len(B_list)
+    K = [B.shape[1] - 1 for B in B_list]
+    J = X.shape[1]
+
+    C = int(C)
+    max_iter = int(max_iter)
+    convergence_window = int(convergence_window)
+    width_stability_window = int(width_stability_window)
+    min_iter = int(min_iter)
+    burn = int(burn)
+    optimizer_maxiter = int(optimizer_maxiter)
+    temperature = float(temperature)
+    threshold = float(threshold)
+    convergence_tol = float(convergence_tol)
+    convergence_mean_tol = float(convergence_mean_tol)
+    if C < 1 or max_iter < 1:
+        raise ValueError("C and max_iter must be positive integers.")
+    if (
+        convergence_window < 1
+        or width_stability_window < 1
+        or min_iter < 1
+        or burn < 0
+        or optimizer_maxiter < 1
+    ):
+        raise ValueError(
+            "convergence windows, min_iter, and optimizer_maxiter must be "
+            "positive, and burn nonnegative."
+        )
+    if not np.isfinite(temperature) or not 0.0 < temperature <= 1.0:
+        raise ValueError("temperature must lie in (0, 1].")
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError("threshold must be finite and positive.")
+    if not np.isfinite(convergence_tol) or convergence_tol < 0:
+        raise ValueError("convergence_tol must be finite and nonnegative.")
+    if not np.isfinite(convergence_mean_tol) or convergence_mean_tol < 0:
+        raise ValueError(
+            "convergence_mean_tol must be finite and nonnegative."
+        )
+    spike_scales = _validate_spike_scales(t_spike, D)
+    rng = _as_rng(random_state)
+    slab_scale = [np.ones(Kd, dtype=float) for Kd in K]
+    omega = [np.ones(Kd + 1, dtype=float) / (Kd + 1) for Kd in K]
+    # Kd + 1 assigns every coordinate to a slab component under the shared
+    # csp_active_mask rule.  These values are replaced by real CSP draws when
+    # the SA phase begins.
+    allocation = [np.full(Kd, Kd + 1, dtype=int) for Kd in K]
+    penalty_scale = [
+        np.ones((J if d == 0 else K[d - 1], K[d]), dtype=float)
+        for d in range(D)
+    ]
+    active_masks = [np.ones(Kd, dtype=bool) for Kd in K]
+    num_active = np.asarray(K, dtype=int)
+    relative_history = [[] for _ in range(D)]
+    sa_relative_history = [[] for _ in range(D)]
+    width_history = []
+    trace = [] if keep_trace else None
+    current_temperature = temperature
+
+    observed_accumulator = None
+    bernoulli_accumulators = None
+    prop_statistic = None
+    sa_iterations = 0
+    csp_start_iteration = None
+    stopped_by_convergence = False
+    activation_permutations = None
+
+    iterations = 0
+    while iterations < max_iter:
+        csp_started = current_temperature >= 1.0 - 1e-12
+        if csp_started and observed_accumulator is None:
+            (
+                prop,
+                B_list,
+                A_list,
+                activation_permutations,
+            ) = _canonicalize_csp_layer_order(prop, B_list, A_list)
+        probabilities = _compute_bernoulli_probabilities_normal(
+            X,
+            prop,
+            B_list,
+            gamma,
+            A_list,
+            row_chunk_size=estep_row_chunk_size,
+            temperature=current_temperature,
+        )
+        A_samples = _sample_latent_layers(probabilities, C, rng)
+
+        if csp_started:
+            if observed_accumulator is None:
+                observed_accumulator = _ObservedNormalAccumulator(
+                    J, K[0] + 1
+                )
+                bernoulli_accumulators = [
+                    _make_bernoulli_layer_accumulator(
+                        K[d], B_list[d].shape[0]
+                    )
+                    for d in range(1, D)
+                ]
+                prop_statistic = np.zeros(K[-1], dtype=float)
+                csp_start_iteration = iterations + 1
+
+            sa_iterations += 1
+            rho = 1.0 / sa_iterations
+            prop_current = np.mean(probabilities[-1], axis=0)
+            prop_statistic = (
+                (1.0 - rho) * prop_statistic + rho * prop_current
+            )
+            observed_accumulator.update(X, A_samples[0], sa_iterations)
+            for d in range(1, D):
+                bernoulli_accumulators[d - 1].update(
+                    A_samples[d - 1],
+                    A_samples[d],
+                    sa_iterations,
+                )
+
+            for d in range(D - 1, -1, -1):
+                num_rows = J if d == 0 else int(num_active[d - 1])
+                (
+                    allocation[d],
+                    penalty_scale[d],
+                    slab_scale[d],
+                    omega[d],
+                ) = update_csp_layer(
+                    B_list[d],
+                    omega[d],
+                    spike_scales[d],
+                    slab_scale[d],
+                    num_rows,
+                    rng=rng,
+                )
+
+            prop_update = prop_statistic.copy()
+            B_update = [None] * D
+            B_update[0], gamma_update = (
+                _solve_gaussian_weighted_l1_from_statistics(
+                    X,
+                    observed_accumulator.Q,
+                    observed_accumulator.q_all,
+                    B_list[0],
+                    gamma,
+                    penalty_scale[0],
+                    current_temperature,
+                    mc_samples=C,
+                    max_iter=optimizer_maxiter,
+                    tol=optimizer_tol,
+                    bound=bound_val,
+                )
+            )
+            for d in range(1, D):
+                B_update[d] = _solve_logistic_weighted_l1_from_accumulator(
+                    bernoulli_accumulators[d - 1],
+                    B_list[d],
+                    penalty_scale[d],
+                    current_temperature,
+                    max_iter=optimizer_maxiter,
+                    tol=optimizer_tol,
+                    bound=bound_val,
+                )
+        else:
+            # Warm-up uses the slab for every coordinate and only the current
+            # Monte Carlo draw.  Its tempered samples are intentionally not
+            # retained in the later stochastic approximation.
+            prop_update = np.mean(probabilities[-1], axis=0)
+            B_update = [None] * D
+            B_update[0], gamma_update = _solve_gaussian_weighted_l1(
+                X,
+                A_samples[0],
+                B_list[0],
+                gamma,
+                penalty_scale[0],
+                current_temperature,
+                max_iter=optimizer_maxiter,
+                tol=optimizer_tol,
+                bound=bound_val,
+            )
+            for d in range(1, D):
+                B_update[d] = _solve_logistic_weighted_l1(
+                    A_samples[d - 1],
+                    A_samples[d],
+                    B_list[d],
+                    penalty_scale[d],
+                    current_temperature,
+                    max_iter=optimizer_maxiter,
+                    tol=optimizer_tol,
+                    bound=bound_val,
+                )
+
+        iterations += 1
+        inactive_indices = []
+        if csp_started:
+            for d in range(D):
+                active_masks[d] = csp_active_mask(allocation[d])
+                inactive = np.flatnonzero(~active_masks[d])
+                inactive_indices.append(inactive)
+                num_active[d] = int(np.sum(active_masks[d]))
+        else:
+            inactive_indices = [np.empty(0, dtype=int) for _ in range(D)]
+
+        for d in range(min(2, D)):
+            slopes = B_update[d][:, 1:]
+            slopes[np.abs(slopes) < threshold] = 0.0
+
+        for d in range(D - 1):
+            if inactive_indices[d].size:
+                B_update[d + 1][inactive_indices[d], :] = 0.0
+
+        if iterations > burn:
+            current_temperature = min(
+                1.0,
+                current_temperature + 0.01 * ((iterations - burn) - 1),
+            )
+
+        current_relative = []
+        for d in range(D):
+            relative = np.linalg.norm(
+                B_update[d][:, 1:] - B_list[d][:, 1:], ord="fro"
+            ) / (np.linalg.norm(B_list[d][:, 1:], ord="fro") + 1e-6)
+            relative_history[d].append(float(relative))
+            current_relative.append(float(relative))
+            if csp_started:
+                sa_relative_history[d].append(float(relative))
+
+        stop_now = False
+        if csp_started:
+            width_history.append(tuple(int(value) for value in num_active))
+            enough_relative = all(
+                len(history) >= convergence_window
+                and np.mean(history[-convergence_window:])
+                < convergence_mean_tol
+                and np.std(history[-convergence_window:]) < convergence_tol
+                for history in sa_relative_history
+            )
+            stable_width = (
+                len(width_history) >= width_stability_window
+                and len(set(width_history[-width_stability_window:])) == 1
+            )
+            stop_now = (
+                iterations >= min_iter
+                and sa_iterations
+                >= max(convergence_window, width_stability_window)
+                and enough_relative
+                and stable_width
+            )
+
+        if keep_trace:
+            trace.append(
+                {
+                    "iteration": iterations,
+                    "phase": "saem_csp" if csp_started else "warmup",
+                    "sa_iteration": sa_iterations,
+                    "num_active": num_active.copy(),
+                    "allocation": [value.copy() for value in allocation],
+                    "omega": [value.copy() for value in omega],
+                    "allocation_input_column_l1": [
+                        np.sum(np.abs(B[:, 1:]), axis=0) for B in B_list
+                    ],
+                    "updated_column_l1": [
+                        np.sum(np.abs(B[:, 1:]), axis=0) for B in B_update
+                    ],
+                    "relative_change": tuple(current_relative),
+                    "temperature": float(current_temperature),
+                    "will_stop": bool(stop_now),
+                }
+            )
+
+        A_list = [
+            (np.mean(sample[:, 1:, :], axis=2) > 0.5).astype(np.uint8)
+            for sample in A_samples
+        ]
+        B_list = [B.copy() for B in B_update]
+        gamma = gamma_update.copy()
+        prop = prop_update.copy()
+
+        if verbose:
+            phase = "SAEM-CSP" if csp_started else "warm-up"
+            print(
+                f"Normal CSP {phase} iteration {iterations}, "
+                f"active={num_active.tolist()}, "
+                f"max relative change={max(current_relative):.4g}"
+            )
+        if stop_now:
+            stopped_by_convergence = True
+            break
+
+    for d in range(D):
+        inactive = np.flatnonzero(~active_masks[d])
+        if inactive.size:
+            B_list[d][:, inactive + 1] = 0.0
+
+    return {
+        "prop": prop,
+        "B_list": B_list,
+        "gamma": gamma,
+        "A_list": A_list,
+        "allocation": [value.copy() for value in allocation],
+        "omega": [value.copy() for value in omega],
+        "slab_scale": [value.copy() for value in slab_scale],
+        "penalty_scale": [value.copy() for value in penalty_scale],
+        "active_masks": [value.copy() for value in active_masks],
+        "num_active": num_active.copy(),
+        "iterations": iterations,
+        "sa_iterations": sa_iterations,
+        "activation_permutations": (
+            None
+            if activation_permutations is None
+            else [value.copy() for value in activation_permutations]
+        ),
+        "csp_start_iteration": csp_start_iteration,
+        "stopped_by_convergence": stopped_by_convergence,
+        "temperature": float(current_temperature),
+        "relative_history": [tuple(values) for values in relative_history],
+        "sa_relative_history": [
+            tuple(values) for values in sa_relative_history
+        ],
+        "width_history": tuple(width_history),
+        "trace": trace,
+    }
+
+
 __all__ = [
     "_solve_gaussian_weighted_l1",
+    "_solve_gaussian_weighted_l1_from_statistics",
     "_solve_logistic_weighted_l1",
+    "_solve_logistic_weighted_l1_from_accumulator",
+    "_canonicalize_csp_layer_order",
     "fit_normal_csp_mcem",
+    "fit_normal_csp_saem",
 ]

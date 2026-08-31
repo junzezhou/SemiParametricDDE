@@ -13,7 +13,7 @@ from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
 from .normal_init_semi import Normal_init_semi
-from .normal_csp import fit_normal_csp_mcem
+from .normal_csp import fit_normal_csp_mcem, fit_normal_csp_saem
 from .semi_saem import get_SAEM_normal
 
 
@@ -60,6 +60,10 @@ def fit_dde_normal(
     optimizer_maxiter: int = 100,
     optimizer_tol: float = 1e-6,
     convergence_window: int = 7,
+    convergence_mean_tol: float = 0.01,
+    width_stability_window: int = 10,
+    csp_min_iter: int = 30,
+    csp_backend: str = "mcem",
     burn: int = 5,
     estep_row_chunk_size: int = 2048,
     keep_trace: bool = False,
@@ -69,7 +73,7 @@ def fit_dde_normal(
     """Fit a fixed-width or CSP-shrunk parametric Normal DDE.
 
     The observed matrix is passed directly to the Normal initialization and
-    either the fixed-width SAEM kernel or the CSP approximate-MCEM kernel.  In
+    either the fixed-width SAEM kernel or a CSP MCEM/SAEM kernel.  In
     contrast, SemiDDE and CopDDE construct latent-Gaussian pseudo-observations
     before using their respective kernels.
 
@@ -230,7 +234,20 @@ def fit_dde_normal(
             raw=(X_result, prop, B_list, gamma, A_list, iterations),
         )
 
-    raw = fit_normal_csp_mcem(
+    backend = str(csp_backend).strip().lower()
+    if backend not in {"saem", "mcem"}:
+        raise ValueError("csp_backend must be 'saem' or 'mcem'.")
+    csp_kernel = (
+        fit_normal_csp_saem if backend == "saem" else fit_normal_csp_mcem
+    )
+    csp_options = {}
+    if backend == "saem":
+        csp_options.update(
+            convergence_mean_tol=convergence_mean_tol,
+            width_stability_window=width_stability_window,
+            min_iter=csp_min_iter,
+        )
+    raw = csp_kernel(
         X,
         prop,
         B_list,
@@ -251,6 +268,7 @@ def fit_dde_normal(
         random_state=random_state,
         keep_trace=keep_trace,
         verbose=bool(verbose),
+        **csp_options,
     )
 
     X_result = X.copy()
@@ -263,7 +281,7 @@ def fit_dde_normal(
         "family": "Normal",
         "dimension_method": "csp",
         "initialization": initialization,
-        "backend": "approximate_mcem_csp",
+        "backend": "saem_csp" if backend == "saem" else "approximate_mcem_csp",
         "threshold_rule": "first_two_layers",
         "num_active": raw["num_active"].copy(),
         "allocation": [value.copy() for value in raw["allocation"]],
@@ -272,6 +290,19 @@ def fit_dde_normal(
         "relative_history": raw["relative_history"],
         "temperature": raw["temperature"],
     }
+    if backend == "saem":
+        diagnostics.update(
+            {
+                "sa_iterations": raw["sa_iterations"],
+                "activation_permutations": raw[
+                    "activation_permutations"
+                ],
+                "csp_start_iteration": raw["csp_start_iteration"],
+                "stopped_by_convergence": raw["stopped_by_convergence"],
+                "sa_relative_history": raw["sa_relative_history"],
+                "width_history": raw["width_history"],
+            }
+        )
     if keep_trace:
         diagnostics["trace"] = raw["trace"]
 

@@ -151,6 +151,7 @@ def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
         tol=0.0,
         max_it=2,
         optimizer_maxiter=20,
+        csp_backend="saem",
         random_state=731,
         verbose=False,
     )
@@ -161,7 +162,9 @@ def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
     assert first.model == "DDE"
     assert first.diagnostics["family"] == "Normal"
     assert first.diagnostics["dimension_method"] == "csp"
-    assert first.diagnostics["backend"] == "approximate_mcem_csp"
+    assert first.diagnostics["backend"] == "saem_csp"
+    assert first.diagnostics["sa_iterations"] == 0
+    assert first.diagnostics["csp_start_iteration"] is None
     assert first.diagnostics["K_max_list"] == (6, 2)
     assert first.diagnostics["threshold_rule"] == "first_two_layers"
     fitted_K = tuple(first.diagnostics["K_list"])
@@ -180,6 +183,28 @@ def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
     np.testing.assert_allclose(first.prop, second.prop)
     for B_first, B_second in zip(first.B_list, second.B_list):
         np.testing.assert_allclose(B_first, B_second)
+
+
+def test_fit_dde_normal_csp_keeps_mcem_as_public_default():
+    X, _, _, _ = _normal_parameters()
+    result = fit(
+        X,
+        method="DDE",
+        D=2,
+        family="Normal",
+        dimension_method="csp",
+        t_spike=[0.03, 0.05],
+        temp=0.9,
+        tau=0.3,
+        C=1,
+        tol=0.0,
+        max_it=1,
+        optimizer_maxiter=1,
+        random_state=733,
+        verbose=False,
+    )
+
+    assert result.diagnostics["backend"] == "approximate_mcem_csp"
 
 
 @pytest.mark.parametrize(
