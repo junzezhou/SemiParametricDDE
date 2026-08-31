@@ -185,6 +185,7 @@ def _solve_gaussian_weighted_l1_from_statistics(
     temperature,
     *,
     mc_samples=1,
+    x_sq_sum=None,
     max_iter=100,
     tol=1e-6,
     bound=10.0,
@@ -233,7 +234,13 @@ def _solve_gaussian_weighted_l1_from_statistics(
 
     quadratic = np.einsum("jp,pq,jq->j", B, Q, B, optimize=True)
     cross = np.einsum("jp,jp->j", B, q_all, optimize=True)
-    sse_average = np.maximum(np.sum(X**2, axis=0) - 2.0 * cross + quadratic, 0.0)
+    if x_sq_sum is None:
+        x_sq_sum = np.sum(X**2, axis=0)
+    else:
+        x_sq_sum = np.asarray(x_sq_sum, dtype=float).reshape(-1)
+        if x_sq_sum.shape != (X.shape[1],):
+            raise ValueError("x_sq_sum must have one entry per observed column.")
+    sse_average = np.maximum(x_sq_sum - 2.0 * cross + quadratic, 0.0)
     sse = C * sse_average
     N = X.shape[0]
     gamma_update = (1.0 + 0.5 * sse) / (1.0 + 0.5 * N * C + 1.0)
@@ -248,6 +255,7 @@ def _solve_gaussian_weighted_l1(
     penalty_scale,
     temperature,
     *,
+    x_sq_sum=None,
     max_iter=100,
     tol=1e-6,
     bound=10.0,
@@ -263,6 +271,7 @@ def _solve_gaussian_weighted_l1(
         penalty_scale,
         temperature,
         mc_samples=A_sample.shape[2],
+        x_sq_sum=x_sq_sum,
         max_iter=max_iter,
         tol=tol,
         bound=bound,
@@ -429,6 +438,7 @@ def fit_normal_csp_mcem(
     optimizer_tol: float = 1e-6,
     bound_val: float = 10.0,
     estep_row_chunk_size: int = 2048,
+    estep_coordinate_chunk_size: int = 1,
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
@@ -448,6 +458,7 @@ def fit_normal_csp_mcem(
     D = len(B_list)
     K = [B.shape[1] - 1 for B in B_list]
     J = X.shape[1]
+    x_sq_sum = np.sum(X**2, axis=0)
 
     C = int(C)
     max_iter = int(max_iter)
@@ -550,6 +561,8 @@ def fit_normal_csp_mcem(
             gamma,
             A_list,
             row_chunk_size=estep_row_chunk_size,
+            coordinate_chunk_size=estep_coordinate_chunk_size,
+            eligible_widths=stage_caps,
             temperature=current_temperature,
         )
         A_samples = _sample_latent_layers(probabilities, C, rng)
@@ -593,6 +606,7 @@ def fit_normal_csp_mcem(
             gamma,
             penalty_scale[0],
             current_temperature,
+            x_sq_sum=x_sq_sum,
             max_iter=optimizer_maxiter,
             tol=optimizer_tol,
             bound=bound_val,
@@ -802,6 +816,7 @@ def fit_normal_csp_saem(
     optimizer_tol: float = 1e-6,
     bound_val: float = 10.0,
     estep_row_chunk_size: int = 2048,
+    estep_coordinate_chunk_size: int = 1,
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
@@ -822,6 +837,7 @@ def fit_normal_csp_saem(
     D = len(B_list)
     K = [B.shape[1] - 1 for B in B_list]
     J = X.shape[1]
+    x_sq_sum = np.sum(X**2, axis=0)
 
     C = int(C)
     max_iter = int(max_iter)
@@ -902,6 +918,7 @@ def fit_normal_csp_saem(
             gamma,
             A_list,
             row_chunk_size=estep_row_chunk_size,
+            coordinate_chunk_size=estep_coordinate_chunk_size,
             temperature=current_temperature,
         )
         A_samples = _sample_latent_layers(probabilities, C, rng)
@@ -962,6 +979,7 @@ def fit_normal_csp_saem(
                     penalty_scale[0],
                     current_temperature,
                     mc_samples=C,
+                    x_sq_sum=x_sq_sum,
                     max_iter=optimizer_maxiter,
                     tol=optimizer_tol,
                     bound=bound_val,
@@ -990,6 +1008,7 @@ def fit_normal_csp_saem(
                 gamma,
                 penalty_scale[0],
                 current_temperature,
+                x_sq_sum=x_sq_sum,
                 max_iter=optimizer_maxiter,
                 tol=optimizer_tol,
                 bound=bound_val,

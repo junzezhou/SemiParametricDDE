@@ -13,11 +13,13 @@ import csv
 import json
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from scipy.special import expit
+from threadpoolctl import threadpool_limits
 
 from dde import fit
 from dde.algorithms.csp import csp_active_mask, update_csp_layer
@@ -471,33 +473,6 @@ def _run_one(
             json.dumps(list(first_active)) if first_active is not None else ""
         ),
         "K_fit": json.dumps(list(K_fit)),
-        "K_trace": json.dumps(
-            [entry["num_active"].astype(int).tolist() for entry in trace]
-        ),
-        "allocation_trace": json.dumps(
-            [
-                [values.astype(int).tolist() for values in entry["allocation"]]
-                for entry in trace
-            ]
-        ),
-        "omega_trace": json.dumps(
-            [
-                [values.tolist() for values in entry["omega"]]
-                for entry in trace
-            ]
-        ),
-        "allocation_input_column_l1_trace": json.dumps(
-            [
-                [values.tolist() for values in entry["allocation_input_column_l1"]]
-                for entry in trace
-            ]
-        ),
-        "updated_column_l1_trace": json.dumps(
-            [
-                [values.tolist() for values in entry["updated_column_l1"]]
-                for entry in trace
-            ]
-        ),
         "exact_width": int(K_fit == scenario["K_true"]),
         "collapsed_layer": int(any(value == 0 for value in K_fit)),
         "iterations": result.diagnostics["iterations"],
@@ -517,6 +492,36 @@ def _run_one(
         ),
         "fit_seconds": elapsed,
     }
+    if keep_trace:
+        record.update(
+            K_trace=json.dumps(
+                [entry["num_active"].astype(int).tolist() for entry in trace]
+            ),
+            allocation_trace=json.dumps(
+                [
+                    [values.astype(int).tolist() for values in entry["allocation"]]
+                    for entry in trace
+                ]
+            ),
+            omega_trace=json.dumps(
+                [
+                    [values.tolist() for values in entry["omega"]]
+                    for entry in trace
+                ]
+            ),
+            allocation_input_column_l1_trace=json.dumps(
+                [
+                    [values.tolist() for values in entry["allocation_input_column_l1"]]
+                    for entry in trace
+                ]
+            ),
+            updated_column_l1_trace=json.dumps(
+                [
+                    [values.tolist() for values in entry["updated_column_l1"]]
+                    for entry in trace
+                ]
+            ),
+        )
     for d in range(scenario["D"]):
         record[f"K{d + 1}_true"] = scenario["K_true"][d]
         record[f"K{d + 1}_initial"] = initial_counts[d]
@@ -537,6 +542,19 @@ def _run_one(
     return record
 
 
+def _run_one_worker(payload):
+    scenario, configuration, positional, keyword = payload
+    with threadpool_limits(limits=1):
+        return _run_one(
+            scenario,
+            configuration,
+            *positional,
+            dataset_cache={},
+            initialization_cache={},
+            **keyword,
+        )
+
+
 def _write_csv(path, records):
     fields = sorted({key for record in records for key in record})
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -545,6 +563,38 @@ def _write_csv(path, records):
         writer.writeheader()
         writer.writerows(records)
     temporary.replace(path)
+
+
+def _write_jsonl(path, records):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w") as stream:
+        for record in records:
+            stream.write(json.dumps(record, separators=(",", ":")))
+            stream.write("\n")
+    temporary.replace(path)
+
+
+def _append_jsonl(path, record):
+    with path.open("a") as stream:
+        stream.write(json.dumps(record, separators=(",", ":")))
+        stream.write("\n")
+
+
+def _read_jsonl(path):
+    records = []
+    with path.open() as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                if any(remaining.strip() for remaining in stream):
+                    raise ValueError(
+                        f"Invalid JSONL checkpoint at line {line_number}."
+                    )
+                break
+    return records
 
 
 def _read_csv(path):
@@ -723,6 +773,7 @@ def main():
     parser.add_argument("--max-iter", type=int, default=30)
     parser.add_argument("--optimizer-maxiter", type=int, default=100)
     parser.add_argument("--mc-samples", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument(
         "--csp-backend", choices=("saem", "mcem"), default="saem"
     )
@@ -777,6 +828,8 @@ def main():
         default=Path("../Results/normal_dde_csp_diagnostics"),
     )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be a positive integer")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     scenarios = [
@@ -811,10 +864,20 @@ def main():
         for scenario in scenarios
     }
     fits_path = args.output_dir / "normal_csp_recovery_fits.csv"
-    records = _read_csv(fits_path) if args.resume and fits_path.exists() else []
+    checkpoint_path = args.output_dir / "normal_csp_recovery_fits.jsonl"
+    checkpoint_exists = checkpoint_path.exists()
+    if args.resume and checkpoint_exists:
+        records = _read_jsonl(checkpoint_path)
+    elif args.resume and fits_path.exists():
+        records = _read_csv(fits_path)
+    else:
+        records = []
+    if not (args.resume and checkpoint_exists):
+        _write_jsonl(checkpoint_path, records)
     completed_keys = {_record_configuration_key(record) for record in records}
     dataset_cache = {}
     initialization_cache = {}
+    cached_dataset_key = None
     total = sum(
         len(configuration_by_scenario[scenario["name"]])
         for scenario in scenarios
@@ -840,6 +903,7 @@ def main():
         for scenario in scenarios
         for configuration in configuration_by_scenario[scenario["name"]]
     )
+    pending = []
     for scenario in scenarios:
         for configuration in configuration_by_scenario[scenario["name"]]:
             configuration_key = _target_configuration_key(
@@ -860,31 +924,76 @@ def main():
             )
             if configuration_key in completed_keys:
                 continue
-            record = _run_one(
+            pending.append((scenario, configuration, configuration_key))
+
+    run_keyword = {
+        "keep_trace": args.keep_trace,
+        "csp_backend": args.csp_backend,
+        "csp_min_iter": args.csp_min_iter,
+        "mcem_stagewise": args.mcem_stagewise,
+        "mcem_stage_min_iter": args.mcem_stage_min_iter,
+        "mcem_stage_width_window": args.mcem_stage_width_window,
+        "mcem_stage_reinitialize_next": args.mcem_stage_reinitialize_next,
+        "mcem_stage_spectral_gap_threshold": (
+            args.mcem_stage_spectral_gap_threshold
+        ),
+        "mcem_first_penalty_power": args.mcem_first_penalty_power,
+        "mcem_top_spike_multiplier": args.mcem_top_spike_multiplier,
+    }
+    run_positional = (
+        args.max_iter,
+        args.optimizer_maxiter,
+        args.mc_samples,
+        args.seed_base,
+    )
+
+    if args.workers == 1:
+        def serial_records():
+            nonlocal cached_dataset_key
+            for scenario, configuration, configuration_key in pending:
+                dataset_key = (
+                    scenario["name"],
+                    int(configuration[1]),
+                    int(configuration[2]),
+                )
+                if dataset_key != cached_dataset_key:
+                    dataset_cache.clear()
+                    initialization_cache.clear()
+                    cached_dataset_key = dataset_key
+                with threadpool_limits(limits=1):
+                    record = _run_one(
+                        scenario,
+                        configuration,
+                        *run_positional,
+                        dataset_cache,
+                        initialization_cache,
+                        **run_keyword,
+                    )
+                yield configuration_key, record
+
+        record_iterator = serial_records()
+    else:
+        payloads = [
+            (
                 scenario,
                 configuration,
-                args.max_iter,
-                args.optimizer_maxiter,
-                args.mc_samples,
-                args.seed_base,
-                dataset_cache,
-                initialization_cache,
-                keep_trace=args.keep_trace,
-                csp_backend=args.csp_backend,
-                csp_min_iter=args.csp_min_iter,
-                mcem_stagewise=args.mcem_stagewise,
-                mcem_stage_min_iter=args.mcem_stage_min_iter,
-                mcem_stage_width_window=args.mcem_stage_width_window,
-                mcem_stage_reinitialize_next=args.mcem_stage_reinitialize_next,
-                mcem_stage_spectral_gap_threshold=(
-                    args.mcem_stage_spectral_gap_threshold
-                ),
-                mcem_first_penalty_power=args.mcem_first_penalty_power,
-                mcem_top_spike_multiplier=args.mcem_top_spike_multiplier,
+                run_positional,
+                run_keyword,
             )
+            for scenario, configuration, _ in pending
+        ]
+        executor = ProcessPoolExecutor(max_workers=args.workers)
+        worker_records = executor.map(_run_one_worker, payloads, chunksize=1)
+        record_iterator = zip(
+            (configuration_key for _, _, configuration_key in pending),
+            worker_records,
+        )
+
+    try:
+        for configuration_key, record in record_iterator:
             records.append(record)
             completed_keys.add(configuration_key)
-            _write_csv(fits_path, records)
+            _append_jsonl(checkpoint_path, record)
             completed += 1
             print(
                 f"[{completed}/{total}] {record['scenario']} {record['group']} "
@@ -892,6 +1001,9 @@ def main():
                 f"mult={record['spike_multiplier']} K={record['K_fit']}",
                 flush=True,
             )
+    finally:
+        if args.workers > 1:
+            executor.shutdown()
 
     summary = _summarize(records)
     _write_csv(fits_path, records)
@@ -903,6 +1015,7 @@ def main():
         "max_iter": args.max_iter,
         "optimizer_maxiter": args.optimizer_maxiter,
         "mc_samples": args.mc_samples,
+        "workers": args.workers,
         "csp_backend": args.csp_backend,
         "csp_min_iter": args.csp_min_iter,
         "mcem_stagewise": args.mcem_stagewise,

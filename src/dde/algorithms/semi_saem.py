@@ -21,7 +21,7 @@ Python list indexing (0-based):
  
 import numpy as np
 from scipy.optimize import minimize
-from scipy.special import logsumexp as _logsumexp
+from scipy.special import expit, logsumexp as _logsumexp
 from dde.utils import TLP, binary, logistic, patterns_to_int, thres, g_est_rversion
 from .normal_init_semi import Normal_init_semi
 
@@ -484,6 +484,8 @@ def _compute_bernoulli_probabilities_normal(
     A_list,
     *,
     row_chunk_size=2048,
+    coordinate_chunk_size=1,
+    eligible_widths=None,
     temperature=1.0,
 ):
     """Compute one synchronous latent-probability sweep for the Normal DDE.
@@ -502,31 +504,44 @@ def _compute_bernoulli_probabilities_normal(
     if row_chunk_size is None:
         row_chunk_size = N
     row_chunk_size = max(1, int(row_chunk_size))
+    coordinate_chunk_size = max(1, int(coordinate_chunk_size))
+    if eligible_widths is None:
+        eligible_widths = K
+    eligible_widths = tuple(int(width) for width in eligible_widths)
+    if len(eligible_widths) != D or any(
+        width < 1 or width > maximum
+        for width, maximum in zip(eligible_widths, K)
+    ):
+        raise ValueError(
+            "eligible_widths must contain one value in [1, K_d] per layer."
+        )
 
     for d_idx in range(D):
+        width = eligible_widths[d_idx]
         if d_idx == D - 1:
             prop_clipped = np.clip(prop, 1e-15, 1.0 - 1e-15)
-            prior_logit = np.broadcast_to(
-                np.log(prop_clipped / (1.0 - prop_clipped)),
-                (N, K[d_idx]),
+            prior_logit = np.log(
+                prop_clipped[:width] / (1.0 - prop_clipped[:width])
             )
         else:
             B_above = B_list[d_idx + 1]
+            parent_width = eligible_widths[d_idx + 1]
             prior_logit = (
-                B_above[:, 0][None, :]
-                + A_list[d_idx + 1] @ B_above[:, 1:].T
+                B_above[:width, 0][None, :]
+                + A_list[d_idx + 1][:, :parent_width]
+                @ B_above[:width, 1 : parent_width + 1].T
             )
 
         if d_idx == 0:
             B1 = B_list[0]
-            slopes = B1[:, 1:]
+            slopes = B1[:, 1 : width + 1]
             weighted_slopes = slopes / gamma[:, None]
             slope_gram = slopes.T @ weighted_slopes
             slope_norms = np.diag(slope_gram)
-            like_logit = np.empty((N, K[d_idx]), dtype=float)
+            like_logit = np.empty((N, width), dtype=float)
             for start in range(0, N, row_chunk_size):
                 stop = min(start + row_chunk_size, N)
-                A_chunk = A_list[0][start:stop]
+                A_chunk = A_list[0][start:stop, :width]
                 data_linear = (
                     (X[start:stop] - B1[:, 0][None, :])
                     / gamma[None, :]
@@ -540,43 +555,84 @@ def _compute_bernoulli_probabilities_normal(
             B_cur = B_list[d_idx]
             A_cur = A_list[d_idx]
             A_below = A_list[d_idx - 1]
-            like_logit = np.empty((N, K[d_idx]), dtype=float)
+            child_width = eligible_widths[d_idx - 1]
+            B_cur_active = B_cur[:child_width, : width + 1]
+            like_logit = np.empty((N, width), dtype=float)
 
             # Broadcasting all coordinates at once would require an
             # N x K_{d-1} x K_d array. Loop over K_d while reusing base_eta
             # and over observation blocks to keep peak memory independent of N.
             for start in range(0, N, row_chunk_size):
                 stop = min(start + row_chunk_size, N)
-                A_cur_chunk = A_cur[start:stop]
+                A_cur_chunk = A_cur[start:stop, :width]
                 base_eta = (
-                    B_cur[:, 0][None, :]
-                    + A_cur_chunk @ B_cur[:, 1:].T
+                    B_cur_active[:, 0][None, :]
+                    + A_cur_chunk @ B_cur_active[:, 1:].T
                 )
                 base_softplus = np.logaddexp(
                     0.0, np.clip(base_eta, -500, 500)
                 )
-                child_linear = A_below[start:stop] @ B_cur[:, 1:]
-                for l in range(K[d_idx]):
-                    slope_l = B_cur[:, l + 1]
+                child_linear = (
+                    A_below[start:stop, :child_width]
+                    @ B_cur_active[:, 1:]
+                )
+                for block_start in range(0, width, coordinate_chunk_size):
+                    block_stop = min(
+                        block_start + coordinate_chunk_size, width
+                    )
+                    slopes_block = B_cur_active[
+                        :, block_start + 1 : block_stop + 1
+                    ].T
                     # For binary a_l, one shifted softplus plus the shared
                     # base value exactly represents softplus(eta_1) -
                     # softplus(eta_0).  This halves the expensive logaddexp
                     # work without constructing an N x K_{d-1} x K_d array.
-                    direction = 1.0 - 2.0 * A_cur_chunk[:, l].astype(float)
-                    shifted_eta = np.clip(
-                        base_eta + direction[:, None] * slope_l[None, :],
-                        -500,
-                        500,
+                    direction = 1.0 - 2.0 * A_cur_chunk[
+                        :, block_start:block_stop
+                    ].astype(float)
+                    if block_stop - block_start == 1:
+                        shifted_eta = (
+                            direction[:, :1] * slopes_block[0][None, :]
+                        )
+                        shifted_eta += base_eta
+                    else:
+                        shifted_eta = (
+                            direction[:, :, None]
+                            * slopes_block[None, :, :]
+                        )
+                        shifted_eta += base_eta[:, None, :]
+                    np.clip(
+                        shifted_eta, -500.0, 500.0, out=shifted_eta
                     )
-                    log_normalizer_delta = direction * np.sum(
-                        np.logaddexp(0.0, shifted_eta) - base_softplus,
-                        axis=1,
-                    )
-                    like_logit[start:stop, l] = (
-                        child_linear[:, l] - log_normalizer_delta
+                    np.logaddexp(0.0, shifted_eta, out=shifted_eta)
+                    if block_stop - block_start == 1:
+                        shifted_eta -= base_softplus
+                        log_normalizer_delta = direction[:, 0] * np.sum(
+                            shifted_eta, axis=1
+                        )
+                    else:
+                        shifted_eta -= base_softplus[:, None, :]
+                        log_normalizer_delta = direction * np.sum(
+                            shifted_eta, axis=2
+                        )
+                    like_logit[
+                        start:stop, block_start:block_stop
+                    ] = (
+                        child_linear[:, block_start:block_stop]
+                        - np.asarray(log_normalizer_delta).reshape(
+                            stop - start, block_stop - block_start
+                        )
                     )
 
-        ber.append(logistic(float(temperature) * (prior_logit + like_logit)))
+        like_logit += prior_logit
+        like_logit *= float(temperature)
+        expit(like_logit, out=like_logit)
+        if width == K[d_idx]:
+            ber.append(like_logit)
+        else:
+            layer_probability = np.zeros((N, K[d_idx]), dtype=float)
+            layer_probability[:, :width] = like_logit
+            ber.append(layer_probability)
 
     return ber
  
