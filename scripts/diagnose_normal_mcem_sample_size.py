@@ -54,22 +54,19 @@ def _run_configuration(
     temperature,
     convergence_tol,
     canonicalize,
-    stagewise,
+    csp_backend,
     stage_min_iter,
     stage_width_window,
     stage_freeze_deeper,
     penalty_strength,
     mc_samples,
-    stage_reinitialize_next,
     stage_spectral_gap_threshold,
     max_iter,
     optimizer_maxiter,
 ):
     prop0, B0, gamma0, A0 = initialization
     if canonicalize:
-        prop0, B0, A0, permutations = _canonicalize_csp_layer_order(
-            prop0, B0, A0
-        )
+        prop0, B0, A0, permutations = _canonicalize_csp_layer_order(prop0, B0, A0)
     else:
         prop0 = np.asarray(prop0).copy()
         B0 = [np.asarray(B).copy() for B in B0]
@@ -96,13 +93,11 @@ def _run_configuration(
         optimizer_maxiter=optimizer_maxiter,
         optimizer_tol=1e-6,
         random_state=fit_seed,
-        csp_backend="mcem",
-        mcem_stagewise=stagewise,
+        csp_backend=csp_backend,
         mcem_stage_min_iter=stage_min_iter,
         mcem_stage_width_window=stage_width_window,
         mcem_stage_freeze_deeper=stage_freeze_deeper,
         mcem_penalty_strength=penalty_strength,
-        mcem_stage_reinitialize_next=stage_reinitialize_next,
         mcem_stage_spectral_gap_threshold=stage_spectral_gap_threshold,
         keep_trace=True,
         verbose=False,
@@ -113,9 +108,7 @@ def _run_configuration(
         _matched_binary_accuracy(A_est, A_layer_true)
         for A_est, A_layer_true in zip(result.A_list, A_true)
     ]
-    final_l1 = [
-        np.sum(np.abs(B[:, 1:]), axis=0).tolist() for B in result.B_list
-    ]
+    final_l1 = [np.sum(np.abs(B[:, 1:]), axis=0).tolist() for B in result.B_list]
     return {
         "name": name,
         "t_spike": list(map(float, t_spike)),
@@ -125,19 +118,18 @@ def _run_configuration(
         "temperature": float(temperature),
         "convergence_tol": float(convergence_tol),
         "canonicalize": bool(canonicalize),
-        "stagewise": bool(stagewise),
+        "csp_backend": csp_backend,
+        "stagewise": result.diagnostics["stagewise"],
         "stage_min_iter": int(stage_min_iter),
         "stage_width_window": int(stage_width_window),
         "stage_freeze_deeper": bool(stage_freeze_deeper),
         "penalty_strength": list(map(float, penalty_strength)),
         "mc_samples": int(mc_samples),
-        "stage_reinitialize_next": bool(stage_reinitialize_next),
+        "transition_mode": result.diagnostics["transition_mode"],
         "stage_spectral_gap_threshold": stage_spectral_gap_threshold,
         "stage_caps": list(map(int, result.diagnostics["stage_caps"])),
         "stage_transitions": result.diagnostics["stage_transitions"],
-        "stage_reinitializations": result.diagnostics[
-            "stage_reinitializations"
-        ],
+        "stage_transition_events": result.diagnostics["stage_transition_events"],
         "final_stage": int(result.diagnostics["final_stage"]),
         "activation_permutations": (
             None
@@ -177,17 +169,18 @@ def _write_summary_csv(path, records):
         "temperature",
         "convergence_tol",
         "canonicalize",
+        "csp_backend",
         "stagewise",
         "stage_min_iter",
         "stage_width_window",
         "stage_freeze_deeper",
         "penalty_strength",
         "mc_samples",
-        "stage_reinitialize_next",
+        "transition_mode",
         "stage_spectral_gap_threshold",
         "stage_caps",
         "stage_transitions",
-        "stage_reinitializations",
+        "stage_transition_events",
         "final_stage",
         "K_fit",
         "iterations",
@@ -222,9 +215,7 @@ def main():
     )
     parser.add_argument("--max-iter", type=int, default=100)
     parser.add_argument("--replicates", type=int, default=1)
-    parser.add_argument(
-        "--sample-sizes", type=int, nargs="+", default=[500, 8000]
-    )
+    parser.add_argument("--sample-sizes", type=int, nargs="+", default=[500, 8000])
     parser.add_argument(
         "--initialization-mode", choices=("data", "truth"), default="data"
     )
@@ -236,16 +227,16 @@ def main():
     )
     parser.add_argument("--optimizer-maxiter", type=int, default=100)
     parser.add_argument("--mc-samples", type=int, default=1)
-    parser.add_argument("--stage-reinitialize-next", action="store_true")
     parser.add_argument(
-        "--stage-spectral-gap-threshold", type=float, default=None
+        "--csp-backend",
+        choices=("mcem", "mcem_reinitialize", "mcem_cap_only"),
+        default="mcem_reinitialize",
     )
+    parser.add_argument("--stage-spectral-gap-threshold", type=float, default=None)
     parser.add_argument("--stage-min-iter", type=int, default=20)
     parser.add_argument("--stage-width-window", type=int, default=10)
     parser.add_argument("--stage-convergence-tol", type=float, default=0.0)
-    parser.add_argument(
-        "--no-stage-freeze-deeper", action="store_true"
-    )
+    parser.add_argument("--no-stage-freeze-deeper", action="store_true")
     parser.add_argument(
         "--penalty-strength",
         type=float,
@@ -282,7 +273,7 @@ def main():
                     scenario["base_temp"],
                     args.stage_convergence_tol,
                     False,
-                    True,
+                    args.csp_backend,
                     args.stage_min_iter,
                     args.stage_width_window,
                     not args.no_stage_freeze_deeper,
@@ -299,26 +290,98 @@ def main():
     else:
         configurations = {
             500: [
-                ("paper", _tau_default(500), scenario["base_temp"], 0.005, False, False, 20, 10, True, [1.0, 1.0, 1.0]),
-                ("low_tau_0.3", 0.3, scenario["base_temp"], 0.005, False, False, 20, 10, True, [1.0, 1.0, 1.0]),
+                (
+                    "paper",
+                    _tau_default(500),
+                    scenario["base_temp"],
+                    0.005,
+                    False,
+                    "mcem",
+                    20,
+                    10,
+                    True,
+                    [1.0, 1.0, 1.0],
+                ),
+                (
+                    "low_tau_0.3",
+                    0.3,
+                    scenario["base_temp"],
+                    0.005,
+                    False,
+                    "mcem",
+                    20,
+                    10,
+                    True,
+                    [1.0, 1.0, 1.0],
+                ),
             ],
             8000: [
-                ("paper", _tau_default(8000), scenario["base_temp"], 0.005, False, False, 20, 10, True, [1.0, 1.0, 1.0]),
-                ("fixed_tau_n500", _tau_default(500), scenario["base_temp"], 0.005, False, False, 20, 10, True, [1.0, 1.0, 1.0]),
-                ("force_100", _tau_default(8000), scenario["base_temp"], 0.0, False, False, 20, 10, True, [1.0, 1.0, 1.0]),
-                ("temperature_1", _tau_default(8000), 1.0, 0.005, False, False, 20, 10, True, [1.0, 1.0, 1.0]),
-                ("canonical_order", _tau_default(8000), scenario["base_temp"], 0.005, True, False, 20, 10, True, [1.0, 1.0, 1.0]),
+                (
+                    "paper",
+                    _tau_default(8000),
+                    scenario["base_temp"],
+                    0.005,
+                    False,
+                    "mcem",
+                    20,
+                    10,
+                    True,
+                    [1.0, 1.0, 1.0],
+                ),
+                (
+                    "fixed_tau_n500",
+                    _tau_default(500),
+                    scenario["base_temp"],
+                    0.005,
+                    False,
+                    "mcem",
+                    20,
+                    10,
+                    True,
+                    [1.0, 1.0, 1.0],
+                ),
+                (
+                    "force_100",
+                    _tau_default(8000),
+                    scenario["base_temp"],
+                    0.0,
+                    False,
+                    "mcem",
+                    20,
+                    10,
+                    True,
+                    [1.0, 1.0, 1.0],
+                ),
+                (
+                    "temperature_1",
+                    _tau_default(8000),
+                    1.0,
+                    0.005,
+                    False,
+                    "mcem",
+                    20,
+                    10,
+                    True,
+                    [1.0, 1.0, 1.0],
+                ),
+                (
+                    "canonical_order",
+                    _tau_default(8000),
+                    scenario["base_temp"],
+                    0.005,
+                    True,
+                    "mcem",
+                    20,
+                    10,
+                    True,
+                    [1.0, 1.0, 1.0],
+                ),
             ],
         }
 
     for N, variants in configurations.items():
         for replicate in range(args.replicates):
-            data_seed = (
-                seed_base
-                + 100_000 * scenario["D"]
-                + 1_000 * N
-                + replicate
-            )
+            data_seed = seed_base + 100_000 * scenario["D"] + 1_000 * N + replicate
             init_seed = data_seed + 101
             fit_seed = data_seed + 202
             X, A_true = _simulate(scenario, N, data_seed)
@@ -331,7 +394,7 @@ def main():
                 temperature,
                 convergence_tol,
                 canonicalize,
-                stagewise,
+                csp_backend,
                 stage_min_iter,
                 stage_width_window,
                 stage_freeze_deeper,
@@ -353,16 +416,13 @@ def main():
                     temperature=temperature,
                     convergence_tol=convergence_tol,
                     canonicalize=canonicalize,
-                    stagewise=stagewise,
+                    csp_backend=csp_backend,
                     stage_min_iter=stage_min_iter,
                     stage_width_window=stage_width_window,
                     stage_freeze_deeper=stage_freeze_deeper,
                     penalty_strength=penalty_strength,
                     mc_samples=args.mc_samples,
-                    stage_reinitialize_next=args.stage_reinitialize_next,
-                    stage_spectral_gap_threshold=(
-                        args.stage_spectral_gap_threshold
-                    ),
+                    stage_spectral_gap_threshold=(args.stage_spectral_gap_threshold),
                     max_iter=args.max_iter,
                     optimizer_maxiter=args.optimizer_maxiter,
                 )

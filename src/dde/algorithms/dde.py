@@ -13,7 +13,7 @@ from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
 from .normal_init_semi import Normal_init_semi
-from .normal_csp import fit_normal_csp_mcem, fit_normal_csp_saem
+from .normal_csp import fit_normal_csp_mcem
 from .semi_saem import get_SAEM_normal
 
 
@@ -61,14 +61,10 @@ def fit_dde_normal(
     optimizer_tol: float = 1e-6,
     convergence_window: int = 7,
     convergence_mean_tol: float = 0.01,
-    width_stability_window: int = 10,
-    csp_min_iter: int = 30,
-    mcem_stagewise: bool = False,
     mcem_stage_min_iter: int = 20,
     mcem_stage_width_window: int = 10,
     mcem_stage_freeze_deeper: bool = True,
     mcem_penalty_strength=1.0,
-    mcem_stage_reinitialize_next: bool = False,
     mcem_stage_spectral_gap_threshold=None,
     csp_backend: str = "mcem",
     burn: int = 5,
@@ -81,13 +77,18 @@ def fit_dde_normal(
     """Fit a fixed-width or CSP-shrunk parametric Normal DDE.
 
     The observed matrix is passed directly to the Normal initialization and
-    either the fixed-width SAEM kernel or a CSP MCEM/SAEM kernel.  In
-    contrast, SemiDDE and CopDDE construct latent-Gaussian pseudo-observations
-    before using their respective kernels.
+    either the fixed-width SAEM kernel or one of the Normal CSP MCEM backends.
+    In contrast, SemiDDE and CopDDE construct latent-Gaussian
+    pseudo-observations before using their respective kernels.
 
     ``initialize="oracle"`` is intended only for simulation studies that need
     estimates aligned with known generating parameters.  Ordinary data fits
     should use the default ``initialize="data"``.
+
+    Normal CSP accepts ``csp_backend="mcem"`` for the original simultaneous
+    updates, ``"mcem_reinitialize"`` for staged parent rebuilding, and
+    ``"mcem_cap_only"`` for staged child-implied caps that preserve eligible
+    parent state.
     """
     if kwargs:
         unknown = ", ".join(sorted(kwargs))
@@ -109,7 +110,9 @@ def fit_dde_normal(
         if K_list is None:
             raise ValueError("K_list is required when dimension_method='fixed'.")
         if t_spike is not None or temp is not None:
-            raise ValueError("t_spike and temp are only used by dimension_method='csp'.")
+            raise ValueError(
+                "t_spike and temp are only used by dimension_method='csp'."
+            )
         K_tuple = validate_K_list_identifiability(K_list, D=D, J=X.shape[1])
         penalties = _validate_pen_list(pen_list, D)
     elif method == "csp":
@@ -205,7 +208,9 @@ def fit_dde_normal(
 
     if method == "fixed":
         if random_state is not None:
-            raise ValueError("random_state is currently supported by the CSP path only.")
+            raise ValueError(
+                "random_state is currently supported by the CSP path only."
+            )
         prop, B_list, gamma, A_list, iterations = get_SAEM_normal(
             X,
             prop,
@@ -243,30 +248,22 @@ def fit_dde_normal(
         )
 
     backend = str(csp_backend).strip().lower()
-    if backend not in {"saem", "mcem"}:
-        raise ValueError("csp_backend must be 'saem' or 'mcem'.")
-    csp_kernel = (
-        fit_normal_csp_saem if backend == "saem" else fit_normal_csp_mcem
-    )
-    csp_options = {}
-    if backend == "saem":
-        csp_options.update(
-            convergence_mean_tol=convergence_mean_tol,
-            width_stability_window=width_stability_window,
-            min_iter=csp_min_iter,
+    backend_configuration = {
+        "mcem": (False, "none"),
+        "mcem_reinitialize": (True, "reinitialize"),
+        "mcem_cap_only": (True, "cap_only"),
+    }
+    if backend not in backend_configuration:
+        raise ValueError(
+            "csp_backend must be 'mcem', 'mcem_reinitialize', or " "'mcem_cap_only'."
         )
-    else:
-        csp_options.update(
-            convergence_mean_tol=convergence_mean_tol,
-            stagewise=bool(mcem_stagewise),
-            stage_min_iter=mcem_stage_min_iter,
-            stage_width_window=mcem_stage_width_window,
-            stage_freeze_deeper=bool(mcem_stage_freeze_deeper),
-            penalty_strength=mcem_penalty_strength,
-            stage_reinitialize_next=bool(mcem_stage_reinitialize_next),
-            stage_spectral_gap_threshold=mcem_stage_spectral_gap_threshold,
+    stagewise, stage_transition_mode = backend_configuration[backend]
+    if backend != "mcem_reinitialize" and mcem_stage_spectral_gap_threshold is not None:
+        raise ValueError(
+            "mcem_stage_spectral_gap_threshold is only valid when "
+            "csp_backend='mcem_reinitialize'."
         )
-    raw = csp_kernel(
+    raw = fit_normal_csp_mcem(
         X,
         prop,
         B_list,
@@ -288,7 +285,14 @@ def fit_dde_normal(
         random_state=random_state,
         keep_trace=keep_trace,
         verbose=bool(verbose),
-        **csp_options,
+        convergence_mean_tol=convergence_mean_tol,
+        stagewise=stagewise,
+        stage_min_iter=mcem_stage_min_iter,
+        stage_width_window=mcem_stage_width_window,
+        stage_freeze_deeper=bool(mcem_stage_freeze_deeper),
+        penalty_strength=mcem_penalty_strength,
+        stage_transition_mode=stage_transition_mode,
+        stage_spectral_gap_threshold=mcem_stage_spectral_gap_threshold,
     )
 
     X_result = X.copy()
@@ -301,7 +305,9 @@ def fit_dde_normal(
         "family": "Normal",
         "dimension_method": "csp",
         "initialization": initialization,
-        "backend": "saem_csp" if backend == "saem" else "approximate_mcem_csp",
+        "backend": backend,
+        "kernel": "approximate_mcem_csp",
+        "transition_mode": stage_transition_mode,
         "threshold_rule": "first_two_layers",
         "num_active": raw["num_active"].copy(),
         "allocation": [value.copy() for value in raw["allocation"]],
@@ -310,35 +316,19 @@ def fit_dde_normal(
         "relative_history": raw["relative_history"],
         "temperature": raw["temperature"],
     }
-    if backend == "mcem":
-        diagnostics.update(
-            {
-                "stagewise": raw["stagewise"],
-                "stage_transitions": raw["stage_transitions"],
-                "final_stage": raw["final_stage"],
-                "stage_freeze_deeper": raw["stage_freeze_deeper"],
-                "penalty_strength": raw["penalty_strength"],
-                "stage_reinitialize_next": raw["stage_reinitialize_next"],
-                "stage_spectral_gap_threshold": raw[
-                    "stage_spectral_gap_threshold"
-                ],
-                "stage_reinitializations": raw["stage_reinitializations"],
-                "stage_caps": raw["stage_caps"],
-            }
-        )
-    if backend == "saem":
-        diagnostics.update(
-            {
-                "sa_iterations": raw["sa_iterations"],
-                "activation_permutations": raw[
-                    "activation_permutations"
-                ],
-                "csp_start_iteration": raw["csp_start_iteration"],
-                "stopped_by_convergence": raw["stopped_by_convergence"],
-                "sa_relative_history": raw["sa_relative_history"],
-                "width_history": raw["width_history"],
-            }
-        )
+    diagnostics.update(
+        {
+            "stagewise": raw["stagewise"],
+            "stage_transitions": raw["stage_transitions"],
+            "final_stage": raw["final_stage"],
+            "stage_freeze_deeper": raw["stage_freeze_deeper"],
+            "penalty_strength": raw["penalty_strength"],
+            "stage_spectral_gap_threshold": raw["stage_spectral_gap_threshold"],
+            "stage_transition_events": raw["stage_transition_events"],
+            "stage_caps": raw["stage_caps"],
+            "stopped_by_convergence": raw["stopped_by_convergence"],
+        }
+    )
     if keep_trace:
         diagnostics["trace"] = raw["trace"]
 

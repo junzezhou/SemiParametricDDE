@@ -35,6 +35,13 @@ result = fit(
     C=1,
     tol=0.005,
     max_it=50,
+    csp_backend="mcem",
     random_state=123,
 )
 ```
+
+Normal CSP provides three MCEM backends.  ``"mcem"`` retains the original
+simultaneous MCEM updates, ``"mcem_reinitialize"`` activates CSP layer by
+layer and rebuilds each waiting parent, and ``"mcem_cap_only"`` uses the same
+staged schedule while preserving eligible parent states and only enforcing the
+child-implied structural cap.

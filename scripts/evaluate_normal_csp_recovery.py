@@ -118,9 +118,7 @@ def _scenario_d2_sparse_deep():
         K_true=K_true,
         B_true=[
             scenario["B_true"][0],
-            np.column_stack(
-                [np.full(K_true[0], -2.0), B2_slope]
-            ),
+            np.column_stack([np.full(K_true[0], -2.0), B2_slope]),
         ],
         prop=np.full(K_true[-1], 0.5),
     )
@@ -131,9 +129,9 @@ def _scenario_d3():
     J = 108
     K_true = (18, 6, 2)
     K_max = (36, 12, 4)
-    B1_negative_columns = np.array(
-        [4, 14, 10, 13, 2, 16, 14, 9, 4, 17, 1, 17, 4, 1, 8, 4, 4, 5]
-    ) - 1
+    B1_negative_columns = (
+        np.array([4, 14, 10, 13, 2, 16, 14, 9, 4, 17, 1, 17, 4, 1, 8, 4, 4, 5]) - 1
+    )
     B2_negative_columns = np.array([2, 5, 4, 5, 1, 5]) - 1
     B1_slope = _block_loadings(
         J,
@@ -178,17 +176,15 @@ def _simulate(scenario, N, seed):
     K_true = scenario["K_true"]
     D = scenario["D"]
     A_true = [None] * D
-    A_true[-1] = rng.binomial(
-        1, scenario["prop"], size=(N, K_true[-1])
-    ).astype(np.uint8)
+    A_true[-1] = rng.binomial(1, scenario["prop"], size=(N, K_true[-1])).astype(
+        np.uint8
+    )
     for d in range(D - 2, -1, -1):
         design = np.column_stack([np.ones(N), A_true[d + 1]])
         probability = expit(design @ B_true[d + 1].T)
         A_true[d] = rng.binomial(1, probability).astype(np.uint8)
     mean = np.column_stack([np.ones(N), A_true[0]]) @ B_true[0].T
-    X = mean + rng.normal(
-        scale=np.sqrt(scenario["gamma"]), size=mean.shape
-    )
+    X = mean + rng.normal(scale=np.sqrt(scenario["gamma"]), size=mean.shape)
     return X, A_true
 
 
@@ -297,7 +293,7 @@ def _allocation_counts(B_list, t_spike, K_max, seed):
 
 
 def _tau_default(N):
-    return max(0.3, 3.0 * N ** -0.3)
+    return max(0.3, 3.0 * N**-0.3)
 
 
 def _configuration_grid(scenario, sample_sizes, replicates, replicate_start=0):
@@ -307,21 +303,45 @@ def _configuration_grid(scenario, sample_sizes, replicates, replicate_start=0):
         for multiplier in (0.5, 1.0, 2.0):
             for replicate in replicate_indices:
                 configurations.add(
-                    ("spike_grid", N, replicate, "data", multiplier, scenario["base_temp"], "paper")
+                    (
+                        "spike_grid",
+                        N,
+                        replicate,
+                        "data",
+                        multiplier,
+                        scenario["base_temp"],
+                        "paper",
+                    )
                 )
 
     diagnostic_N = sample_sizes[0]
     for replicate in replicate_indices:
         for mode in ("oracle", "truth"):
             configurations.add(
-                ("initialization", diagnostic_N, replicate, mode, 1.0, scenario["base_temp"], "paper")
+                (
+                    "initialization",
+                    diagnostic_N,
+                    replicate,
+                    mode,
+                    1.0,
+                    scenario["base_temp"],
+                    "paper",
+                )
             )
         for temperature in (scenario["base_temp"], 1.0):
             for threshold_name in ("paper", "near_zero"):
                 if temperature == scenario["base_temp"] and threshold_name == "paper":
                     continue
                 configurations.add(
-                    ("anneal_threshold", diagnostic_N, replicate, "data", 1.0, temperature, threshold_name)
+                    (
+                        "anneal_threshold",
+                        diagnostic_N,
+                        replicate,
+                        "data",
+                        1.0,
+                        temperature,
+                        threshold_name,
+                    )
                 )
     return sorted(configurations)
 
@@ -336,17 +356,16 @@ def _run_one(
     dataset_cache,
     initialization_cache,
     keep_trace=False,
-    csp_backend="saem",
-    csp_min_iter=30,
-    mcem_stagewise=False,
+    csp_backend="mcem",
     mcem_stage_min_iter=20,
     mcem_stage_width_window=10,
-    mcem_stage_reinitialize_next=False,
     mcem_stage_spectral_gap_threshold=None,
     mcem_first_penalty_power=0.0,
     mcem_top_spike_multiplier=1.0,
 ):
-    group, N, replicate, init_mode, multiplier, temperature, threshold_name = configuration
+    group, N, replicate, init_mode, multiplier, temperature, threshold_name = (
+        configuration
+    )
     data_seed = seed_base + 100_000 * scenario["D"] + 1_000 * N + replicate
     init_seed = data_seed + 101
     fit_seed = data_seed + 202
@@ -361,8 +380,7 @@ def _run_one(
         )
     prop0, B0, gamma0, A0 = initialization_cache[initialization_key]
     t_spike = scenario["base_t_spike"] * multiplier
-    if csp_backend == "mcem":
-        t_spike[-1] *= float(mcem_top_spike_multiplier)
+    t_spike[-1] *= float(mcem_top_spike_multiplier)
     penalty_strength = np.ones(scenario["D"], dtype=float)
     penalty_strength[0] = (N / 500.0) ** float(mcem_first_penalty_power)
     initial_counts, _ = _allocation_counts(
@@ -400,14 +418,9 @@ def _run_one(
         random_state=fit_seed,
         keep_trace=keep_trace,
         csp_backend=csp_backend,
-        csp_min_iter=csp_min_iter,
-        mcem_stagewise=mcem_stagewise,
         mcem_stage_min_iter=mcem_stage_min_iter,
         mcem_stage_width_window=mcem_stage_width_window,
-        mcem_stage_reinitialize_next=mcem_stage_reinitialize_next,
-        mcem_stage_spectral_gap_threshold=(
-            mcem_stage_spectral_gap_threshold
-        ),
+        mcem_stage_spectral_gap_threshold=(mcem_stage_spectral_gap_threshold),
         mcem_penalty_strength=penalty_strength,
         verbose=False,
     )
@@ -418,10 +431,7 @@ def _run_one(
         for A_est, A_layer_true in zip(result.A_list, A_true)
     )
     trace = result.diagnostics.get("trace", [])
-    first_csp_entry = next(
-        (entry for entry in trace if entry.get("phase") == "saem_csp"),
-        trace[0] if trace else None,
-    )
+    first_csp_entry = trace[0] if trace else None
     first_active = (
         tuple(first_csp_entry["num_active"].tolist())
         if first_csp_entry is not None
@@ -443,11 +453,8 @@ def _run_one(
         "max_iter_budget": max_iter,
         "optimizer_maxiter": optimizer_maxiter,
         "csp_backend": csp_backend,
-        "csp_min_iter": csp_min_iter,
-        "mcem_stagewise": int(mcem_stagewise),
         "mcem_stage_min_iter": mcem_stage_min_iter,
         "mcem_stage_width_window": mcem_stage_width_window,
-        "mcem_stage_reinitialize_next": int(mcem_stage_reinitialize_next),
         "mcem_stage_spectral_gap_threshold": (
             mcem_stage_spectral_gap_threshold
             if mcem_stage_spectral_gap_threshold is not None
@@ -462,8 +469,8 @@ def _run_one(
         "stage_caps": json.dumps(
             result.diagnostics.get("stage_caps", scenario["K_max"])
         ),
-        "stage_reinitializations": json.dumps(
-            result.diagnostics.get("stage_reinitializations", ())
+        "stage_transition_events": json.dumps(
+            result.diagnostics.get("stage_transition_events", ())
         ),
         "K_true": json.dumps(list(scenario["K_true"])),
         "K_max": json.dumps(list(scenario["K_max"])),
@@ -476,19 +483,12 @@ def _run_one(
         "exact_width": int(K_fit == scenario["K_true"]),
         "collapsed_layer": int(any(value == 0 for value in K_fit)),
         "iterations": result.diagnostics["iterations"],
-        "sa_iterations": result.diagnostics.get("sa_iterations", 0),
-        "csp_start_iteration": result.diagnostics.get(
-            "csp_start_iteration", np.nan
-        ),
         "stopped_by_convergence": int(
             result.diagnostics.get("stopped_by_convergence", False)
         ),
         "hit_max_iter": int(result.diagnostics["iterations"] >= max_iter),
         "dimension_l1_error": int(
-            sum(
-                abs(fitted - truth)
-                for fitted, truth in zip(K_fit, scenario["K_true"])
-            )
+            sum(abs(fitted - truth) for fitted, truth in zip(K_fit, scenario["K_true"]))
         ),
         "fit_seconds": elapsed,
     }
@@ -504,10 +504,7 @@ def _run_one(
                 ]
             ),
             omega_trace=json.dumps(
-                [
-                    [values.tolist() for values in entry["omega"]]
-                    for entry in trace
-                ]
+                [[values.tolist() for values in entry["omega"]] for entry in trace]
             ),
             allocation_input_column_l1_trace=json.dumps(
                 [
@@ -590,9 +587,7 @@ def _read_jsonl(path):
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 if any(remaining.strip() for remaining in stream):
-                    raise ValueError(
-                        f"Invalid JSONL checkpoint at line {line_number}."
-                    )
+                    raise ValueError(f"Invalid JSONL checkpoint at line {line_number}.")
                 break
     return records
 
@@ -619,7 +614,7 @@ def _read_csv(path):
         "mcem_penalty_strength",
         "stage_transitions",
         "stage_caps",
-        "stage_reinitializations",
+        "stage_transition_events",
     }
     with path.open(newline="") as stream:
         records = list(csv.DictReader(stream))
@@ -648,11 +643,8 @@ def _record_configuration_key(record):
         int(float(record.get("max_iter_budget", 0))),
         int(float(record.get("optimizer_maxiter", 0))),
         record.get("csp_backend", "mcem"),
-        int(float(record.get("csp_min_iter", 0))),
-        int(float(record.get("mcem_stagewise", 0))),
         int(float(record.get("mcem_stage_min_iter", 20))),
         int(float(record.get("mcem_stage_width_window", 10))),
-        int(float(record.get("mcem_stage_reinitialize_next", 0))),
         (
             float(record["mcem_stage_spectral_gap_threshold"])
             if record.get("mcem_stage_spectral_gap_threshold") not in (None, "")
@@ -670,16 +662,15 @@ def _target_configuration_key(
     max_iter,
     optimizer_maxiter,
     csp_backend,
-    csp_min_iter,
-    mcem_stagewise,
     mcem_stage_min_iter,
     mcem_stage_width_window,
-    mcem_stage_reinitialize_next,
     mcem_stage_spectral_gap_threshold,
     mcem_first_penalty_power,
     mcem_top_spike_multiplier,
 ):
-    group, N, replicate, init_mode, multiplier, temperature, threshold_name = configuration
+    group, N, replicate, init_mode, multiplier, temperature, threshold_name = (
+        configuration
+    )
     return (
         scenario["name"],
         group,
@@ -693,11 +684,8 @@ def _target_configuration_key(
         int(max_iter),
         int(optimizer_maxiter),
         str(csp_backend),
-        int(csp_min_iter),
-        int(mcem_stagewise),
         int(mcem_stage_min_iter),
         int(mcem_stage_width_window),
-        int(mcem_stage_reinitialize_next),
         (
             float(mcem_stage_spectral_gap_threshold)
             if mcem_stage_spectral_gap_threshold is not None
@@ -741,7 +729,9 @@ def _summarize(records):
         item["fits"] = len(rows)
         item["exact_width_rate"] = float(np.mean([row["exact_width"] for row in rows]))
         item["collapse_rate"] = float(np.mean([row["collapsed_layer"] for row in rows]))
-        item["hit_max_iter_rate"] = float(np.mean([row["hit_max_iter"] for row in rows]))
+        item["hit_max_iter_rate"] = float(
+            np.mean([row["hit_max_iter"] for row in rows])
+        )
         item["mean_dimension_l1_error"] = float(
             np.mean([row["dimension_l1_error"] for row in rows])
         )
@@ -775,16 +765,13 @@ def main():
     parser.add_argument("--mc-samples", type=int, default=1)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument(
-        "--csp-backend", choices=("saem", "mcem"), default="saem"
+        "--csp-backend",
+        choices=("mcem", "mcem_reinitialize", "mcem_cap_only"),
+        default="mcem",
     )
-    parser.add_argument("--csp-min-iter", type=int, default=30)
-    parser.add_argument("--mcem-stagewise", action="store_true")
     parser.add_argument("--mcem-stage-min-iter", type=int, default=20)
     parser.add_argument("--mcem-stage-width-window", type=int, default=10)
-    parser.add_argument("--mcem-stage-reinitialize-next", action="store_true")
-    parser.add_argument(
-        "--mcem-stage-spectral-gap-threshold", type=float, default=None
-    )
+    parser.add_argument("--mcem-stage-spectral-gap-threshold", type=float, default=None)
     parser.add_argument("--mcem-first-penalty-power", type=float, default=0.0)
     parser.add_argument("--mcem-top-spike-multiplier", type=float, default=1.0)
     parser.add_argument("--seed-base", type=int, default=20260828)
@@ -879,8 +866,7 @@ def main():
     initialization_cache = {}
     cached_dataset_key = None
     total = sum(
-        len(configuration_by_scenario[scenario["name"]])
-        for scenario in scenarios
+        len(configuration_by_scenario[scenario["name"]]) for scenario in scenarios
     )
     completed = sum(
         _target_configuration_key(
@@ -890,11 +876,8 @@ def main():
             args.max_iter,
             args.optimizer_maxiter,
             args.csp_backend,
-            args.csp_min_iter,
-            args.mcem_stagewise,
             args.mcem_stage_min_iter,
             args.mcem_stage_width_window,
-            args.mcem_stage_reinitialize_next,
             args.mcem_stage_spectral_gap_threshold,
             args.mcem_first_penalty_power,
             args.mcem_top_spike_multiplier,
@@ -913,11 +896,8 @@ def main():
                 args.max_iter,
                 args.optimizer_maxiter,
                 args.csp_backend,
-                args.csp_min_iter,
-                args.mcem_stagewise,
                 args.mcem_stage_min_iter,
                 args.mcem_stage_width_window,
-                args.mcem_stage_reinitialize_next,
                 args.mcem_stage_spectral_gap_threshold,
                 args.mcem_first_penalty_power,
                 args.mcem_top_spike_multiplier,
@@ -929,14 +909,9 @@ def main():
     run_keyword = {
         "keep_trace": args.keep_trace,
         "csp_backend": args.csp_backend,
-        "csp_min_iter": args.csp_min_iter,
-        "mcem_stagewise": args.mcem_stagewise,
         "mcem_stage_min_iter": args.mcem_stage_min_iter,
         "mcem_stage_width_window": args.mcem_stage_width_window,
-        "mcem_stage_reinitialize_next": args.mcem_stage_reinitialize_next,
-        "mcem_stage_spectral_gap_threshold": (
-            args.mcem_stage_spectral_gap_threshold
-        ),
+        "mcem_stage_spectral_gap_threshold": (args.mcem_stage_spectral_gap_threshold),
         "mcem_first_penalty_power": args.mcem_first_penalty_power,
         "mcem_top_spike_multiplier": args.mcem_top_spike_multiplier,
     }
@@ -948,6 +923,7 @@ def main():
     )
 
     if args.workers == 1:
+
         def serial_records():
             nonlocal cached_dataset_key
             for scenario, configuration, configuration_key in pending:
@@ -1017,14 +993,9 @@ def main():
         "mc_samples": args.mc_samples,
         "workers": args.workers,
         "csp_backend": args.csp_backend,
-        "csp_min_iter": args.csp_min_iter,
-        "mcem_stagewise": args.mcem_stagewise,
         "mcem_stage_min_iter": args.mcem_stage_min_iter,
         "mcem_stage_width_window": args.mcem_stage_width_window,
-        "mcem_stage_reinitialize_next": args.mcem_stage_reinitialize_next,
-        "mcem_stage_spectral_gap_threshold": (
-            args.mcem_stage_spectral_gap_threshold
-        ),
+        "mcem_stage_spectral_gap_threshold": (args.mcem_stage_spectral_gap_threshold),
         "mcem_first_penalty_power": args.mcem_first_penalty_power,
         "mcem_top_spike_multiplier": args.mcem_top_spike_multiplier,
         "seed_base": args.seed_base,
