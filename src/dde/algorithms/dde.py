@@ -12,9 +12,9 @@ from dde.utils import validate_K_list_identifiability, validate_dde_lists
 from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
-from .normal_init_semi import Normal_init_semi
-from .normal_csp import fit_normal_csp_mcem
-from .semi_saem import get_SAEM_normal
+from .normal_csp import fit_parametric_csp_mcem
+from .parametric_families import NORMAL_FAMILY, resolve_parametric_family
+from .semi_saem import get_SAEM_parametric
 
 
 def _validate_pen_list(pen_list: Sequence[float], D: int) -> list[float]:
@@ -34,9 +34,10 @@ def _validate_pen_list(pen_list: Sequence[float], D: int) -> list[float]:
     return penalties
 
 
-def fit_dde_normal(
+def fit_parametric_dde(
     Y,
     *,
+    family,
     D: int,
     K_list=None,
     dimension_method: str = "fixed",
@@ -74,10 +75,11 @@ def fit_dde_normal(
     verbose: bool = True,
     **kwargs: Any,
 ) -> DDEResult:
-    """Fit a fixed-width or CSP-shrunk parametric Normal DDE.
+    """Fit a fixed-width or CSP-shrunk parametric DDE.
 
-    The observed matrix is passed directly to the Normal initialization and
-    either the fixed-width SAEM kernel or one of the Normal CSP MCEM backends.
+    The family adapter validates the observed matrix, prepares initialization,
+    and supplies observed-layer operations to the fixed-width SAEM kernel or
+    one of the CSP MCEM backends.
     In contrast, SemiDDE and CopDDE construct latent-Gaussian
     pseudo-observations before using their respective kernels.
 
@@ -85,22 +87,19 @@ def fit_dde_normal(
     estimates aligned with known generating parameters.  Ordinary data fits
     should use the default ``initialize="data"``.
 
-    Normal CSP accepts ``csp_backend="mcem"`` for the original simultaneous
+    CSP accepts ``csp_backend="mcem"`` for the original simultaneous
     updates, ``"mcem_reinitialize"`` for staged parent rebuilding, and
     ``"mcem_cap_only"`` for staged child-implied caps that preserve eligible
     parent state.
     """
+    family_adapter = resolve_parametric_family(family)
     if kwargs:
         unknown = ", ".join(sorted(kwargs))
-        raise TypeError(f"Unexpected Normal DDE argument(s): {unknown}.")
+        raise TypeError(
+            f"Unexpected {family_adapter.name} DDE argument(s): {unknown}."
+        )
 
-    X = np.asarray(Y, dtype=float)
-    if X.ndim != 2:
-        raise ValueError(f"Y must be a two-dimensional matrix; got shape {X.shape}.")
-    if X.shape[0] < 1 or X.shape[1] < 1:
-        raise ValueError("Y must contain at least one observation and one variable.")
-    if not np.all(np.isfinite(X)):
-        raise ValueError("Normal DDE requires finite values in Y.")
+    X = family_adapter.validate_y(Y)
 
     D = int(D)
     if D < 1:
@@ -125,12 +124,15 @@ def fit_dde_normal(
             raise ValueError("pen_list is only used by dimension_method='fixed'.")
         if t_spike is None or temp is None:
             raise ValueError(
-                "Normal DDE with dimension_method='csp' requires t_spike and temp."
+                f"{family_adapter.name} DDE with dimension_method='csp' "
+                "requires t_spike and temp."
             )
         K_tuple = maximal_identifiable_widths(X.shape[1], D)
         penalties = None
     else:
-        raise ValueError("Normal DDE dimension_method must be 'fixed' or 'csp'.")
+        raise ValueError(
+            f"{family_adapter.name} DDE dimension_method must be 'fixed' or 'csp'."
+        )
 
     tau = float(tau)
     tol = float(tol)
@@ -151,12 +153,23 @@ def fit_dde_normal(
     if max_it < 1:
         raise ValueError("max_it must be a positive integer.")
 
-    supplied = [prop_in, B_list_in, gamma_in, A_list_in]
+    supplied_names = ["prop_in", "B_list_in"]
+    supplied = [prop_in, B_list_in]
+    if family_adapter.has_dispersion:
+        supplied_names.append("gamma_in")
+        supplied.append(gamma_in)
+    elif gamma_in is not None:
+        raise ValueError(
+            f"{family_adapter.name} has no dispersion parameter; gamma_in must be omitted."
+        )
+    supplied_names.append("A_list_in")
+    supplied.append(A_list_in)
     if any(value is not None for value in supplied) and not all(
         value is not None for value in supplied
     ):
+        joined_names = ", ".join(supplied_names[:-1])
         raise ValueError(
-            "prop_in, B_list_in, gamma_in, and A_list_in must be supplied together."
+            f"{joined_names}, and {supplied_names[-1]} must be supplied together."
         )
 
     if all(value is not None for value in supplied):
@@ -166,14 +179,18 @@ def fit_dde_normal(
             B_list_in,
             A_list=A_list_in,
             prop=prop_in,
-            gamma=gamma_in,
+            gamma=None,
             K_list=K_tuple,
             observed_name="Y",
             require_binary_A=True,
         )
         prop = np.asarray(prop_in, dtype=float)
         B_list = [np.asarray(B, dtype=float) for B in B_list_in]
-        gamma = np.asarray(gamma_in, dtype=float)
+        gamma = (
+            family_adapter.validate_dispersion(gamma_in, X.shape[1])
+            if family_adapter.has_dispersion
+            else None
+        )
         A_list = [np.asarray(A, dtype=float) for A in A_list_in]
     else:
         initialization = str(initialize).lower()
@@ -182,9 +199,8 @@ def fit_dde_normal(
                 raise ValueError(
                     "B_list_true and G_list_true are only used with initialize='oracle'."
                 )
-            prop, B_list, gamma, A_list, _ = Normal_init_semi(
+            prop, B_list, gamma, A_list, _ = family_adapter.initialize(
                 X,
-                K_tuple[0],
                 K_tuple,
                 epsilon=epsilon,
                 mode="data",
@@ -194,13 +210,12 @@ def fit_dde_normal(
                 raise ValueError(
                     "initialize='oracle' requires B_list_true and G_list_true."
                 )
-            prop, B_list, gamma, A_list, _ = Normal_init_semi(
+            prop, B_list, gamma, A_list, _ = family_adapter.initialize(
                 X,
-                K_tuple[0],
                 K_tuple,
-                B_list_true,
-                G_list_true,
-                epsilon,
+                B_list_true=B_list_true,
+                G_list_true=G_list_true,
+                epsilon=epsilon,
                 mode="oracle",
             )
         else:
@@ -211,7 +226,7 @@ def fit_dde_normal(
             raise ValueError(
                 "random_state is currently supported by the CSP path only."
             )
-        prop, B_list, gamma, A_list, iterations = get_SAEM_normal(
+        prop, B_list, gamma, A_list, iterations = get_SAEM_parametric(
             X,
             prop,
             B_list,
@@ -225,6 +240,7 @@ def fit_dde_normal(
             bound_val=bound_val,
             verbose=bool(verbose),
             estep_row_chunk_size=estep_row_chunk_size,
+            family=family_adapter,
         )
 
         X_result = X.copy()
@@ -240,7 +256,7 @@ def fit_dde_normal(
                 "iterations": iterations,
                 "D": D,
                 "K_list": list(K_tuple),
-                "family": "Normal",
+                "family": family_adapter.name,
                 "dimension_method": "fixed",
                 "initialization": initialization,
             },
@@ -263,7 +279,7 @@ def fit_dde_normal(
             "mcem_stage_spectral_gap_threshold is only valid when "
             "csp_backend='mcem_reinitialize'."
         )
-    raw = fit_normal_csp_mcem(
+    raw = fit_parametric_csp_mcem(
         X,
         prop,
         B_list,
@@ -293,6 +309,7 @@ def fit_dde_normal(
         penalty_strength=mcem_penalty_strength,
         stage_transition_mode=stage_transition_mode,
         stage_spectral_gap_threshold=mcem_stage_spectral_gap_threshold,
+        family=family_adapter,
     )
 
     X_result = X.copy()
@@ -302,7 +319,7 @@ def fit_dde_normal(
         "K_list": tuple(raw["num_active"].tolist()),
         "K_max_list": K_tuple,
         "original_K_list": K_tuple,
-        "family": "Normal",
+        "family": family_adapter.name,
         "dimension_method": "csp",
         "initialization": initialization,
         "backend": backend,
@@ -354,4 +371,11 @@ def fit_dde_normal(
     )
 
 
-__all__ = ["fit_dde_normal"]
+def fit_dde_normal(Y, **kwargs) -> DDEResult:
+    """Compatibility wrapper for the public Normal DDE fitting function."""
+    if "family" in kwargs:
+        raise TypeError("Unexpected Normal DDE argument(s): family.")
+    return fit_parametric_dde(Y, family=NORMAL_FAMILY, **kwargs)
+
+
+__all__ = ["fit_dde_normal", "fit_parametric_dde"]

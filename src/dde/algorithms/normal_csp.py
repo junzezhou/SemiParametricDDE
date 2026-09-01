@@ -1,11 +1,10 @@
-"""CSP-MAP MCEM kernels for a Normal-observed DDE.
+"""CSP-MAP MCEM kernels for parametric-observed DDEs.
 
 The original simultaneous kernel follows the coordinate-ascent architecture
 used by the package's CopDDE CSP path.  Two staged variants share that kernel
 and differ only in whether a waiting parent is rebuilt or capped while its
-eligible state is preserved.  All variants work directly on Normal data,
-without rank-likelihood augmentation, and use batched proximal-gradient
-weighted-lasso updates.
+eligible state is preserved.  The latent control loop is family-independent;
+its adapter supplies the observed conditional likelihood and M-step.
 """
 
 from __future__ import annotations
@@ -15,9 +14,16 @@ from scipy.special import expit
 
 from .csp import csp_active_mask, update_csp_layer
 from .normal_init_semi import initialize_binary_parent
+from .parametric_families import (
+    NORMAL_FAMILY,
+    _largest_eigenvalue_psd,
+    _soft_threshold,
+    _solve_gaussian_weighted_l1,
+    _solve_gaussian_weighted_l1_from_statistics,
+    resolve_parametric_family,
+)
 from .semi_saem import (
-    _compute_bernoulli_probabilities_normal,
-    _normal_sample_statistics,
+    _compute_bernoulli_probabilities_parametric,
 )
 
 
@@ -25,11 +31,6 @@ def _as_rng(random_state=None):
     if isinstance(random_state, np.random.Generator):
         return random_state
     return np.random.default_rng(random_state)
-
-
-def _soft_threshold(x, threshold):
-    x = np.asarray(x, dtype=float)
-    return np.sign(x) * np.maximum(np.abs(x) - threshold, 0.0)
 
 
 def _validate_spike_scales(t_spike, D: int) -> np.ndarray:
@@ -78,13 +79,6 @@ def _sample_latent_layers(ber, C: int, rng) -> list[np.ndarray]:
         augmented[:, 1:, :] = rng.random((N, Kd, C)) < probs[:, :, None]
         samples.append(augmented)
     return samples
-
-
-def _largest_eigenvalue_psd(matrix: np.ndarray) -> float:
-    matrix = np.asarray(matrix, dtype=float)
-    if matrix.size == 0:
-        return 0.0
-    return max(float(np.linalg.eigvalsh(matrix)[-1]), 0.0)
 
 
 def _spectral_parent_width(A_prev, cap, minimum_gap):
@@ -228,103 +222,6 @@ def _apply_staged_parent_cap_only(
     }
 
 
-def _solve_gaussian_weighted_l1_from_statistics(
-    X,
-    Q,
-    q_all,
-    B_start,
-    gamma,
-    penalty_scale,
-    temperature,
-    *,
-    mc_samples=1,
-    x_sq_sum=None,
-    max_iter=100,
-    tol=1e-6,
-    bound=10.0,
-):
-    """Batched Normal-layer update from MC or SA sufficient statistics."""
-    X = np.asarray(X, dtype=float)
-    Q = np.asarray(Q, dtype=float)
-    q_all = np.asarray(q_all, dtype=float)
-    B = np.asarray(B_start, dtype=float).copy()
-    gamma = np.maximum(np.asarray(gamma, dtype=float).reshape(-1), 1e-10)
-    penalty_scale = np.asarray(penalty_scale, dtype=float)
-    C = int(mc_samples)
-
-    largest = _largest_eigenvalue_psd(Q)
-    if largest <= 1e-14:
-        B[:, 0] = np.clip(np.mean(X, axis=0), -bound, bound)
-        B[:, 1:] = 0.0
-    else:
-        row_step = gamma / (float(temperature) * largest)
-        row_step = np.maximum(row_step, 1e-14)
-        Y = B.copy()
-        momentum = 1.0
-        for _ in range(int(max_iter)):
-            gradient = (float(temperature) / gamma[:, None]) * (Y @ Q - q_all)
-            candidate = Y - row_step[:, None] * gradient
-            candidate[:, 0] = np.clip(candidate[:, 0], -bound, bound)
-            candidate[:, 1:] = _soft_threshold(
-                candidate[:, 1:],
-                row_step[:, None] / penalty_scale,
-            )
-            candidate[:, 1:] = np.clip(candidate[:, 1:], -bound, bound)
-
-            relative = np.linalg.norm(candidate - B) / (np.linalg.norm(B) + 1e-12)
-            next_momentum = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * momentum**2))
-            Y = candidate + ((momentum - 1.0) / next_momentum) * (candidate - B)
-            B = candidate
-            momentum = next_momentum
-            if relative <= tol:
-                break
-
-    quadratic = np.einsum("jp,pq,jq->j", B, Q, B, optimize=True)
-    cross = np.einsum("jp,jp->j", B, q_all, optimize=True)
-    if x_sq_sum is None:
-        x_sq_sum = np.sum(X**2, axis=0)
-    else:
-        x_sq_sum = np.asarray(x_sq_sum, dtype=float).reshape(-1)
-        if x_sq_sum.shape != (X.shape[1],):
-            raise ValueError("x_sq_sum must have one entry per observed column.")
-    sse_average = np.maximum(x_sq_sum - 2.0 * cross + quadratic, 0.0)
-    sse = C * sse_average
-    N = X.shape[0]
-    gamma_update = (1.0 + 0.5 * sse) / (1.0 + 0.5 * N * C + 1.0)
-    return B, np.maximum(gamma_update, 1e-10)
-
-
-def _solve_gaussian_weighted_l1(
-    X,
-    A_sample,
-    B_start,
-    gamma,
-    penalty_scale,
-    temperature,
-    *,
-    x_sq_sum=None,
-    max_iter=100,
-    tol=1e-6,
-    bound=10.0,
-):
-    """Batched FISTA update for one current Normal Monte Carlo sample."""
-    Q, q_all = _normal_sample_statistics(X, A_sample)
-    return _solve_gaussian_weighted_l1_from_statistics(
-        X,
-        Q,
-        q_all,
-        B_start,
-        gamma,
-        penalty_scale,
-        temperature,
-        mc_samples=A_sample.shape[2],
-        x_sq_sum=x_sq_sum,
-        max_iter=max_iter,
-        tol=tol,
-        bound=bound,
-    )
-
-
 def _solve_logistic_weighted_l1(
     child_sample,
     parent_sample,
@@ -383,11 +280,11 @@ def _solve_logistic_weighted_l1(
     return B
 
 
-def fit_normal_csp_mcem(
+def fit_parametric_csp_mcem(
     X,
     prop_in,
     B_list_in,
-    gamma_in,
+    dispersion_in,
     A_list_in,
     *,
     C: int,
@@ -414,8 +311,9 @@ def fit_normal_csp_mcem(
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
+    family,
 ):
-    """Fit maximal-width Normal DDE parameters under layer-wise CSP priors.
+    """Fit a maximal-width parametric DDE under layer-wise CSP priors.
 
     ``stagewise`` activates CSP from the observed-side layer toward the
     deepest layer and advances only after the current layer's width has been
@@ -423,15 +321,16 @@ def fit_normal_csp_mcem(
     waiting parent is rebuilt, only capped while preserving its state, or
     left untouched.
     """
+    family = resolve_parametric_family(family)
     X = np.asarray(X, dtype=float)
     prop = np.asarray(prop_in, dtype=float).reshape(-1).copy()
     B_list = [np.asarray(B, dtype=float).copy() for B in B_list_in]
-    gamma = np.asarray(gamma_in, dtype=float).reshape(-1).copy()
+    dispersion = family.copy_dispersion(dispersion_in)
     A_list = [np.asarray(A, dtype=np.uint8).copy() for A in A_list_in]
     D = len(B_list)
     K = [B.shape[1] - 1 for B in B_list]
     J = X.shape[1]
-    x_sq_sum = np.sum(X**2, axis=0)
+    response_cache = family.make_response_cache(X)
 
     C = int(C)
     max_iter = int(max_iter)
@@ -528,12 +427,13 @@ def fit_normal_csp_mcem(
     iterations = 0
     while iterations < max_iter:
         iteration_stage = active_stage
-        probabilities = _compute_bernoulli_probabilities_normal(
+        probabilities = _compute_bernoulli_probabilities_parametric(
             X,
             prop,
             B_list,
-            gamma,
+            dispersion,
             A_list,
+            family=family,
             row_chunk_size=estep_row_chunk_size,
             coordinate_chunk_size=estep_coordinate_chunk_size,
             eligible_widths=stage_caps,
@@ -571,14 +471,14 @@ def fit_normal_csp_mcem(
         else:
             prop_update = np.mean(probabilities[-1], axis=0)
         B_update = [None] * D
-        B_update[0], gamma_update = _solve_gaussian_weighted_l1(
+        B_update[0], dispersion_update = family.csp_mstep(
             X,
             A_samples[0],
             B_list[0],
-            gamma,
+            dispersion,
             penalty_scale[0],
             current_temperature,
-            x_sq_sum=x_sq_sum,
+            response_cache=response_cache,
             max_iter=optimizer_maxiter,
             tol=optimizer_tol,
             bound=bound_val,
@@ -702,7 +602,7 @@ def fit_normal_csp_mcem(
             for sample in A_samples
         ]
         B_list = [B.copy() for B in B_update]
-        gamma = gamma_update.copy()
+        dispersion = family.copy_dispersion(dispersion_update)
         prop = prop_update.copy()
         if stage_advanced and stage_transition_mode != "none":
             transition = (
@@ -745,7 +645,7 @@ def fit_normal_csp_mcem(
     return {
         "prop": prop,
         "B_list": B_list,
-        "gamma": gamma,
+        "gamma": dispersion,
         "A_list": A_list,
         "allocation": [value.copy() for value in allocation],
         "omega": [value.copy() for value in omega],
@@ -770,6 +670,26 @@ def fit_normal_csp_mcem(
     }
 
 
+def fit_normal_csp_mcem(
+    X,
+    prop_in,
+    B_list_in,
+    gamma_in,
+    A_list_in,
+    **kwargs,
+):
+    """Compatibility wrapper for the Normal CSP-MCEM kernel."""
+    return fit_parametric_csp_mcem(
+        X,
+        prop_in,
+        B_list_in,
+        gamma_in,
+        A_list_in,
+        family=NORMAL_FAMILY,
+        **kwargs,
+    )
+
+
 __all__ = [
     "_solve_gaussian_weighted_l1",
     "_solve_gaussian_weighted_l1_from_statistics",
@@ -777,5 +697,6 @@ __all__ = [
     "_canonicalize_csp_layer_order",
     "_apply_staged_parent_cap_only",
     "_reinitialize_staged_parent",
+    "fit_parametric_csp_mcem",
     "fit_normal_csp_mcem",
 ]

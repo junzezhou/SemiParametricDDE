@@ -92,20 +92,17 @@ def fit(
         chosen = _infer_model(Y, variable_types)
 
     if chosen == "dde":
-        from .algorithms.dde import fit_dde_normal
+        from .algorithms.dde import fit_parametric_dde
 
         if D is None:
             raise ValueError("D is required when method='DDE'.")
         if family is None:
             raise ValueError("family is required when method='DDE'.")
         family_name = str(family).strip().lower()
-        if family_name not in {"normal", "gaussian"}:
-            raise NotImplementedError(
-                "The current DDE interface implements family='Normal' only."
-            )
         dimension = "fixed" if dimension_method is None else str(dimension_method).lower()
-        return fit_dde_normal(
+        return fit_parametric_dde(
             Y,
+            family=family_name,
             D=D,
             K_list=K_list,
             dimension_method=dimension,

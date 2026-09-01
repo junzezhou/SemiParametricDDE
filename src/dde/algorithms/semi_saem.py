@@ -22,23 +22,17 @@ Python list indexing (0-based):
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import expit, logsumexp as _logsumexp
-from dde.utils import TLP, binary, logistic, patterns_to_int, thres, g_est_rversion
+from dde.utils import binary, logistic, patterns_to_int, thres, g_est_rversion
 from .normal_init_semi import Normal_init_semi
-
-
-def _tlp_penalty(x, pen, tau):
-    """Return the paper/MATLAB TLP penalty ``pen * sum(min(abs(x), tau))``."""
-    return float(pen) * TLP(x, tau)
-
-
-def _tlp_penalty_value_grad(x, pen, tau):
-    """Return the TLP value and a valid gradient away from its knots."""
-    x = np.asarray(x, dtype=float)
-    value = _tlp_penalty(x, pen, tau)
-    grad = np.zeros_like(x)
-    active = (np.abs(x) < tau) & (x != 0.0)
-    grad[active] = float(pen) * np.sign(x[active])
-    return value, grad
+from .parametric_families import (
+    NORMAL_FAMILY,
+    _ObservedNormalAccumulator,
+    _normal_sample_statistics,
+    _tlp_penalty,
+    _tlp_penalty_value_grad,
+    _update_deep_normal_observed,
+    resolve_parametric_family,
+)
 
 
 # MARK: Original SA objective accumulation built a nested closure chain, so each
@@ -48,60 +42,6 @@ def _tlp_penalty_value_grad(x, pen, tau):
 #     def g(x, _fo=f_old, _fn=f_new, _a=alpha):
 #         return (1.0 - _a) * _fo(x) + _a * _fn(x)
 #     return g
-
-
-class _ObservedNormalAccumulator:
-    """Layer-shared running quadratic statistics for Normal responses."""
-
-    def __init__(self, n_responses, n_features):
-        self.Q = np.zeros((n_features, n_features), dtype=float)
-        self.q_all = np.zeros((n_responses, n_features), dtype=float)
-
-    def update(self, X, A_samples, t):
-        alpha = 1.0 / t
-        Q_new, q_new = _normal_sample_statistics(X, A_samples)
-        self.Q = (1.0 - alpha) * self.Q + alpha * Q_new
-        self.q_all = (1.0 - alpha) * self.q_all + alpha * q_new
-        return Q_new, q_new
-
-    def value(self, response_index, x):
-        q = self.q_all[response_index]
-        return float(x @ self.Q @ x - 2.0 * q @ x)
-
-    def value_and_grad(self, response_index, x):
-        q = self.q_all[response_index]
-        value = float(x @ self.Q @ x - 2.0 * q @ x)
-        grad = 2.0 * (self.Q @ x - q)
-        return value, grad
-
-
-def _normal_sample_statistics(X, A_samples):
-    """Return current-MC Normal design cross-products, averaged over draws."""
-    X = np.asarray(X, dtype=float)
-    A_samples = np.asarray(A_samples, dtype=float)
-    C = A_samples.shape[2]
-    Q = np.einsum("nkc,nlc->kl", A_samples, A_samples, optimize=True) / C
-    q_all = X.T @ np.mean(A_samples, axis=2)
-    return Q, q_all
-
-
-def _update_deep_normal_observed(X, Q, q_all, tau, *, x_sq_sum=None):
-    """MATLAB D>=3 closed-form observed-layer update and variances."""
-    X = np.asarray(X, dtype=float)
-    try:
-        coefficients_t = np.linalg.solve(Q, q_all.T)
-    except np.linalg.LinAlgError:
-        coefficients_t = np.linalg.lstsq(Q, q_all.T, rcond=1e-10)[0]
-    B_update = coefficients_t.T
-    B_update[:, 1:] = thres(B_update[:, 1:], tau)
-
-    quadratic = np.einsum("jp,pq,jq->j", B_update, Q, B_update, optimize=True)
-    cross = np.einsum("jp,jp->j", B_update, q_all, optimize=True)
-    if x_sq_sum is None:
-        x_sq_sum = np.sum(X ** 2, axis=0)
-    residual_sum_squares = x_sq_sum - 2.0 * cross + quadratic
-    gamma_update = residual_sum_squares / X.shape[0]
-    return B_update, gamma_update
 
 
 def _matlab_debias(x, tau):
@@ -476,27 +416,28 @@ def _make_bernoulli_layer_accumulator(K_upper, n_children):
     return _BinaryHistoryBernoulliLayerAccumulator(K_upper, n_children)
 
 
-def _compute_bernoulli_probabilities_normal(
+def _compute_bernoulli_probabilities_parametric(
     X,
     prop,
     B_list,
-    gamma,
+    dispersion,
     A_list,
     *,
+    family,
     row_chunk_size=2048,
     coordinate_chunk_size=1,
     eligible_widths=None,
     temperature=1.0,
 ):
-    """Compute one synchronous latent-probability sweep for the Normal DDE.
+    """Compute one synchronous latent-probability sweep for a parametric DDE.
 
     This is algebraically equivalent to the original coordinate loops: every
     layer is conditioned on the same incoming ``A_list`` rather than on values
     sampled earlier in the sweep.
     """
+    family = resolve_parametric_family(family)
     X = np.asarray(X, dtype=float)
     prop = np.asarray(prop, dtype=float)
-    gamma = np.asarray(gamma, dtype=float)
     N = X.shape[0]
     D = len(B_list)
     K = [B.shape[1] - 1 for B in B_list]
@@ -533,24 +474,15 @@ def _compute_bernoulli_probabilities_normal(
             )
 
         if d_idx == 0:
-            B1 = B_list[0]
-            slopes = B1[:, 1 : width + 1]
-            weighted_slopes = slopes / gamma[:, None]
-            slope_gram = slopes.T @ weighted_slopes
-            slope_norms = np.diag(slope_gram)
-            like_logit = np.empty((N, width), dtype=float)
-            for start in range(0, N, row_chunk_size):
-                stop = min(start + row_chunk_size, N)
-                A_chunk = A_list[0][start:stop, :width]
-                data_linear = (
-                    (X[start:stop] - B1[:, 0][None, :])
-                    / gamma[None, :]
-                ) @ slopes
-                like_logit[start:stop] = (
-                    data_linear
-                    - A_chunk @ slope_gram
-                    + (A_chunk - 0.5) * slope_norms[None, :]
-                )
+            like_logit = family.observed_conditional_logit(
+                X,
+                B_list[0],
+                dispersion,
+                A_list[0],
+                width=width,
+                row_chunk_size=row_chunk_size,
+                coordinate_chunk_size=coordinate_chunk_size,
+            )
         else:
             B_cur = B_list[d_idx]
             A_cur = A_list[d_idx]
@@ -635,23 +567,52 @@ def _compute_bernoulli_probabilities_normal(
             ber.append(layer_probability)
 
     return ber
+
+
+def _compute_bernoulli_probabilities_normal(
+    X,
+    prop,
+    B_list,
+    gamma,
+    A_list,
+    *,
+    row_chunk_size=2048,
+    coordinate_chunk_size=1,
+    eligible_widths=None,
+    temperature=1.0,
+):
+    """Compatibility wrapper for the Normal observed-family probability sweep."""
+    return _compute_bernoulli_probabilities_parametric(
+        X,
+        prop,
+        B_list,
+        gamma,
+        A_list,
+        family=NORMAL_FAMILY,
+        row_chunk_size=row_chunk_size,
+        coordinate_chunk_size=coordinate_chunk_size,
+        eligible_widths=eligible_widths,
+        temperature=temperature,
+    )
  
  
 # ============================================================
-#  Inner SAEM (Normal observed layer, D latent layers)
+#  Inner SAEM (parametric observed layer, D latent layers)
 # ============================================================
  
-def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
-                    pen_list, tau, A_list_in, C, tol,
-                    max_iter=50, bound_val=10.0, verbose=True,
-                    estep_row_chunk_size=2048):
+def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
+                        pen_list, tau, A_list_in, C, tol,
+                        max_iter=50, bound_val=10.0, verbose=True,
+                        estep_row_chunk_size=2048, *, family):
+    """Shared fixed-width SAEM runner with observed behavior from ``family``."""
+    family = resolve_parametric_family(family)
     N, J = X.shape
     D = len(B_list_in)
     K = [B_list_in[d].shape[1] - 1 for d in range(D)]
  
     prop   = np.array(prop_in, dtype=float).copy()
     B_list = [np.array(B, dtype=float).copy() for B in B_list_in]
-    gamma  = np.array(gamma_in, dtype=float).copy()
+    dispersion = family.copy_dispersion(dispersion_in)
     # Latent states are binary. Keeping persistent states in uint8 reduces
     # their storage eightfold; floating-point design matrices are still formed
     # at the exact locations where the likelihood needs them.
@@ -661,9 +622,9 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
     # Keeping the unused lower-layer arrays costs N * sum(K[:-1]) float64s.
     p_top = np.zeros((N, K[-1]))
 
-    # This response-only statistic is constant across SAEM iterations.  Passing
-    # it to the closed-form update avoids allocating X ** 2 on every iteration.
-    x_sq_sum = np.sum(X ** 2, axis=0)
+    # Response-only quantities are constant across SAEM iterations.  The
+    # adapter decides which quantities its observed M-step needs.
+    response_cache = family.make_response_cache(X)
  
     # MARK: Original accumulators stored Python functions that were repeatedly
     # wrapped by _sa_accumulate, creating an increasingly deep objective chain.
@@ -672,7 +633,7 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
     # f_acc_bern = []
     # for d in range(1, D):
     #     f_acc_bern.append([_zero] * B_list[d].shape[0])
-    f_acc_obs = _ObservedNormalAccumulator(J, K[0] + 1)
+    f_acc_obs = family.make_fixed_accumulator(J, K[0] + 1)
     f_acc_bern = [
         _make_bernoulli_layer_accumulator(K[d], B_list[d].shape[0])
         for d in range(1, D)
@@ -680,12 +641,13 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
  
     t = 1
     while True:
-        ber = _compute_bernoulli_probabilities_normal(
+        ber = _compute_bernoulli_probabilities_parametric(
             X,
             prop,
             B_list,
-            gamma,
+            dispersion,
             A_list,
+            family=family,
             row_chunk_size=estep_row_chunk_size,
         )
  
@@ -700,30 +662,19 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
         p_top = (1.0 - 1.0 / t) * p_top + (1.0 / t) * ber[-1]
         prop_update = np.mean(p_top, axis=0)
 
-        Q_current, q_current = f_acc_obs.update(X, A_samples[0], t)
-        if D >= 3:
-            B1_update, gamma_update = _update_deep_normal_observed(
-                X, Q_current, q_current, tau, x_sq_sum=x_sq_sum
-            )
-        else:
-            B1_update = np.zeros_like(B_list[0])
-            gamma_update = np.zeros(J)
-            for j in range(J):
-                Xj = X[:, j]
-                _pen = pen_list[0]
-                def obj(x, __j=j, __pen=_pen):
-                    value, grad = f_acc_obs.value_and_grad(__j, x)
-                    pen_value, pen_grad = _tlp_penalty_value_grad(
-                        x[1:], __pen, tau
-                    )
-                    grad[1:] += pen_grad
-                    return value + pen_value, grad
-                bounds = [(-bound_val, bound_val)] * (K[0] + 1)
-                res = minimize(obj, B_list[0][j, :], method='L-BFGS-B',
-                               jac=True, bounds=bounds, options={'maxiter': 10})
-                B1_update[j, :] = res.x
-                eta = np.tensordot(A_samples[0], res.x, axes=([1], [0]))
-                gamma_update[j] = np.sum((Xj[:, None] - eta) ** 2) / (N * C)
+        B1_update, dispersion_update = family.fixed_mstep(
+            X,
+            A_samples[0],
+            B_list[0],
+            dispersion,
+            f_acc_obs,
+            iteration=t,
+            depth=D,
+            penalty=pen_list[0],
+            tau=tau,
+            bound_val=bound_val,
+            response_cache=response_cache,
+        )
  
         B_updates = [B1_update]
         for d_idx in range(1, D):
@@ -751,7 +702,7 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
         err = np.sqrt(
             np.sum((prop - prop_update) ** 2)
             + sum(np.sum((B_list[d] - B_updates[d]) ** 2) for d in range(D))
-            + np.sum((gamma - gamma_update) ** 2))
+            + family.dispersion_distance_sq(dispersion, dispersion_update))
  
         A_list_new = []
         for d in range(D):
@@ -767,7 +718,7 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
             else:
                 B_updates[d][:, 1:] = thres(B_updates[d][:, 1:], tau)
         B_list = [B.copy() for B in B_updates]
-        gamma = gamma_update.copy()
+        dispersion = family.copy_dispersion(dispersion_update)
         A_list = A_list_new
  
         t += 1
@@ -776,7 +727,30 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
         if abs(err) <= tol or t >= max_iter:
             break
  
-    return prop, B_list, gamma, A_list, t
+    return prop, B_list, dispersion, A_list, t
+
+
+def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
+                    pen_list, tau, A_list_in, C, tol,
+                    max_iter=50, bound_val=10.0, verbose=True,
+                    estep_row_chunk_size=2048):
+    """Compatibility wrapper for the fixed-width Normal SAEM kernel."""
+    return get_SAEM_parametric(
+        X,
+        prop_in,
+        B_list_in,
+        gamma_in,
+        pen_list,
+        tau,
+        A_list_in,
+        C,
+        tol,
+        max_iter=max_iter,
+        bound_val=bound_val,
+        verbose=verbose,
+        estep_row_chunk_size=estep_row_chunk_size,
+        family=NORMAL_FAMILY,
+    )
  
  
 # ============================================================
