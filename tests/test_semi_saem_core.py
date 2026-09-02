@@ -2,15 +2,18 @@ import numpy as np
 import pytest
 
 import dde.algorithms.semi_saem as semi_saem_module
+from dde.algorithms.parametric_families import NORMAL_FAMILY
 from dde.algorithms.semi_saem import (
     _BinaryHistoryBernoulliLayerAccumulator,
     _BernoulliLayerAccumulator,
     _DirectAddressBernoulliLayerAccumulator,
     _ObservedNormalAccumulator,
     _compute_bernoulli_probabilities_normal,
+    _latent_coordinate_probability_parametric,
     _matlab_debias,
     _make_bernoulli_layer_accumulator,
     _normal_sample_statistics,
+    _observed_coordinate_loglik_delta,
     _tlp_penalty,
     _tlp_penalty_value_grad,
     _update_deep_normal_observed,
@@ -139,6 +142,74 @@ def test_chunked_normal_estep_matches_single_block():
 
     for expected_layer, actual_layer in zip(expected, actual):
         np.testing.assert_allclose(actual_layer, expected_layer, rtol=1e-12, atol=1e-12)
+
+
+def test_normal_coordinate_conditionals_match_vectorized_static_state():
+    rng = np.random.default_rng(1016)
+    N, J = 9, 12
+    K_list = [4, 2]
+    X = rng.normal(size=(N, J))
+    B_list = [rng.normal(scale=0.2, size=(J, K_list[0] + 1))]
+    B_list.append(rng.normal(scale=0.2, size=(K_list[0], K_list[1] + 1)))
+    A_list = [
+        rng.integers(0, 2, size=(N, width), dtype=np.uint8)
+        for width in K_list
+    ]
+    prop = rng.uniform(0.2, 0.8, size=K_list[-1])
+    gamma = rng.uniform(0.5, 1.5, size=J)
+    expected = _compute_bernoulli_probabilities_normal(
+        X, prop, B_list, gamma, A_list
+    )
+
+    for layer, width in enumerate(K_list):
+        for coordinate in range(width):
+            actual, _ = _latent_coordinate_probability_parametric(
+                X,
+                prop,
+                B_list,
+                gamma,
+                A_list,
+                layer,
+                coordinate,
+                family=NORMAL_FAMILY,
+                row_chunk_size=3,
+            )
+            np.testing.assert_allclose(
+                actual,
+                expected[layer][:, coordinate],
+                rtol=1e-12,
+                atol=1e-12,
+            )
+
+
+def test_normal_closed_coordinate_delta_matches_log_probability_difference():
+    rng = np.random.default_rng(1017)
+    X = rng.normal(size=(17, 12))
+    eta_zero = rng.normal(scale=2.0, size=X.shape)
+    eta_zero[0, :4] = np.array([-100.0, -25.0, 25.0, 100.0])
+    slope = rng.normal(scale=1.5, size=X.shape[1])
+    gamma = rng.uniform(0.4, 1.7, size=X.shape[1])
+    expected = np.sum(
+        NORMAL_FAMILY.conditional_log_prob(
+            X, eta_zero + slope[None, :], gamma
+        )
+        - NORMAL_FAMILY.conditional_log_prob(X, eta_zero, gamma),
+        axis=1,
+    )
+
+    direct = NORMAL_FAMILY.observed_coordinate_loglik_delta(
+        X, eta_zero, slope, gamma
+    )
+    chunked = _observed_coordinate_loglik_delta(
+        X,
+        eta_zero,
+        slope,
+        gamma,
+        family=NORMAL_FAMILY,
+        row_chunk_size=4,
+    )
+    np.testing.assert_allclose(direct, expected, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(chunked, direct, rtol=0.0, atol=0.0)
 
 
 def test_chunked_normal_estep_preserves_fixed_seed_full_kernel():
@@ -289,7 +360,65 @@ def test_binary_history_accumulator_matches_grouped_objective_and_gradient():
         assert history.value(child_index, probe) == pytest.approx(
             grouped.value(child_index, probe), rel=1e-12, abs=1e-12
         )
+    np.testing.assert_allclose(
+        history.weighted_design_gram(),
+        grouped.weighted_design_gram(),
+        rtol=1e-12,
+        atol=1e-12,
+    )
     assert history._row_weight == pytest.approx(1.0 / (3 * C))
+    assert len(history._parent_chunks) == 3
+    assert len(history._packed_child_chunks) == 3
+    assert all(chunk.dtype == np.uint8 for chunk in history._parent_chunks)
+    assert all(
+        chunk.dtype == np.uint8 for chunk in history._packed_child_chunks
+    )
+
+
+@pytest.mark.parametrize("K", (4, 12, 21))
+def test_batched_bernoulli_accumulator_matches_rowwise_objectives(K):
+    rng = np.random.default_rng(1020 + K)
+    N, R, C = 31, 11, 2
+    accumulator = _make_bernoulli_layer_accumulator(K, R)
+    for iteration in (1, 2, 3):
+        upper = np.concatenate(
+            [
+                np.ones((N, 1, C), dtype=np.uint8),
+                rng.integers(0, 2, size=(N, K, C), dtype=np.uint8),
+            ],
+            axis=1,
+        )
+        lower = np.concatenate(
+            [
+                np.ones((N, 1, C), dtype=np.uint8),
+                rng.integers(0, 2, size=(N, R, C), dtype=np.uint8),
+            ],
+            axis=1,
+        )
+        accumulator.update(lower, upper, iteration)
+
+    coefficients = rng.normal(scale=0.15, size=(R, K + 1))
+    expected_values = []
+    expected_gradients = []
+    for child_index in range(R):
+        value, gradient = accumulator.value_and_grad(
+            child_index, coefficients[child_index]
+        )
+        expected_values.append(value)
+        expected_gradients.append(gradient)
+
+    actual_value, actual_gradient = accumulator.batched_value_and_grad(
+        coefficients, row_chunk_size=7
+    )
+    assert actual_value == pytest.approx(
+        np.sum(expected_values), rel=1e-12, abs=1e-10
+    )
+    np.testing.assert_allclose(
+        actual_gradient,
+        np.asarray(expected_gradients),
+        rtol=1e-12,
+        atol=1e-11,
+    )
 
 
 def test_binary_history_sufficient_statistics_preserve_clipped_eta_fallback():
@@ -315,6 +444,30 @@ def test_binary_history_sufficient_statistics_preserve_clipped_eta_fallback():
         actual_value, actual_grad = history.value_and_grad(child_index, probe)
         assert actual_value == pytest.approx(expected_value, rel=1e-12, abs=1e-12)
         np.testing.assert_allclose(actual_grad, expected_grad, rtol=1e-12, atol=1e-12)
+
+    coefficients = np.vstack(
+        [probe + 0.25 * child_index for child_index in range(R)]
+    )
+    expected_values = []
+    expected_gradients = []
+    for child_index in range(R):
+        value, gradient = history.value_and_grad(
+            child_index, coefficients[child_index]
+        )
+        expected_values.append(value)
+        expected_gradients.append(gradient)
+    actual_value, actual_gradient = history.batched_value_and_grad(
+        coefficients, row_chunk_size=5
+    )
+    assert actual_value == pytest.approx(
+        np.sum(expected_values), rel=1e-12, abs=1e-10
+    )
+    np.testing.assert_allclose(
+        actual_gradient,
+        np.asarray(expected_gradients),
+        rtol=1e-12,
+        atol=1e-11,
+    )
 
 
 def test_direct_address_accumulator_matches_grouped_objective_and_gradient():
@@ -442,6 +595,23 @@ def test_binary_history_backend_uses_less_storage_for_mostly_unique_patterns():
         )
     )
     assert history.storage_nbytes < grouped_nbytes
+    packed_child_width = (R + 7) // 8
+    expected_history_nbytes = (
+        3 * N * C * (U + packed_child_width)
+        + R * (U + 1) * np.dtype(float).itemsize
+    )
+    assert history.storage_nbytes == expected_history_nbytes
+
+    # The previous float64 monolith doubled its capacity from 2*N to 4*N
+    # on the third update.  The chunked binary representation must remain
+    # substantially below that exact legacy allocation.
+    legacy_capacity = 4 * N * C
+    legacy_nbytes = (
+        legacy_capacity * U * np.dtype(float).itemsize
+        + legacy_capacity * packed_child_width
+        + R * (U + 1) * np.dtype(float).itemsize
+    )
+    assert history.storage_nbytes <= 0.25 * legacy_nbytes
 
 
 def _central_difference(fun, x, step=1e-6):

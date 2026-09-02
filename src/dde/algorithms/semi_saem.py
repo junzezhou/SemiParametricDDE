@@ -1,6 +1,6 @@
 """
-Penalized SAEM for D-layer Normal-observed deep discrete latent model
-+ Semiparametric outer iteration for g-function estimation.
+Family-adapted penalized SAEM for D-layer parametric DDEs, plus the
+Normal-working-response semiparametric outer iteration.
  
 Three-mode marginal PMF computation for P(A_1):
   Mode A  (all-dense):   every K_d <= max_enum_bits  →  exact, full 2^{K_1} vector
@@ -10,7 +10,7 @@ Three-mode marginal PMF computation for P(A_1):
 Model (1-based layers):
   Layer D (top):   A_D ~ Bernoulli(prop)
   Layer d (1<d<D): A_d | A_{d+1} ~ Bernoulli(logistic(B_{d+1} @ [1, A_{d+1}]))
-  Layer 0 (obs):   X | A_1 ~ Normal(mean = B_1 @ [1, A_1], var = gamma)
+  Layer 0 (obs):   X | A_1 follows the selected parametric family adapter
  
 Python list indexing (0-based):
   B_list[d] = B_{d+1}     d=0 => B_1 (J, K_1+1);  d>=1 => B_{d+1} (K_d, K_{d+1}+1)
@@ -25,9 +25,13 @@ from scipy.special import expit, logsumexp as _logsumexp
 from dde.utils import binary, logistic, patterns_to_int, thres, g_est_rversion
 from .normal_init_semi import Normal_init_semi
 from .parametric_families import (
+    BERNOULLI_FAMILY,
     NORMAL_FAMILY,
     _ObservedNormalAccumulator,
+    _binary_child_conditional_logit,
+    _matlab_debias,
     _normal_sample_statistics,
+    _solve_bernoulli_tlp_batched,
     _tlp_penalty,
     _tlp_penalty_value_grad,
     _update_deep_normal_observed,
@@ -44,14 +48,68 @@ from .parametric_families import (
 #     return g
 
 
-def _matlab_debias(x, tau):
-    """Match the deep-Normal MATLAB ``debias.m`` elementwise."""
-    x = np.asarray(x, dtype=float)
-    out = x.copy()
-    out[x > tau] = x[x > tau] + tau
-    out[x < tau] = x[x < tau] - tau
-    out[np.abs(x) < tau] = 0.0
-    return out
+def _flatten_bernoulli_children(children, C):
+    """Align fixed or Monte Carlo binary children with flattened parents."""
+    children = np.asarray(children)
+    if children.ndim == 2:
+        return np.repeat(children, int(C), axis=0)
+    if children.ndim == 3:
+        return np.moveaxis(children[:, 1:, :], 1, 2).reshape(
+            -1, children.shape[1] - 1
+        )
+    raise ValueError("Bernoulli children must be a 2D matrix or 3D MC array.")
+
+
+def _batched_grouped_bernoulli_value_and_grad(
+    design,
+    counts,
+    sum_y,
+    coefficients,
+    *,
+    row_chunk_size=2048,
+):
+    """Evaluate all independent Bernoulli responses with shared designs.
+
+    The returned scalar is the sum of the existing per-response objectives,
+    and the returned matrix stacks their analytic gradients.  Chunking caps
+    the temporary ``n_patterns x n_responses`` logits used by the batched
+    matrix multiplications.
+    """
+    design = np.asarray(design, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+    sum_y = np.asarray(sum_y, dtype=float)
+    coefficients = np.asarray(coefficients, dtype=float)
+    if design.ndim != 2 or coefficients.ndim != 2:
+        raise ValueError("Bernoulli batch design and coefficients must be matrices.")
+    if counts.shape != (design.shape[0],):
+        raise ValueError("Bernoulli batch counts have an incompatible shape.")
+    if sum_y.shape != (design.shape[0], coefficients.shape[0]):
+        raise ValueError("Bernoulli batch response sums have an incompatible shape.")
+    if coefficients.shape[1] != design.shape[1]:
+        raise ValueError("Bernoulli batch coefficient width is incompatible.")
+    if row_chunk_size is None:
+        row_chunk_size = max(1, design.shape[0])
+    row_chunk_size = max(1, int(row_chunk_size))
+
+    value = 0.0
+    gradient = np.zeros_like(coefficients)
+    for start in range(0, design.shape[0], row_chunk_size):
+        stop = min(start + row_chunk_size, design.shape[0])
+        design_chunk = design[start:stop]
+        counts_chunk = counts[start:stop, None]
+        response_chunk = sum_y[start:stop]
+        raw_eta = design_chunk @ coefficients.T
+        eta = np.clip(raw_eta, -500.0, 500.0)
+        value += float(
+            np.sum(
+                -response_chunk * eta
+                + counts_chunk * np.logaddexp(0.0, eta)
+            )
+        )
+        residual = counts_chunk * logistic(eta) - response_chunk
+        residual *= (raw_eta > -500.0) & (raw_eta < 500.0)
+        gradient += residual.T @ design_chunk
+    return value, gradient
 
 
 class _BernoulliLayerAccumulator:
@@ -70,9 +128,7 @@ class _BernoulliLayerAccumulator:
         alpha = 1.0 / t
         C = A_upper_samples.shape[2]
         parents = np.moveaxis(A_upper_samples[:, 1:, :], 1, 2).reshape(-1, self.K_upper)
-        children = np.moveaxis(A_lower_samples[:, 1:, :], 1, 2).reshape(
-            -1, self.n_children
-        )
+        children = _flatten_bernoulli_children(A_lower_samples, C)
         weights = np.int64(1) << np.arange(self.K_upper - 1, -1, -1, dtype=np.int64)
         codes_flat = parents.astype(np.int64) @ weights
 
@@ -83,22 +139,22 @@ class _BernoulliLayerAccumulator:
         new_sum_y /= C
 
         all_codes = np.union1d(self.codes, new_codes)
-        old_counts = np.zeros(all_codes.size, dtype=float)
-        old_sum_y = np.zeros((all_codes.size, self.n_children), dtype=float)
-        new_counts_aligned = np.zeros(all_codes.size, dtype=float)
-        new_sum_y_aligned = np.zeros((all_codes.size, self.n_children), dtype=float)
+        merged_counts = np.zeros(all_codes.size, dtype=float)
+        merged_sum_y = np.zeros(
+            (all_codes.size, self.n_children), dtype=float
+        )
 
         if self.codes.size:
             old_pos = np.searchsorted(all_codes, self.codes)
-            old_counts[old_pos] = self.counts
-            old_sum_y[old_pos, :] = self.sum_y
+            merged_counts[old_pos] = (1.0 - alpha) * self.counts
+            merged_sum_y[old_pos, :] = (1.0 - alpha) * self.sum_y
         new_pos = np.searchsorted(all_codes, new_codes)
-        new_counts_aligned[new_pos] = new_counts
-        new_sum_y_aligned[new_pos, :] = new_sum_y
+        merged_counts[new_pos] += alpha * new_counts
+        merged_sum_y[new_pos, :] += alpha * new_sum_y
 
         self.codes = all_codes
-        self.counts = (1.0 - alpha) * old_counts + alpha * new_counts_aligned
-        self.sum_y = (1.0 - alpha) * old_sum_y + alpha * new_sum_y_aligned
+        self.counts = merged_counts
+        self.sum_y = merged_sum_y
         self._parent_states = None
         self._design = None
 
@@ -133,6 +189,15 @@ class _BernoulliLayerAccumulator:
         clip_derivative = ((raw_eta > -500.0) & (raw_eta < 500.0)).astype(float)
         grad = self.design.T @ (residual * clip_derivative)
         return value, grad
+
+    def batched_value_and_grad(self, coefficients, *, row_chunk_size=2048):
+        return _batched_grouped_bernoulli_value_and_grad(
+            self.design,
+            self.counts,
+            self.sum_y,
+            coefficients,
+            row_chunk_size=row_chunk_size,
+        )
 
     def weighted_design_gram(self):
         """Return the SA-weighted design cross-product for this layer."""
@@ -171,9 +236,7 @@ class _DirectAddressBernoulliLayerAccumulator:
         parents = np.moveaxis(
             A_upper_samples[:, 1:, :], 1, 2
         ).reshape(-1, self.K_upper)
-        children = np.moveaxis(
-            A_lower_samples[:, 1:, :], 1, 2
-        ).reshape(-1, self.n_children)
+        children = _flatten_bernoulli_children(A_lower_samples, C)
         codes = parents.astype(np.int64) @ self._code_weights
 
         current_counts = np.bincount(
@@ -223,6 +286,15 @@ class _DirectAddressBernoulliLayerAccumulator:
         grad = self.design.T @ (residual * clip_derivative)
         return value, grad
 
+    def batched_value_and_grad(self, coefficients, *, row_chunk_size=2048):
+        return _batched_grouped_bernoulli_value_and_grad(
+            self.design,
+            self.counts,
+            self.sum_y,
+            coefficients,
+            row_chunk_size=row_chunk_size,
+        )
+
     def weighted_design_gram(self):
         """Return the SA-weighted design cross-product for this layer."""
         return self.design.T @ (self.counts[:, None] * self.design)
@@ -246,34 +318,33 @@ class _BinaryHistoryBernoulliLayerAccumulator:
         self.K_upper = int(K_upper)
         self.n_children = int(n_children)
         self._packed_child_width = (self.n_children + 7) // 8
-        self._capacity = 0
         self._size = 0
-        self._parents = np.empty((0, self.K_upper), dtype=float)
-        self._packed_children = np.empty(
-            (0, self._packed_child_width), dtype=np.uint8
-        )
+        self._parent_chunks = []
+        self._packed_child_chunks = []
         self._row_weight = 0.0
         self._draws_per_update = None
         self._response_stats = np.zeros(
             (self.n_children, self.K_upper + 1), dtype=float
         )
 
-    def _ensure_capacity(self, required):
-        if required <= self._capacity:
-            return
-        new_capacity = (
-            required if self._capacity == 0 else max(required, 2 * self._capacity)
-        )
-        parents = np.empty((new_capacity, self.K_upper), dtype=float)
-        packed_children = np.empty(
-            (new_capacity, self._packed_child_width), dtype=np.uint8
-        )
-        if self._size:
-            parents[:self._size] = self._parents[:self._size]
-            packed_children[:self._size] = self._packed_children[:self._size]
-        self._parents = parents
-        self._packed_children = packed_children
-        self._capacity = new_capacity
+    def _iter_float_chunks(self, row_chunk_size=None):
+        """Yield bounded float parents with aligned packed child rows."""
+        if row_chunk_size is not None:
+            row_chunk_size = max(1, int(row_chunk_size))
+        for parent_chunk, packed_child_chunk in zip(
+            self._parent_chunks, self._packed_child_chunks
+        ):
+            chunk_size = (
+                parent_chunk.shape[0]
+                if row_chunk_size is None
+                else row_chunk_size
+            )
+            for start in range(0, parent_chunk.shape[0], chunk_size):
+                stop = min(start + chunk_size, parent_chunk.shape[0])
+                yield (
+                    parent_chunk[start:stop].astype(float),
+                    packed_child_chunk[start:stop],
+                )
 
     def update(self, A_lower_samples, A_upper_samples, t):
         alpha = 1.0 / t
@@ -295,10 +366,8 @@ class _BinaryHistoryBernoulliLayerAccumulator:
         parents = np.moveaxis(
             A_upper_samples[:, 1:, :], 1, 2
         ).reshape(-1, self.K_upper)
-        children = np.moveaxis(
-            A_lower_samples[:, 1:, :], 1, 2
-        ).reshape(-1, self.n_children)
-        parents = np.ascontiguousarray(parents, dtype=float)
+        children = _flatten_bernoulli_children(A_lower_samples, C)
+        parents = np.ascontiguousarray(parents, dtype=np.uint8)
         children_float = np.ascontiguousarray(children, dtype=float)
         packed_children = np.packbits(
             np.ascontiguousarray(children, dtype=np.uint8),
@@ -308,17 +377,17 @@ class _BinaryHistoryBernoulliLayerAccumulator:
 
         current_response_stats = np.empty_like(self._response_stats)
         current_response_stats[:, 0] = np.sum(children_float, axis=0) / C
-        current_response_stats[:, 1:] = children_float.T @ parents / C
+        current_response_stats[:, 1:] = (
+            children_float.T @ parents.astype(float)
+        ) / C
         self._response_stats = (
             (1.0 - alpha) * self._response_stats
             + alpha * current_response_stats
         )
 
-        end = self._size + parents.shape[0]
-        self._ensure_capacity(end)
-        self._parents[self._size:end] = parents
-        self._packed_children[self._size:end] = packed_children
-        self._size = end
+        self._parent_chunks.append(parents)
+        self._packed_child_chunks.append(packed_children)
+        self._size += parents.shape[0]
 
     @staticmethod
     def _child_column(packed_children, child_index):
@@ -331,74 +400,125 @@ class _BinaryHistoryBernoulliLayerAccumulator:
     @property
     def storage_nbytes(self):
         return int(
-            self._parents.nbytes
-            + self._packed_children.nbytes
+            sum(chunk.nbytes for chunk in self._parent_chunks)
+            + sum(chunk.nbytes for chunk in self._packed_child_chunks)
             + self._response_stats.nbytes
         )
 
     def value(self, child_index, x):
         x = np.asarray(x, dtype=float)
-        parents = self._parents[:self._size]
-        raw_eta = x[0] + parents @ x[1:]
-        eta = np.clip(raw_eta, -500, 500)
-        positive_value = self._row_weight * np.sum(np.logaddexp(0.0, eta))
-        if np.all((raw_eta > -500.0) & (raw_eta < 500.0)):
-            return float(
-                positive_value - self._response_stats[child_index] @ x
+        value = -float(self._response_stats[child_index] @ x)
+        for parents, packed_children in self._iter_float_chunks():
+            raw_eta = x[0] + parents @ x[1:]
+            eta = np.clip(raw_eta, -500.0, 500.0)
+            value += self._row_weight * float(
+                np.sum(np.logaddexp(0.0, eta))
             )
-
-        # Clipping makes the response term locally nonlinear. Retain the
-        # packed child history solely for this rare boundary fallback so the
-        # result stays identical to the previous implementation.
-        y = self._child_column(
-            self._packed_children[:self._size], child_index
-        )
-        return float(
-            self._row_weight
-            * np.sum(-y * eta + np.logaddexp(0.0, eta))
-        )
+            clipped = (raw_eta <= -500.0) | (raw_eta >= 500.0)
+            if np.any(clipped):
+                children = self._child_column(
+                    packed_children, child_index
+                )
+                value += self._row_weight * float(
+                    children @ (raw_eta - eta)
+                )
+        return value
 
     def value_and_grad(self, child_index, x):
         x = np.asarray(x, dtype=float)
-        parents = self._parents[:self._size]
-        raw_eta = x[0] + parents @ x[1:]
-        eta = np.clip(raw_eta, -500, 500)
-        interior = (raw_eta > -500.0) & (raw_eta < 500.0)
-        if np.all(interior):
-            positive_residual = self._row_weight * logistic(eta)
-            grad = np.empty_like(x)
-            grad[0] = np.sum(positive_residual)
-            grad[1:] = parents.T @ positive_residual
-            grad -= self._response_stats[child_index]
-            value = float(
-                self._row_weight * np.sum(np.logaddexp(0.0, eta))
-                - self._response_stats[child_index] @ x
+        value = -float(self._response_stats[child_index] @ x)
+        grad = -self._response_stats[child_index].copy()
+        for parents, packed_children in self._iter_float_chunks():
+            raw_eta = x[0] + parents @ x[1:]
+            eta = np.clip(raw_eta, -500.0, 500.0)
+            probability = logistic(eta)
+            positive_residual = self._row_weight * probability
+            value += self._row_weight * float(
+                np.sum(np.logaddexp(0.0, eta))
             )
-            return value, grad
+            grad[0] += np.sum(positive_residual)
+            grad[1:] += parents.T @ positive_residual
 
-        y = self._child_column(
-            self._packed_children[:self._size], child_index
-        )
-        value = float(
-            self._row_weight
-            * np.sum(-y * eta + np.logaddexp(0.0, eta))
-        )
-        residual = self._row_weight * (logistic(eta) - y)
-        residual *= interior
-        grad = np.empty_like(x)
-        grad[0] = np.sum(residual)
-        grad[1:] = parents.T @ residual
+            clipped = (raw_eta <= -500.0) | (raw_eta >= 500.0)
+            if np.any(clipped):
+                children = self._child_column(
+                    packed_children, child_index
+                )
+                value += self._row_weight * float(
+                    children @ (raw_eta - eta)
+                )
+                correction = self._row_weight * (children - probability)
+                correction *= clipped
+                grad[0] += np.sum(correction)
+                grad[1:] += parents.T @ correction
         return value, grad
+
+    def batched_value_and_grad(self, coefficients, *, row_chunk_size=2048):
+        """Return the summed objective and all response gradients.
+
+        In the usual interior case the response-dependent linear term comes
+        from the exact running sufficient statistic.  The packed child
+        history is unpacked only for coordinates whose natural parameter is
+        clipped, matching ``value_and_grad`` at the numerical guard rails.
+        """
+        coefficients = np.asarray(coefficients, dtype=float)
+        expected_shape = (self.n_children, self.K_upper + 1)
+        if coefficients.shape != expected_shape:
+            raise ValueError(
+                "Bernoulli batch coefficients must have shape "
+                f"{expected_shape}; got {coefficients.shape}."
+            )
+        if row_chunk_size is None:
+            row_chunk_size = max(1, self._size)
+        row_chunk_size = max(1, int(row_chunk_size))
+
+        value = 0.0
+        gradient = np.zeros_like(coefficients)
+        for parents, packed_children in self._iter_float_chunks(
+            row_chunk_size
+        ):
+            raw_eta = (
+                coefficients[:, 0][None, :]
+                + parents @ coefficients[:, 1:].T
+            )
+            eta = np.clip(raw_eta, -500.0, 500.0)
+            probability = logistic(eta)
+            weighted_probability = self._row_weight * probability
+            value += self._row_weight * float(
+                np.sum(np.logaddexp(0.0, eta))
+            )
+            gradient[:, 0] += np.sum(weighted_probability, axis=0)
+            gradient[:, 1:] += weighted_probability.T @ parents
+
+            clipped = (raw_eta <= -500.0) | (raw_eta >= 500.0)
+            if np.any(clipped):
+                children = np.unpackbits(
+                    packed_children,
+                    axis=1,
+                    count=self.n_children,
+                    bitorder="little",
+                ).astype(float, copy=False)
+                value += self._row_weight * float(
+                    np.sum(children * (raw_eta - eta))
+                )
+                correction = self._row_weight * (children - probability)
+                correction *= clipped
+                gradient[:, 0] += np.sum(correction, axis=0)
+                gradient[:, 1:] += correction.T @ parents
+
+        value -= float(np.sum(self._response_stats * coefficients))
+        gradient -= self._response_stats
+        return value, gradient
 
     def weighted_design_gram(self):
         """Return the SA-weighted cross-product without expanding a design."""
-        parents = self._parents[:self._size]
-        gram = np.empty((self.K_upper + 1, self.K_upper + 1), dtype=float)
+        gram = np.zeros((self.K_upper + 1, self.K_upper + 1), dtype=float)
         gram[0, 0] = self._size
-        parent_sums = np.sum(parents, axis=0)
-        gram[0, 1:] = parent_sums
-        gram[1:, 0] = parent_sums
-        gram[1:, 1:] = parents.T @ parents
+        for parents, _ in self._iter_float_chunks():
+            parent_sums = np.sum(parents, axis=0)
+            gram[0, 1:] += parent_sums
+            gram[1:, 0] += parent_sums
+            gram[1:, 1:] += parents.T @ parents
         gram *= self._row_weight
         return gram
 
@@ -488,73 +608,16 @@ def _compute_bernoulli_probabilities_parametric(
             A_cur = A_list[d_idx]
             A_below = A_list[d_idx - 1]
             child_width = eligible_widths[d_idx - 1]
-            B_cur_active = B_cur[:child_width, : width + 1]
-            like_logit = np.empty((N, width), dtype=float)
-
-            # Broadcasting all coordinates at once would require an
-            # N x K_{d-1} x K_d array. Loop over K_d while reusing base_eta
-            # and over observation blocks to keep peak memory independent of N.
-            for start in range(0, N, row_chunk_size):
-                stop = min(start + row_chunk_size, N)
-                A_cur_chunk = A_cur[start:stop, :width]
-                base_eta = (
-                    B_cur_active[:, 0][None, :]
-                    + A_cur_chunk @ B_cur_active[:, 1:].T
-                )
-                base_softplus = np.logaddexp(
-                    0.0, np.clip(base_eta, -500, 500)
-                )
-                child_linear = (
-                    A_below[start:stop, :child_width]
-                    @ B_cur_active[:, 1:]
-                )
-                for block_start in range(0, width, coordinate_chunk_size):
-                    block_stop = min(
-                        block_start + coordinate_chunk_size, width
-                    )
-                    slopes_block = B_cur_active[
-                        :, block_start + 1 : block_stop + 1
-                    ].T
-                    # For binary a_l, one shifted softplus plus the shared
-                    # base value exactly represents softplus(eta_1) -
-                    # softplus(eta_0).  This halves the expensive logaddexp
-                    # work without constructing an N x K_{d-1} x K_d array.
-                    direction = 1.0 - 2.0 * A_cur_chunk[
-                        :, block_start:block_stop
-                    ].astype(float)
-                    if block_stop - block_start == 1:
-                        shifted_eta = (
-                            direction[:, :1] * slopes_block[0][None, :]
-                        )
-                        shifted_eta += base_eta
-                    else:
-                        shifted_eta = (
-                            direction[:, :, None]
-                            * slopes_block[None, :, :]
-                        )
-                        shifted_eta += base_eta[:, None, :]
-                    np.clip(
-                        shifted_eta, -500.0, 500.0, out=shifted_eta
-                    )
-                    np.logaddexp(0.0, shifted_eta, out=shifted_eta)
-                    if block_stop - block_start == 1:
-                        shifted_eta -= base_softplus
-                        log_normalizer_delta = direction[:, 0] * np.sum(
-                            shifted_eta, axis=1
-                        )
-                    else:
-                        shifted_eta -= base_softplus[:, None, :]
-                        log_normalizer_delta = direction * np.sum(
-                            shifted_eta, axis=2
-                        )
-                    like_logit[
-                        start:stop, block_start:block_stop
-                    ] = (
-                        child_linear[:, block_start:block_stop]
-                        - np.asarray(log_normalizer_delta).reshape(
-                            stop - start, block_stop - block_start
-                        )
-                    )
+            like_logit = _binary_child_conditional_logit(
+                A_below,
+                B_cur,
+                A_cur,
+                parent_width=width,
+                child_width=child_width,
+                row_chunk_size=row_chunk_size,
+                coordinate_chunk_size=coordinate_chunk_size,
+                sparse="auto" if family.key == "bernoulli" else False,
+            )
 
         like_logit += prior_logit
         like_logit *= float(temperature)
@@ -567,6 +630,384 @@ def _compute_bernoulli_probabilities_parametric(
             ber.append(layer_probability)
 
     return ber
+
+
+def _observed_coordinate_loglik_delta(
+    X,
+    eta_zero,
+    slope,
+    dispersion,
+    *,
+    family,
+    row_chunk_size=2048,
+):
+    """Return the observed log-likelihood change when one parent is set to 1.
+
+    ``eta_zero`` is the observed natural parameter with the selected latent
+    coordinate set to zero.  The adapter supplies a family-specific algebraic
+    form so this hot path avoids constructing two full log-probability arrays.
+    """
+    family = resolve_parametric_family(family)
+    X = np.asarray(X, dtype=float)
+    eta_zero = np.asarray(eta_zero, dtype=float)
+    slope = np.asarray(slope, dtype=float)
+    N = X.shape[0]
+    if eta_zero.shape != X.shape or slope.shape != (X.shape[1],):
+        raise ValueError(
+            "Observed coordinate likelihood received incompatible shapes."
+        )
+    if row_chunk_size is None:
+        row_chunk_size = N
+    row_chunk_size = max(1, int(row_chunk_size))
+    delta = np.empty(N, dtype=float)
+    for start in range(0, N, row_chunk_size):
+        stop = min(start + row_chunk_size, N)
+        delta[start:stop] = family.observed_coordinate_loglik_delta(
+            X[start:stop],
+            eta_zero[start:stop],
+            slope,
+            dispersion,
+        )
+    return delta
+
+
+def _binary_coordinate_loglik_delta(
+    children,
+    eta_zero,
+    slope,
+    *,
+    child_linear=None,
+    row_chunk_size=None,
+):
+    """Return Bernoulli-child log-likelihood odds for one parent coordinate."""
+    children = np.asarray(children, dtype=float)
+    eta_zero = np.asarray(eta_zero, dtype=float)
+    slope = np.asarray(slope, dtype=float)
+    if eta_zero.shape != children.shape or slope.shape != (children.shape[1],):
+        raise ValueError(
+            "Binary coordinate likelihood received incompatible shapes."
+        )
+    if child_linear is None:
+        cached_linear = None
+    else:
+        cached_linear = np.asarray(child_linear, dtype=float)
+        if cached_linear.shape != (children.shape[0],):
+            raise ValueError(
+                "Cached Bernoulli child-linear term has an incompatible shape."
+            )
+    if row_chunk_size is None:
+        row_chunk_size = max(1, children.shape[0])
+    row_chunk_size = max(1, int(row_chunk_size))
+    delta = np.empty(children.shape[0], dtype=float)
+    for start in range(0, children.shape[0], row_chunk_size):
+        stop = min(start + row_chunk_size, children.shape[0])
+        eta_zero_chunk = eta_zero[start:stop]
+        linear_chunk = (
+            children[start:stop] @ slope
+            if cached_linear is None
+            else cached_linear[start:stop]
+        )
+        delta[start:stop] = linear_chunk - np.sum(
+            np.logaddexp(0.0, eta_zero_chunk + slope[None, :])
+            - np.logaddexp(0.0, eta_zero_chunk),
+            axis=1,
+        )
+    return delta
+
+
+def _coordinate_prior_logit(prop, B_list, A_list, layer, coordinate):
+    """Return the prior log-odds shared by dense and sparse Gibbs paths."""
+    if layer == len(A_list) - 1:
+        probability = np.clip(prop[coordinate], 1e-15, 1.0 - 1e-15)
+        return np.log(probability / (1.0 - probability))
+    coefficient_above = np.asarray(B_list[layer + 1], dtype=float)
+    return (
+        coefficient_above[coordinate, 0]
+        + np.asarray(A_list[layer + 1], dtype=float)
+        @ coefficient_above[coordinate, 1:]
+    )
+
+
+def _sparse_bernoulli_coordinate_probability(
+    X,
+    prop,
+    B_list,
+    A_list,
+    layer,
+    coordinate,
+    child_eta,
+    active_children,
+    *,
+    child_linear=None,
+    row_chunk_size=2048,
+):
+    """Evaluate one Bernoulli full conditional on nonzero child slopes only."""
+    state = np.asarray(A_list[layer], dtype=np.uint8)
+    coefficient = np.asarray(B_list[layer], dtype=float)
+    active_children = np.asarray(active_children, dtype=np.intp)
+    if active_children.ndim != 1:
+        raise ValueError("Active Bernoulli child indices must be one-dimensional.")
+
+    if active_children.size:
+        slope = coefficient[active_children, coordinate + 1]
+        eta_zero_active = (
+            np.asarray(child_eta[:, active_children], dtype=float)
+            - state[:, coordinate, None] * slope[None, :]
+        )
+        children = (
+            np.asarray(X)[:, active_children]
+            if layer == 0
+            else np.asarray(A_list[layer - 1])[:, active_children]
+        )
+        likelihood_logit = _binary_coordinate_loglik_delta(
+            children,
+            eta_zero_active,
+            slope,
+            child_linear=child_linear,
+            row_chunk_size=row_chunk_size,
+        )
+    else:
+        eta_zero_active = np.empty((state.shape[0], 0), dtype=float)
+        likelihood_logit = np.zeros(state.shape[0], dtype=float)
+
+    prior_logit = _coordinate_prior_logit(
+        prop, B_list, A_list, layer, coordinate
+    )
+    return expit(prior_logit + likelihood_logit), eta_zero_active
+
+
+def _sparse_observed_child_linear_cache(X, coefficient, active_children):
+    """Cache ``X @ slope`` for the observed Bernoulli Gibbs layer."""
+    X = np.asarray(X)
+    coefficient = np.asarray(coefficient, dtype=float)
+    cache = np.zeros((X.shape[0], len(active_children)), dtype=float)
+    for coordinate, indices in enumerate(active_children):
+        if indices.size:
+            cache[:, coordinate] = (
+                X[:, indices] @ coefficient[indices, coordinate + 1]
+            )
+    return cache
+
+
+def _latent_coordinate_probability_parametric(
+    X,
+    prop,
+    B_list,
+    dispersion,
+    A_list,
+    layer,
+    coordinate,
+    *,
+    family,
+    child_eta=None,
+    row_chunk_size=2048,
+    sparse_bernoulli=True,
+):
+    """Return one exact full conditional and its zero-coordinate child eta."""
+    family = resolve_parametric_family(family)
+    X = np.asarray(X, dtype=float)
+    prop = np.asarray(prop, dtype=float)
+    layer = int(layer)
+    coordinate = int(coordinate)
+    state = np.asarray(A_list[layer], dtype=np.uint8)
+    coefficient = np.asarray(B_list[layer], dtype=float)
+    if child_eta is None:
+        child_eta = (
+            coefficient[:, 0][None, :]
+            + state @ coefficient[:, 1:].T
+        )
+    else:
+        child_eta = np.asarray(child_eta, dtype=float)
+    slope = coefficient[:, coordinate + 1]
+
+    if family.key == "bernoulli" and sparse_bernoulli:
+        active_children = np.flatnonzero(slope != 0.0)
+        probability, eta_zero_active = (
+            _sparse_bernoulli_coordinate_probability(
+                X,
+                prop,
+                B_list,
+                A_list,
+                layer,
+                coordinate,
+                child_eta,
+                active_children,
+                row_chunk_size=row_chunk_size,
+            )
+        )
+        eta_zero = child_eta.copy()
+        eta_zero[:, active_children] = eta_zero_active
+        return probability, eta_zero
+
+    eta_zero = child_eta - state[:, coordinate, None] * slope[None, :]
+
+    if layer == 0:
+        likelihood_logit = _observed_coordinate_loglik_delta(
+            X,
+            eta_zero,
+            slope,
+            dispersion,
+            family=family,
+            row_chunk_size=row_chunk_size,
+        )
+    else:
+        likelihood_logit = _binary_coordinate_loglik_delta(
+            A_list[layer - 1], eta_zero, slope
+        )
+
+    prior_logit = _coordinate_prior_logit(
+        prop, B_list, A_list, layer, coordinate
+    )
+    return expit(prior_logit + likelihood_logit), eta_zero
+
+
+def _sample_latent_layers_parametric(
+    X,
+    prop,
+    B_list,
+    dispersion,
+    A_list,
+    C,
+    *,
+    family,
+    row_chunk_size=2048,
+    rng=None,
+    sparse_bernoulli=True,
+):
+    """Draw a persistent sequence of systematic coordinate-Gibbs sweeps.
+
+    Observations are vectorised, while dependent latent coordinates are updated
+    sequentially.  Each Monte Carlo draw continues from the preceding sweep,
+    and the final draw becomes the next persistent SAEM state.
+    """
+    family = resolve_parametric_family(family)
+    X = np.asarray(X, dtype=float)
+    C = int(C)
+    if C < 1:
+        raise ValueError("C must be a positive integer.")
+    initial_state = [np.asarray(A, dtype=np.uint8) for A in A_list]
+    N = X.shape[0]
+    samples = [
+        np.empty((N, state.shape[1] + 1, C), dtype=np.uint8)
+        for state in initial_state
+    ]
+    for sample in samples:
+        sample[:, 0, :] = 1
+    top_probability_sum = np.zeros_like(initial_state[-1], dtype=float)
+    random = np.random.random if rng is None else rng.random
+    state = [A.copy() for A in initial_state]
+    use_sparse_bernoulli = family.key == "bernoulli" and sparse_bernoulli
+    active_children_by_layer = None
+    observed_child_linear = None
+    if use_sparse_bernoulli:
+        active_children_by_layer = [
+            [
+                np.flatnonzero(
+                    np.asarray(coefficient)[:, coordinate + 1] != 0.0
+                )
+                for coordinate in range(np.asarray(coefficient).shape[1] - 1)
+            ]
+            for coefficient in B_list
+        ]
+        observed_child_linear = _sparse_observed_child_linear_cache(
+            X, B_list[0], active_children_by_layer[0]
+        )
+
+    for draw_index in range(C):
+        for layer, coefficient in enumerate(B_list):
+            coefficient = np.asarray(coefficient, dtype=float)
+            child_eta = (
+                coefficient[:, 0][None, :]
+                + state[layer] @ coefficient[:, 1:].T
+            )
+            for coordinate in range(state[layer].shape[1]):
+                if use_sparse_bernoulli:
+                    active_children = active_children_by_layer[layer][coordinate]
+                    probability, eta_zero_active = (
+                        _sparse_bernoulli_coordinate_probability(
+                            X,
+                            prop,
+                            B_list,
+                            state,
+                            layer,
+                            coordinate,
+                            child_eta,
+                            active_children,
+                            child_linear=(
+                                observed_child_linear[:, coordinate]
+                                if layer == 0
+                                else None
+                            ),
+                            row_chunk_size=row_chunk_size,
+                        )
+                    )
+                else:
+                    probability, eta_zero = _latent_coordinate_probability_parametric(
+                        X,
+                        prop,
+                        B_list,
+                        dispersion,
+                        state,
+                        layer,
+                        coordinate,
+                        family=family,
+                        child_eta=child_eta,
+                        row_chunk_size=row_chunk_size,
+                        sparse_bernoulli=False,
+                    )
+                updated = (random(N) < probability).astype(np.uint8)
+                state[layer][:, coordinate] = updated
+                if use_sparse_bernoulli:
+                    if active_children.size:
+                        active_slope = coefficient[
+                            active_children, coordinate + 1
+                        ]
+                        child_eta[:, active_children] = (
+                            eta_zero_active
+                            + updated[:, None] * active_slope[None, :]
+                        )
+                else:
+                    slope = coefficient[:, coordinate + 1]
+                    child_eta = eta_zero + updated[:, None] * slope[None, :]
+                if layer == len(state) - 1:
+                    top_probability_sum[:, coordinate] += probability
+        for layer, layer_state in enumerate(state):
+            samples[layer][:, 1:, draw_index] = layer_state
+
+    return samples, top_probability_sum / C
+
+
+def _postprocess_and_measure_fixed_update(
+    prop,
+    prop_update,
+    B_list,
+    B_updates,
+    dispersion,
+    dispersion_update,
+    *,
+    family,
+    tau,
+    depth,
+):
+    """Postprocess an M-step and return its parameter-normalised change."""
+    family = resolve_parametric_family(family)
+    B_processed = family.postprocess_fixed_coefficients(
+        B_updates, tau=tau, depth=depth
+    )
+    squared_error = (
+        np.sum((np.asarray(prop) - np.asarray(prop_update)) ** 2)
+        + sum(
+            np.sum((np.asarray(old) - np.asarray(new)) ** 2)
+            for old, new in zip(B_list, B_processed)
+        )
+        + family.dispersion_distance_sq(dispersion, dispersion_update)
+    )
+    n_parameters = np.asarray(prop).size + sum(
+        np.asarray(B).size for B in B_list
+    )
+    if dispersion is not None:
+        n_parameters += np.asarray(dispersion).size
+    return B_processed, float(np.sqrt(squared_error / n_parameters))
 
 
 def _compute_bernoulli_probabilities_normal(
@@ -604,7 +1045,11 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                         pen_list, tau, A_list_in, C, tol,
                         max_iter=50, bound_val=10.0, verbose=True,
                         estep_row_chunk_size=2048, *, family):
-    """Shared fixed-width SAEM runner with observed behavior from ``family``."""
+    """Run fixed-width SAEM with observed behavior supplied by ``family``.
+
+    ``tol`` is compared with the root-mean-square parameter change after the
+    family coefficient postprocessor has been applied.
+    """
     family = resolve_parametric_family(family)
     N, J = X.shape
     D = len(B_list_in)
@@ -641,25 +1086,21 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
  
     t = 1
     while True:
-        ber = _compute_bernoulli_probabilities_parametric(
+        A_samples, top_probability = _sample_latent_layers_parametric(
             X,
             prop,
             B_list,
             dispersion,
             A_list,
+            C,
             family=family,
             row_chunk_size=estep_row_chunk_size,
         )
- 
-        A_samples = []
-        for d in range(D):
-            raw = np.random.rand(N, K[d], C) < ber[d][:, :, None]
-            augmented = np.empty((N, K[d] + 1, C), dtype=np.uint8)
-            augmented[:, 0, :] = 1
-            augmented[:, 1:, :] = raw
-            A_samples.append(augmented)
- 
-        p_top = (1.0 - 1.0 / t) * p_top + (1.0 / t) * ber[-1]
+
+        p_top = (
+            (1.0 - 1.0 / t) * p_top
+            + (1.0 / t) * top_probability
+        )
         prop_update = np.mean(p_top, axis=0)
 
         B1_update, dispersion_update = family.fixed_mstep(
@@ -679,51 +1120,68 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
         B_updates = [B1_update]
         for d_idx in range(1, D):
             n_rows = B_list[d_idx].shape[0]
-            B_d_upd = np.zeros_like(B_list[d_idx])
             bidx = d_idx - 1
             f_acc_bern[bidx].update(
                 A_samples[d_idx - 1], A_samples[d_idx], t
             )
-            for k in range(n_rows):
-                _pen = pen_list[d_idx]
-                def obj(x, __k=k, __pen=_pen):
-                    value, grad = f_acc_bern[bidx].value_and_grad(__k, x)
-                    pen_value, pen_grad = _tlp_penalty_value_grad(
-                        x[1:], __pen, tau
-                    )
-                    grad[1:] += pen_grad
-                    return value + pen_value, grad
-                bounds = [(-bound_val, bound_val)] * (K[d_idx] + 1)
-                res = minimize(obj, B_list[d_idx][k, :], method='L-BFGS-B',
-                               jac=True, bounds=bounds, options={'maxiter': 10})
-                B_d_upd[k, :] = res.x
-            B_updates.append(B_d_upd)
- 
-        err = np.sqrt(
-            np.sum((prop - prop_update) ** 2)
-            + sum(np.sum((B_list[d] - B_updates[d]) ** 2) for d in range(D))
-            + family.dispersion_distance_sq(dispersion, dispersion_update))
- 
-        A_list_new = []
-        for d in range(D):
-            A_list_new.append(
-                (np.mean(A_samples[d][:, 1:, :], axis=2) > 0.5).astype(np.uint8))
- 
-        prop = prop_update.copy()
-        for d in range(D):
-            if D >= 3:
-                B_updates[d][:, 1:] = _matlab_debias(
-                    B_updates[d][:, 1:], tau
+            bounds = family.fixed_latent_bounds(K[d_idx] + 1, bound_val)
+            if family.key == "bernoulli":
+                B_d_upd = _solve_bernoulli_tlp_batched(
+                    f_acc_bern[bidx],
+                    B_list[d_idx],
+                    pen_list[d_idx],
+                    tau,
+                    bounds,
+                    max_iter=10,
                 )
             else:
-                B_updates[d][:, 1:] = thres(B_updates[d][:, 1:], tau)
+                B_d_upd = np.zeros_like(B_list[d_idx])
+                for k in range(n_rows):
+                    _pen = pen_list[d_idx]
+
+                    def obj(x, __k=k, __pen=_pen):
+                        value, grad = f_acc_bern[bidx].value_and_grad(__k, x)
+                        pen_value, pen_grad = _tlp_penalty_value_grad(
+                            x[1:], __pen, tau
+                        )
+                        grad[1:] += pen_grad
+                        return value + pen_value, grad
+
+                    res = minimize(
+                        obj,
+                        B_list[d_idx][k, :],
+                        method="L-BFGS-B",
+                        jac=True,
+                        bounds=bounds,
+                        options={"maxiter": 10},
+                    )
+                    B_d_upd[k, :] = res.x
+            B_updates.append(B_d_upd)
+ 
+        B_updates, err = _postprocess_and_measure_fixed_update(
+            prop,
+            prop_update,
+            B_list,
+            B_updates,
+            dispersion,
+            dispersion_update,
+            family=family,
+            tau=tau,
+            depth=D,
+        )
+ 
+        A_list_new = [
+            A_samples[d][:, 1:, -1].copy() for d in range(D)
+        ]
+ 
+        prop = prop_update.copy()
         B_list = [B.copy() for B in B_updates]
         dispersion = family.copy_dispersion(dispersion_update)
         A_list = A_list_new
  
         t += 1
         if verbose:
-            print(f'EM Iteration {t},\t Err {err:.1f}')
+            print(f'EM Iteration {t},\t Err {err:.4g}')
         if abs(err) <= tol or t >= max_iter:
             break
  
@@ -750,6 +1208,29 @@ def get_SAEM_normal(X, prop_in, B_list_in, gamma_in,
         verbose=verbose,
         estep_row_chunk_size=estep_row_chunk_size,
         family=NORMAL_FAMILY,
+    )
+
+
+def get_SAEM_bernoulli(X, prop_in, B_list_in,
+                       pen_list, tau, A_list_in, C, tol,
+                       max_iter=50, bound_val=10.0, verbose=True,
+                       estep_row_chunk_size=2048):
+    """Compatibility wrapper for the fixed-width Bernoulli SAEM kernel."""
+    return get_SAEM_parametric(
+        X,
+        prop_in,
+        B_list_in,
+        None,
+        pen_list,
+        tau,
+        A_list_in,
+        C,
+        tol,
+        max_iter=max_iter,
+        bound_val=bound_val,
+        verbose=verbose,
+        estep_row_chunk_size=estep_row_chunk_size,
+        family=BERNOULLI_FAMILY,
     )
  
  

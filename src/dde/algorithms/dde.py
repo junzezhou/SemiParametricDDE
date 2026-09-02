@@ -13,8 +13,15 @@ from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
 from .normal_csp import fit_parametric_csp_mcem
-from .parametric_families import NORMAL_FAMILY, resolve_parametric_family
+from .parametric_families import (
+    BERNOULLI_FAMILY,
+    NORMAL_FAMILY,
+    resolve_parametric_family,
+)
 from .semi_saem import get_SAEM_parametric
+
+
+DEFAULT_PARAMETRIC_CONVERGENCE_TOL = 0.005
 
 
 def _validate_pen_list(pen_list: Sequence[float], D: int) -> list[float]:
@@ -46,7 +53,7 @@ def fit_parametric_dde(
     temp=None,
     tau: float,
     C: int,
-    tol: float,
+    tol: float = DEFAULT_PARAMETRIC_CONVERGENCE_TOL,
     max_it: int = 50,
     initialize: str = "data",
     epsilon: float = 1e-4,
@@ -86,6 +93,9 @@ def fit_parametric_dde(
     ``initialize="oracle"`` is intended only for simulation studies that need
     estimates aligned with known generating parameters.  Ordinary data fits
     should use the default ``initialize="data"``.
+
+    For fixed-width fits, ``tol`` is the postprocessed parameter-update RMSE.
+    Its default is ``0.005`` for a dimension-independent convergence scale.
 
     CSP accepts ``csp_backend="mcem"`` for the original simultaneous
     updates, ``"mcem_reinitialize"`` for staged parent rebuilding, and
@@ -259,6 +269,10 @@ def fit_parametric_dde(
                 "family": family_adapter.name,
                 "dimension_method": "fixed",
                 "initialization": initialization,
+                "latent_transition": "systematic_coordinate_gibbs",
+                "mc_state_update": "last_draw",
+                "convergence_metric": "postprocessed_parameter_rmse",
+                "convergence_tol": tol,
             },
             raw=(X_result, prop, B_list, gamma, A_list, iterations),
         )
@@ -378,4 +392,11 @@ def fit_dde_normal(Y, **kwargs) -> DDEResult:
     return fit_parametric_dde(Y, family=NORMAL_FAMILY, **kwargs)
 
 
-__all__ = ["fit_dde_normal", "fit_parametric_dde"]
+def fit_dde_bernoulli(Y, **kwargs) -> DDEResult:
+    """Compatibility wrapper for the public Bernoulli DDE fitting function."""
+    if "family" in kwargs:
+        raise TypeError("Unexpected Bernoulli DDE argument(s): family.")
+    return fit_parametric_dde(Y, family=BERNOULLI_FAMILY, **kwargs)
+
+
+__all__ = ["fit_dde_bernoulli", "fit_dde_normal", "fit_parametric_dde"]

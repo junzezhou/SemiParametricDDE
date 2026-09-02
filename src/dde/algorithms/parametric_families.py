@@ -5,19 +5,21 @@ this module own only observed-layer behavior: data validation and
 initialization, the observed contribution to latent conditional log-odds,
 observed-layer M-steps, dispersion semantics, scoring, and simulation.
 
-Only the Normal adapter is registered during the behavior-preserving
-refactor.  Bernoulli, Poisson, and Lognormal adapters can therefore be added
-without cloning either the fixed-width SAEM or CSP-MCEM control loops.
+Normal and Bernoulli adapters share the same fixed-width SAEM and CSP-MCEM
+control loops.  Poisson and Lognormal can follow the same adapter boundary.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 import numpy as np
 from scipy.optimize import minimize
+from scipy.special import expit
 
 from dde.utils import TLP, thres
 
+from .bernoulli_init import Bernoulli_init, _bernoulli_working_response
 from .normal_init_semi import Normal_init_semi
 
 
@@ -34,6 +36,98 @@ def _tlp_penalty_value_grad(x, pen, tau):
     active = (np.abs(x) < tau) & (x != 0.0)
     grad[active] = float(pen) * np.sign(x[active])
     return value, grad
+
+
+def _solve_bernoulli_tlp_rowwise(
+    accumulator,
+    B_start,
+    penalty,
+    tau,
+    bounds,
+    *,
+    max_iter=10,
+):
+    """Reference implementation of the original per-response L-BFGS-B."""
+    B_start = np.asarray(B_start, dtype=float)
+    B_update = np.zeros_like(B_start)
+    for response_index in range(B_start.shape[0]):
+
+        def objective(x, __index=response_index):
+            value, gradient = accumulator.value_and_grad(__index, x)
+            penalty_value, penalty_gradient = _tlp_penalty_value_grad(
+                x[1:], penalty, tau
+            )
+            gradient[1:] += penalty_gradient
+            return value + penalty_value, gradient
+
+        result = minimize(
+            objective,
+            B_start[response_index],
+            method="L-BFGS-B",
+            jac=True,
+            bounds=bounds,
+            options={"maxiter": int(max_iter)},
+        )
+        B_update[response_index] = result.x
+    return B_update
+
+
+def _solve_bernoulli_tlp_batched(
+    accumulator,
+    B_start,
+    penalty,
+    tau,
+    bounds,
+    *,
+    max_iter=10,
+    row_chunk_size=2048,
+):
+    """Joint L-BFGS-B evaluation of separable Bernoulli TLP objectives.
+
+    This uses the same likelihood, TLP parameterization, coefficient bounds,
+    and iteration cap as ``_solve_bernoulli_tlp_rowwise``.  Combining the
+    independent response objectives allows their logits and gradients to be
+    evaluated by chunked matrix multiplications and removes one optimizer
+    invocation per response.
+    """
+    B_start = np.asarray(B_start, dtype=float)
+    if B_start.ndim != 2:
+        raise ValueError("Bernoulli coefficient start must be a matrix.")
+    bounds = list(bounds)
+    if len(bounds) != B_start.shape[1]:
+        raise ValueError("Bernoulli coefficient bounds have an incompatible width.")
+    shape = B_start.shape
+
+    def objective(flattened):
+        coefficients = np.asarray(flattened, dtype=float).reshape(shape)
+        value, gradient = accumulator.batched_value_and_grad(
+            coefficients, row_chunk_size=row_chunk_size
+        )
+        penalty_value, penalty_gradient = _tlp_penalty_value_grad(
+            coefficients[:, 1:], penalty, tau
+        )
+        gradient[:, 1:] += penalty_gradient
+        return value + penalty_value, gradient.ravel()
+
+    result = minimize(
+        objective,
+        B_start.ravel(),
+        method="L-BFGS-B",
+        jac=True,
+        bounds=bounds * B_start.shape[0],
+        options={"maxiter": int(max_iter)},
+    )
+    return result.x.reshape(shape)
+
+
+def _matlab_debias(x, tau):
+    """Match the deep-Normal MATLAB ``debias.m`` elementwise."""
+    x = np.asarray(x, dtype=float)
+    out = x.copy()
+    out[x > tau] = x[x > tau] + tau
+    out[x < tau] = x[x < tau] - tau
+    out[np.abs(x) < tau] = 0.0
+    return out
 
 
 class _ObservedNormalAccumulator:
@@ -93,6 +187,126 @@ def _update_deep_normal_observed(X, Q, q_all, tau, *, x_sq_sum=None):
 def _soft_threshold(x, threshold):
     x = np.asarray(x, dtype=float)
     return np.sign(x) * np.maximum(np.abs(x) - threshold, 0.0)
+
+
+def _binary_child_conditional_logit(
+    children,
+    B,
+    parents,
+    *,
+    parent_width,
+    child_width=None,
+    row_chunk_size=2048,
+    coordinate_chunk_size=1,
+    sparse=False,
+):
+    """Return Bernoulli-child likelihood odds for each parent coordinate.
+
+    The sparse path evaluates each coordinate only on children whose slope is
+    nonzero.  It is algebraically identical to the dense flip-state formula,
+    but reuses cached ``children @ slope`` terms and avoids allocating dense
+    shifted predictors for zero-loading children.
+    """
+    children = np.asarray(children)
+    parents = np.asarray(parents)
+    B = np.asarray(B, dtype=float)
+    N = children.shape[0]
+    parent_width = int(parent_width)
+    if child_width is None:
+        child_width = children.shape[1]
+    child_width = int(child_width)
+    if row_chunk_size is None:
+        row_chunk_size = N
+    row_chunk_size = max(1, int(row_chunk_size))
+    coordinate_chunk_size = max(1, int(coordinate_chunk_size))
+    B_active = B[:child_width, : parent_width + 1]
+    like_logit = np.empty((N, parent_width), dtype=float)
+
+    if sparse == "auto":
+        slopes = B_active[:, 1:]
+        sparse = np.count_nonzero(slopes) <= slopes.size / 2
+    elif not isinstance(sparse, (bool, np.bool_)):
+        raise ValueError("sparse must be a boolean or 'auto'.")
+
+    if sparse:
+        active_children = [
+            np.flatnonzero(B_active[:, coordinate + 1] != 0.0)
+            for coordinate in range(parent_width)
+        ]
+        child_linear = np.zeros((N, parent_width), dtype=float)
+        for coordinate, indices in enumerate(active_children):
+            if indices.size:
+                child_linear[:, coordinate] = (
+                    children[:, indices]
+                    @ B_active[indices, coordinate + 1]
+                )
+
+    for start in range(0, N, row_chunk_size):
+        stop = min(start + row_chunk_size, N)
+        parent_chunk = parents[start:stop, :parent_width]
+        base_eta = B_active[:, 0][None, :] + parent_chunk @ B_active[:, 1:].T
+        if sparse:
+            for block_start in range(0, parent_width, coordinate_chunk_size):
+                block_stop = min(
+                    block_start + coordinate_chunk_size, parent_width
+                )
+                for coordinate in range(block_start, block_stop):
+                    indices = active_children[coordinate]
+                    if not indices.size:
+                        like_logit[start:stop, coordinate] = 0.0
+                        continue
+                    slope = B_active[indices, coordinate + 1]
+                    eta_zero = (
+                        base_eta[:, indices]
+                        - parent_chunk[:, coordinate, None] * slope[None, :]
+                    )
+                    normalizer_delta = np.logaddexp(
+                        0.0, eta_zero + slope[None, :]
+                    ) - np.logaddexp(0.0, eta_zero)
+                    like_logit[start:stop, coordinate] = (
+                        child_linear[start:stop, coordinate]
+                        - np.sum(normalizer_delta, axis=1)
+                    )
+            continue
+
+        base_softplus = np.logaddexp(0.0, base_eta)
+        child_linear = (
+            children[start:stop, :child_width] @ B_active[:, 1:]
+        )
+        for block_start in range(0, parent_width, coordinate_chunk_size):
+            block_stop = min(
+                block_start + coordinate_chunk_size, parent_width
+            )
+            slopes_block = B_active[
+                :, block_start + 1 : block_stop + 1
+            ].T
+            direction = 1.0 - 2.0 * parent_chunk[
+                :, block_start:block_stop
+            ].astype(float)
+            if block_stop - block_start == 1:
+                shifted_eta = direction[:, :1] * slopes_block[0][None, :]
+                shifted_eta += base_eta
+            else:
+                shifted_eta = direction[:, :, None] * slopes_block[None, :, :]
+                shifted_eta += base_eta[:, None, :]
+            np.logaddexp(0.0, shifted_eta, out=shifted_eta)
+            if block_stop - block_start == 1:
+                shifted_eta -= base_softplus
+                log_normalizer_delta = direction[:, 0] * np.sum(
+                    shifted_eta, axis=1
+                )
+            else:
+                shifted_eta -= base_softplus[:, None, :]
+                log_normalizer_delta = direction * np.sum(
+                    shifted_eta, axis=2
+                )
+            like_logit[start:stop, block_start:block_stop] = (
+                child_linear[:, block_start:block_stop]
+                - np.asarray(log_normalizer_delta).reshape(
+                    stop - start, block_stop - block_start
+                )
+            )
+    return like_logit
 
 
 def _largest_eigenvalue_psd(matrix: np.ndarray) -> float:
@@ -209,14 +423,18 @@ class NormalFamilyAdapter:
     has_dispersion: bool = True
     dispersion_name: str = "conditional_variance"
 
-    def initial_working_response(self, Y, *, epsilon) -> np.ndarray:
+    def inverse_mean_link(self, mean, *, epsilon=None):
+        del epsilon
+        return np.asarray(mean, dtype=float)
+
+    def initial_working_response(self, Y, *, epsilon, K1=None) -> np.ndarray:
         """Return the response used by the shared spectral initializer.
 
         Normal uses the identity mean link.  Discrete-family adapters can
         instead return a stabilized inverse-mean-link response while keeping
         the latent spectral initialization outside the fitting runners.
         """
-        del epsilon
+        del epsilon, K1
         return self.validate_y(Y).copy()
 
     def validate_y(self, Y) -> np.ndarray:
@@ -306,6 +524,23 @@ class NormalFamilyAdapter:
             )
         return like_logit
 
+    def observed_coordinate_loglik_delta(
+        self, X, eta_zero, slope, dispersion
+    ):
+        """Return Normal log-likelihood odds for one latent coordinate."""
+        X = np.asarray(X, dtype=float)
+        eta_zero = np.asarray(eta_zero, dtype=float)
+        slope = np.asarray(slope, dtype=float)
+        gamma = np.asarray(dispersion, dtype=float)
+        return np.sum(
+            (
+                (X - eta_zero) * slope[None, :]
+                - 0.5 * slope[None, :] ** 2
+            )
+            / gamma[None, :],
+            axis=1,
+        )
+
     def make_fixed_accumulator(self, n_responses, n_features):
         return _ObservedNormalAccumulator(n_responses, n_features)
 
@@ -385,7 +620,11 @@ class NormalFamilyAdapter:
         max_iter,
         tol,
         bound,
+        bounds,
+        row_chunk_size,
+        coordinate_chunk_size,
     ):
+        del bounds, row_chunk_size, coordinate_chunk_size
         return _solve_gaussian_weighted_l1(
             X,
             A_samples,
@@ -402,6 +641,25 @@ class NormalFamilyAdapter:
     def dispersion_distance_sq(self, old, new) -> float:
         return float(np.sum((np.asarray(old) - np.asarray(new)) ** 2))
 
+    def fixed_latent_bounds(self, n_parameters, bound_val):
+        return [(-bound_val, bound_val)] * int(n_parameters)
+
+    def csp_coefficient_bounds(self, n_parameters, bound_val, *, observed):
+        """Preserve the existing Normal CSP bounds policy."""
+        if observed:
+            return [(-bound_val, bound_val)] * int(n_parameters)
+        return [(-5.0, bound_val)] + [
+            (-bound_val, bound_val)
+        ] * (int(n_parameters) - 1)
+
+    def postprocess_fixed_coefficients(self, B_updates, *, tau, depth):
+        for B_update in B_updates:
+            if depth >= 3:
+                B_update[:, 1:] = _matlab_debias(B_update[:, 1:], tau)
+            else:
+                B_update[:, 1:] = thres(B_update[:, 1:], tau)
+        return B_updates
+
     def conditional_log_prob(self, Y, eta, dispersion):
         Y = np.asarray(Y, dtype=float)
         eta = np.asarray(eta, dtype=float)
@@ -416,11 +674,252 @@ class NormalFamilyAdapter:
         return rng.normal(loc=eta, scale=scale, size=eta.shape)
 
 
+@dataclass(frozen=True)
+class BernoulliFamilyAdapter:
+    """Observed-layer operations for a conditionally Bernoulli DDE."""
+
+    name: str = "Bernoulli"
+    key: str = "bernoulli"
+    aliases: tuple[str, ...] = ("bernoulli", "binary")
+    has_dispersion: bool = False
+    dispersion_name: Optional[str] = None
+
+    def inverse_mean_link(self, mean, *, epsilon=1e-4):
+        clipped = np.clip(
+            np.asarray(mean, dtype=float), epsilon, 1.0 - epsilon
+        )
+        return np.log(clipped / (1.0 - clipped))
+
+    def initial_working_response(self, Y, *, epsilon, K1=None):
+        if K1 is None:
+            raise ValueError(
+                "Bernoulli initial_working_response requires K1."
+            )
+        return _bernoulli_working_response(
+            self.validate_y(Y), int(K1), float(epsilon)
+        )
+
+    def validate_y(self, Y) -> np.ndarray:
+        X = np.asarray(Y)
+        if X.ndim != 2:
+            raise ValueError(
+                f"Y must be a two-dimensional matrix; got shape {X.shape}."
+            )
+        if X.shape[0] < 1 or X.shape[1] < 1:
+            raise ValueError("Y must contain at least one observation and one variable.")
+        try:
+            finite = np.isfinite(X)
+        except TypeError as exc:
+            raise ValueError(
+                "Bernoulli DDE requires numeric binary 0/1 values in Y."
+            ) from exc
+        if not np.all(finite) or not np.all((X == 0) | (X == 1)):
+            raise ValueError(
+                "Bernoulli DDE requires binary 0/1 values in Y."
+            )
+        return X.astype(float, copy=False)
+
+    def validate_dispersion(self, dispersion, n_responses):
+        del n_responses
+        if dispersion is not None:
+            raise ValueError(
+                "Bernoulli has no dispersion parameter; gamma_in must be omitted."
+            )
+        return None
+
+    def initialize(
+        self,
+        X,
+        K_list,
+        *,
+        epsilon,
+        mode,
+        B_list_true=None,
+        G_list_true=None,
+    ):
+        return Bernoulli_init(
+            X,
+            K_list,
+            epsilon=epsilon,
+            mode=mode,
+            B_list=B_list_true,
+            G_list=G_list_true,
+        )
+
+    def observed_conditional_logit(
+        self,
+        X,
+        B1,
+        dispersion,
+        A1,
+        *,
+        width,
+        row_chunk_size,
+        coordinate_chunk_size=1,
+    ):
+        del dispersion
+        return _binary_child_conditional_logit(
+            X,
+            B1,
+            A1,
+            parent_width=width,
+            child_width=np.asarray(X).shape[1],
+            row_chunk_size=row_chunk_size,
+            coordinate_chunk_size=coordinate_chunk_size,
+            sparse="auto",
+        )
+
+    def observed_coordinate_loglik_delta(
+        self, X, eta_zero, slope, dispersion
+    ):
+        """Return Bernoulli log-likelihood odds for one latent coordinate."""
+        del dispersion
+        X = np.asarray(X, dtype=float)
+        eta_zero = np.asarray(eta_zero, dtype=float)
+        slope = np.asarray(slope, dtype=float)
+        eta_one = eta_zero + slope[None, :]
+        return (
+            X @ slope
+            - np.sum(
+                np.logaddexp(0.0, eta_one)
+                - np.logaddexp(0.0, eta_zero),
+                axis=1,
+            )
+        )
+
+    def make_fixed_accumulator(self, n_responses, n_features):
+        # Imported lazily because the shared accumulator is defined by the
+        # SAEM module that imports this adapter module.
+        from .semi_saem import _make_bernoulli_layer_accumulator
+
+        return _make_bernoulli_layer_accumulator(
+            int(n_features) - 1, int(n_responses)
+        )
+
+    def make_response_cache(self, X):
+        del X
+        return None
+
+    def copy_dispersion(self, dispersion):
+        return self.validate_dispersion(dispersion, 0)
+
+    def fixed_mstep(
+        self,
+        X,
+        A_samples,
+        B_start,
+        dispersion,
+        accumulator,
+        *,
+        iteration,
+        depth,
+        penalty,
+        tau,
+        bound_val,
+        response_cache,
+    ):
+        del dispersion, depth, response_cache
+        accumulator.update(X, A_samples, iteration)
+        bounds = self.fixed_latent_bounds(B_start.shape[1], bound_val)
+        return (
+            _solve_bernoulli_tlp_batched(
+                accumulator,
+                B_start,
+                penalty,
+                tau,
+                bounds,
+                max_iter=10,
+            ),
+            None,
+        )
+
+    def csp_mstep(
+        self,
+        X,
+        A_samples,
+        B_start,
+        dispersion,
+        penalty_scale,
+        temperature,
+        *,
+        response_cache,
+        max_iter,
+        tol,
+        bound,
+        bounds,
+        row_chunk_size,
+        coordinate_chunk_size,
+    ):
+        del dispersion, response_cache
+        from .normal_csp import _solve_logistic_weighted_l1
+
+        return (
+            _solve_logistic_weighted_l1(
+                X,
+                A_samples,
+                B_start,
+                penalty_scale,
+                temperature,
+                max_iter=max_iter,
+                tol=tol,
+                bound=bound,
+                bounds=bounds,
+                row_chunk_size=row_chunk_size,
+                coordinate_chunk_size=coordinate_chunk_size,
+            ),
+            None,
+        )
+
+    def dispersion_distance_sq(self, old, new) -> float:
+        if old is not None or new is not None:
+            raise ValueError("Bernoulli has no dispersion parameter.")
+        return 0.0
+
+    def fixed_latent_bounds(self, n_parameters, bound_val):
+        bound_val = float(bound_val)
+        upper = min(5.0, bound_val)
+        intercept_lower = -upper
+        slope_lower = -min(2.5, bound_val)
+        return [(intercept_lower, upper)] + [
+            (slope_lower, upper)
+        ] * (int(n_parameters) - 1)
+
+    def csp_coefficient_bounds(self, n_parameters, bound_val, *, observed):
+        """Use the validated Bernoulli bounds for observed and latent logits."""
+        del observed
+        return self.fixed_latent_bounds(n_parameters, bound_val)
+
+    def postprocess_fixed_coefficients(self, B_updates, *, tau, depth):
+        del depth
+        for B_update in B_updates:
+            B_update[:, 1:] = thres(B_update[:, 1:], tau)
+        return B_updates
+
+    def conditional_log_prob(self, Y, eta, dispersion):
+        del dispersion
+        Y = np.asarray(Y, dtype=float)
+        eta = np.asarray(eta, dtype=float)
+        return np.where(
+            Y == 1.0,
+            -np.logaddexp(0.0, -eta),
+            -np.logaddexp(0.0, eta),
+        )
+
+    def sample_observed(self, eta, dispersion, rng):
+        del dispersion
+        probabilities = expit(np.asarray(eta, dtype=float))
+        return rng.binomial(1, probabilities, size=probabilities.shape)
+
+
 NORMAL_FAMILY = NormalFamilyAdapter()
+BERNOULLI_FAMILY = BernoulliFamilyAdapter()
 
 _FAMILY_REGISTRY = {
     alias: NORMAL_FAMILY for alias in NORMAL_FAMILY.aliases
 }
+_FAMILY_REGISTRY.update(
+    {alias: BERNOULLI_FAMILY for alias in BERNOULLI_FAMILY.aliases}
+)
 
 
 def register_parametric_family(adapter):
@@ -446,15 +945,20 @@ def resolve_parametric_family(value):
             "has_dispersion",
             "validate_y",
             "validate_dispersion",
+            "inverse_mean_link",
             "initial_working_response",
             "initialize",
             "observed_conditional_logit",
+            "observed_coordinate_loglik_delta",
             "make_fixed_accumulator",
             "make_response_cache",
             "copy_dispersion",
             "fixed_mstep",
             "csp_mstep",
             "dispersion_distance_sq",
+            "fixed_latent_bounds",
+            "csp_coefficient_bounds",
+            "postprocess_fixed_coefficients",
             "conditional_log_prob",
             "sample_observed",
         )
@@ -465,19 +969,25 @@ def resolve_parametric_family(value):
     if normalized in _FAMILY_REGISTRY:
         return _FAMILY_REGISTRY[normalized]
     raise NotImplementedError(
-        "The current DDE interface implements family='Normal' only."
+        "The current DDE interface implements Normal and Bernoulli families only."
     )
 
 
 __all__ = [
+    "BERNOULLI_FAMILY",
+    "BernoulliFamilyAdapter",
     "NORMAL_FAMILY",
     "NormalFamilyAdapter",
     "_ObservedNormalAccumulator",
+    "_binary_child_conditional_logit",
     "_largest_eigenvalue_psd",
+    "_matlab_debias",
     "_normal_sample_statistics",
     "_soft_threshold",
     "_solve_gaussian_weighted_l1",
     "_solve_gaussian_weighted_l1_from_statistics",
+    "_solve_bernoulli_tlp_batched",
+    "_solve_bernoulli_tlp_rowwise",
     "_tlp_penalty",
     "_tlp_penalty_value_grad",
     "_update_deep_normal_observed",

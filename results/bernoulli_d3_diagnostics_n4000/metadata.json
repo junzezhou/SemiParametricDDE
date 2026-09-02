@@ -1,0 +1,19 @@
+{
+  "sample_sizes": [
+    4000
+  ],
+  "replicates": 3,
+  "iterations": 15,
+  "starts": [
+    "data",
+    "truth"
+  ],
+  "samplers": [
+    "parallel",
+    "sequential"
+  ],
+  "n_jobs": 6,
+  "seed_base": 20260902,
+  "wall_seconds": 26.389445499997237,
+  "note": "Diagnostic implementation only; production code is unchanged."
+}

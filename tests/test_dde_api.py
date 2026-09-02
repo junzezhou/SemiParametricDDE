@@ -51,6 +51,16 @@ def test_fit_dde_normal_fixed_public_smoke():
     assert result.diagnostics["family"] == "Normal"
     assert result.diagnostics["dimension_method"] == "fixed"
     assert result.diagnostics["initialization"] == "data"
+    assert (
+        result.diagnostics["latent_transition"]
+        == "systematic_coordinate_gibbs"
+    )
+    assert result.diagnostics["mc_state_update"] == "last_draw"
+    assert (
+        result.diagnostics["convergence_metric"]
+        == "postprocessed_parameter_rmse"
+    )
+    assert result.diagnostics["convergence_tol"] == 0.0
 
 
 def test_fit_dde_normal_is_equivalent_to_direct_kernel_with_same_initial_state():
@@ -106,7 +116,7 @@ def test_fit_dde_normal_is_equivalent_to_direct_kernel_with_same_initial_state()
     [
         ({"D": None}, "D is required"),
         ({"family": None}, "family is required"),
-        ({"family": "Poisson"}, "Normal.*only"),
+        ({"family": "Poisson"}, "Normal and Bernoulli.*only"),
         ({"K_list": [3, 2]}, "K_list"),
         ({"pen_list": [0.0]}, "length D=2"),
     ],

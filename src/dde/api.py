@@ -67,14 +67,14 @@ def fit(
         Parametric observed-data family. Required when ``method="DDE"``.
     K_list:
         Layer widths ordered from the shallowest latent layer to the deepest.
-        Required for fixed-width fits and omitted for Normal-DDE CSP fits,
+        Required for fixed-width fits and omitted for parametric-DDE CSP fits,
         whose maximal widths are derived recursively from the observed width.
     variable_types:
         Optional variable type labels used when ``model="auto"``.
     dimension_method:
         ``"fixed"`` for supplied widths, or ``"csp"`` for CSP-based width
-        selection in supported Normal DDE and copula estimators. If omitted, SemiDDE uses
-        ``"fixed"`` and CopDDE uses ``"csp"``.
+        selection in supported parametric DDE and copula estimators. If omitted,
+        SemiDDE uses ``"fixed"`` and CopDDE uses ``"csp"``.
     **kwargs:
         Algorithm-specific keyword arguments.
     """

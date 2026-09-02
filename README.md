@@ -1,7 +1,7 @@
 # dde
 
 `dde` is a Python package for Deep Discrete Encoder models, including
-parametric Normal DDE estimation,
+parametric Normal and Bernoulli DDE estimation,
 semi-parametric DDE estimation for continuous observations and copula/rank
 likelihood DDE estimation for mixed-scale observations.
 
@@ -40,8 +40,28 @@ result = fit(
 )
 ```
 
-Normal CSP provides three MCEM backends.  ``"mcem"`` retains the original
+Parametric CSP provides three MCEM backends.  ``"mcem"`` retains the original
 simultaneous MCEM updates, ``"mcem_reinitialize"`` activates CSP layer by
 layer and rebuilds each waiting parent, and ``"mcem_cap_only"`` uses the same
 staged schedule while preserving eligible parent states and only enforcing the
 child-implied structural cap.
+
+Bernoulli DDE uses the same fixed and CSP interfaces, requires a binary 0/1
+matrix, and has no `gamma` dispersion parameter. For fixed-width parametric
+DDEs, `tol` is the RMSE of the postprocessed parameter update and defaults to
+`0.005`:
+
+```python
+result = fit(
+    Y_binary,
+    method="DDE",
+    family="Bernoulli",
+    D=2,
+    dimension_method="fixed",
+    K_list=[6, 2],
+    pen_list=[0.1, 0.1],
+    tau=0.3,
+    C=1,
+    tol=0.005,
+)
+```
