@@ -1,0 +1,89 @@
+{
+  "created_utc": "2026-09-03T03:27:25.340620+00:00",
+  "command": [
+    "scripts/evaluate_bernoulli_csp_recovery.py",
+    "--scenarios",
+    "d2",
+    "--sample-sizes",
+    "4000",
+    "8000",
+    "--replicates",
+    "10",
+    "--workers",
+    "4",
+    "--backend",
+    "mcem",
+    "--C",
+    "1",
+    "--max-iter",
+    "50",
+    "--optimizer-maxiter",
+    "100",
+    "--base-seed",
+    "20261001",
+    "--shrinkage-burn",
+    "0",
+    "--penalty-n-power",
+    "0.25",
+    "--penalty-reference-n",
+    "1000",
+    "--penalty-min-strength",
+    "1",
+    "--output-dir",
+    "results/bernoulli_csp_penalty025_d2_highn_seed20261001"
+  ],
+  "python": "3.12.9",
+  "numpy": "1.26.4",
+  "scipy": "1.13.1",
+  "sample_sizes": [
+    4000,
+    8000
+  ],
+  "replicates": 10,
+  "workers": 4,
+  "settings": {
+    "backend": "mcem",
+    "C": 1,
+    "max_iter": 50,
+    "optimizer_maxiter": 100,
+    "optimizer_tol": 1e-06,
+    "tol": 0.005,
+    "convergence_window": 7,
+    "convergence_mean_tol": 0.01,
+    "burn": 5,
+    "tau": 0.3,
+    "penalty_n_power": 0.25,
+    "penalty_reference_n": 1000.0,
+    "penalty_min_strength": 1.0,
+    "shrinkage_burn": 0,
+    "t_spike_multiplier": 1.0,
+    "initialization": "data",
+    "base_seed": 20261001,
+    "keep_trace": false
+  },
+  "scenarios": {
+    "d2": {
+      "name": "D2_Bs_overspecified_J27",
+      "D": 2,
+      "J": 27,
+      "K_true": [
+        6,
+        2
+      ],
+      "extra_observed": 9,
+      "t_spike": [
+        0.03,
+        0.05
+      ],
+      "temperature": 0.9,
+      "K_max": [
+        9,
+        3
+      ]
+    }
+  },
+  "completed_rows": 20,
+  "successful_rows": 20,
+  "failed_rows": 0,
+  "wall_seconds_this_invocation": 80.71162966699922
+}

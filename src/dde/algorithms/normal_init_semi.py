@@ -74,7 +74,7 @@ def _permute_columns_hungarian(B_est, B_ref_slice):
     return B_est[:, perm], perm
 
 
-def _truncated_svd(M, k):
+def _truncated_svd(M, k, *, rng=None):
     """
     Compute the top-k SVD of M robustly.
     Falls back to full SVD when k >= min(M.shape) - 1 (svds limitation).
@@ -86,7 +86,12 @@ def _truncated_svd(M, k):
     # scipy.sparse.linalg.svds requires k < min(m, n)
     if k < min(m, n) - 1:
         try:
-            U, S, Vt = truncated_svds(np.asarray(M, dtype=np.float64), k=k)
+            v0 = None
+            if rng is not None:
+                v0 = rng.standard_normal(min(m, n))
+            U, S, Vt = truncated_svds(
+                np.asarray(M, dtype=np.float64), k=k, v0=v0
+            )
             # svds returns in ascending order; flip to descending
             idx = np.argsort(-S)
             return U[:, idx], S[idx], Vt[idx, :]

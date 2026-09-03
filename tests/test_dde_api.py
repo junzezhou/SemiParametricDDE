@@ -175,6 +175,9 @@ def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
     assert first.diagnostics["backend"] == "mcem"
     assert first.diagnostics["kernel"] == "approximate_mcem_csp"
     assert first.diagnostics["transition_mode"] == "none"
+    assert first.diagnostics["latent_transition"] == "legacy_synchronous"
+    assert first.diagnostics["mc_state_update"] == "draw_majority"
+    assert first.diagnostics["canonicalized_initial_order"] is False
     assert first.diagnostics["K_max_list"] == (6, 2)
     assert first.diagnostics["threshold_rule"] == "first_two_layers"
     fitted_K = tuple(first.diagnostics["K_list"])

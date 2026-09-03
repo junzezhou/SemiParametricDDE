@@ -31,7 +31,7 @@ def _stable_varimax(loadings):
     return rotated
 
 
-def _bernoulli_working_response(children, K_parent, epsilon):
+def _bernoulli_working_response(children, K_parent, epsilon, *, rng=None):
     """Return the MATLAB double-SVD inverse-link working response."""
     children = np.asarray(children, dtype=float)
     epsilon = float(epsilon)
@@ -54,7 +54,7 @@ def _bernoulli_working_response(children, K_parent, epsilon):
     threshold = 1.01 * np.sqrt(N)
     while True:
         U, singular_values, Vt = _truncated_svd(
-            children, requested_rank
+            children, requested_rank, rng=rng
         )
         if (
             requested_rank >= minimum_dimension
@@ -84,14 +84,17 @@ def _initialize_binary_parent_layer(
     threshold_constant,
     B_reference=None,
     G_reference=None,
+    rng=None,
 ):
     """Initialize one binary parent layer from binary child variables."""
     children = np.asarray(children, dtype=np.uint8)
     K_parent = int(K_parent)
-    working = _bernoulli_working_response(children, K_parent, epsilon)
+    working = _bernoulli_working_response(
+        children, K_parent, epsilon, rng=rng
+    )
     n_children = children.shape[1]
 
-    _, _, Vt = _truncated_svd(working, K_parent)
+    _, _, Vt = _truncated_svd(working, K_parent, rng=rng)
     if Vt.shape[0] < K_parent:
         raise ValueError(
             "Bernoulli spectral initialization could not recover K_parent directions."
@@ -167,6 +170,7 @@ def Bernoulli_init(
     mode="data",
     B_list=None,
     G_list=None,
+    random_state=None,
 ):
     """Initialize a D-layer Bernoulli DDE using the MATLAB double-SVD scheme."""
     X_array = np.asarray(X)
@@ -196,6 +200,12 @@ def Bernoulli_init(
             )
         if len(B_list) != D or len(G_list) != D:
             raise ValueError("B_list and G_list lengths must match K_list.")
+    if isinstance(random_state, np.random.Generator):
+        rng = random_state
+    elif random_state is None:
+        rng = None
+    else:
+        rng = np.random.default_rng(random_state)
 
     B_initial = []
     A_initial = []
@@ -210,6 +220,7 @@ def Bernoulli_init(
             threshold_constant=threshold_constant,
             B_reference=None if not oracle else B_list[layer],
             G_reference=None if not oracle else G_list[layer],
+            rng=rng,
         )
         B_initial.append(B_layer)
         A_initial.append(parent)

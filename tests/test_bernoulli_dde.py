@@ -8,14 +8,17 @@ from scipy.special import expit
 import dde.algorithms.parametric_families as family_module
 import dde.algorithms.semi_saem as semi_saem_module
 from dde import fit
+from dde.algorithms.dde import _resolve_mcem_shrinkage_defaults
 from dde.algorithms.bernoulli_init import (
     Bernoulli_init,
     _bernoulli_working_response,
 )
 from dde.algorithms.normal_csp import (
+    _canonicalize_csp_layer_order,
     _logistic_mc_design_and_response_statistic,
     _logistic_mc_value_and_grad,
     _solve_logistic_weighted_l1,
+    fit_bernoulli_csp_mcem,
 )
 from dde.algorithms.parametric_families import (
     BERNOULLI_FAMILY,
@@ -104,7 +107,10 @@ class _PathRng:
 
 
 @pytest.mark.parametrize("depth", (2, 3))
-def test_systematic_fixed_gibbs_transition_preserves_exact_posterior(depth):
+@pytest.mark.parametrize("temperature", (1.0, 0.73))
+def test_systematic_fixed_gibbs_transition_preserves_exact_posterior(
+    depth, temperature
+):
     X = np.ones((1, 1), dtype=float)
     prop = np.array([0.45])
     B_list = [np.array([[-1.2, 2.4]])] + [
@@ -127,7 +133,7 @@ def test_systematic_fixed_gibbs_transition_preserves_exact_posterior(depth):
         observed_success = expit(
             B_list[0][0, 0] + B_list[0][0, 1] * state[0]
         )
-        posterior[index] = probability * observed_success
+        posterior[index] = (probability * observed_success) ** temperature
     posterior /= np.sum(posterior)
 
     transition = np.zeros((states.shape[0], states.shape[0]), dtype=float)
@@ -147,6 +153,7 @@ def test_systematic_fixed_gibbs_transition_preserves_exact_posterior(depth):
                     layer,
                     0,
                     family=BERNOULLI_FAMILY,
+                    temperature=temperature,
                 )
                 path_probability *= (
                     conditional[0] if value else 1.0 - conditional[0]
@@ -162,6 +169,7 @@ def test_systematic_fixed_gibbs_transition_preserves_exact_posterior(depth):
                 1,
                 family=BERNOULLI_FAMILY,
                 rng=_PathRng(target),
+                temperature=temperature,
             )
             sampled_state = tuple(int(layer[0, 1, 0]) for layer in sampled)
             assert sampled_state == tuple(target)
@@ -170,6 +178,116 @@ def test_systematic_fixed_gibbs_transition_preserves_exact_posterior(depth):
     np.testing.assert_allclose(np.sum(transition, axis=1), 1.0, atol=1e-14)
     np.testing.assert_allclose(
         posterior @ transition, posterior, rtol=0.0, atol=1e-14
+    )
+
+
+def test_systematic_gibbs_caps_match_the_equivalent_reduced_model():
+    rng = np.random.default_rng(949)
+    N, J = 19, 7
+    full_widths = (3, 2)
+    eligible_widths = (2, 1)
+    X = rng.integers(0, 2, size=(N, J), dtype=np.uint8)
+    prop = np.array([0.42, 0.81])
+    B_full = [
+        rng.normal(scale=0.35, size=(J, full_widths[0] + 1)),
+        rng.normal(scale=0.35, size=(full_widths[0], full_widths[1] + 1)),
+    ]
+    A_full = [
+        rng.integers(0, 2, size=(N, width), dtype=np.uint8)
+        for width in full_widths
+    ]
+    B_reduced = [
+        B_full[0][:, : eligible_widths[0] + 1].copy(),
+        B_full[1][
+            : eligible_widths[0], : eligible_widths[1] + 1
+        ].copy(),
+    ]
+    A_reduced = [
+        A_full[layer][:, :width].copy()
+        for layer, width in enumerate(eligible_widths)
+    ]
+
+    full_samples, full_top = _sample_latent_layers_parametric(
+        X,
+        prop,
+        B_full,
+        None,
+        A_full,
+        3,
+        family=BERNOULLI_FAMILY,
+        rng=np.random.default_rng(950),
+        eligible_widths=eligible_widths,
+        temperature=0.81,
+    )
+    reduced_samples, reduced_top = _sample_latent_layers_parametric(
+        X,
+        prop[: eligible_widths[-1]],
+        B_reduced,
+        None,
+        A_reduced,
+        3,
+        family=BERNOULLI_FAMILY,
+        rng=np.random.default_rng(950),
+        temperature=0.81,
+    )
+
+    for full, reduced, width in zip(
+        full_samples, reduced_samples, eligible_widths
+    ):
+        np.testing.assert_array_equal(full[:, : width + 1, :], reduced)
+        np.testing.assert_array_equal(full[:, width + 1 :, :], 0)
+    np.testing.assert_array_equal(
+        full_top[:, : eligible_widths[-1]], reduced_top
+    )
+    np.testing.assert_array_equal(full_top[:, eligible_widths[-1] :], 0.0)
+
+
+def test_bernoulli_csp_initial_ordering_is_model_invariant_and_used():
+    X, prop, B_list, A_list = _bernoulli_state(953)
+    before = _compute_bernoulli_probabilities_parametric(
+        X,
+        prop,
+        B_list,
+        None,
+        A_list,
+        family=BERNOULLI_FAMILY,
+    )
+    ordered_prop, ordered_B, ordered_A, permutations = (
+        _canonicalize_csp_layer_order(prop, B_list, A_list)
+    )
+    after = _compute_bernoulli_probabilities_parametric(
+        X,
+        ordered_prop,
+        ordered_B,
+        None,
+        ordered_A,
+        family=BERNOULLI_FAMILY,
+    )
+    for layer, permutation in enumerate(permutations):
+        np.testing.assert_allclose(
+            after[layer], before[layer][:, permutation], rtol=1e-13, atol=1e-13
+        )
+        strength = np.sum(np.abs(ordered_B[layer][:, 1:]), axis=0)
+        assert np.all(strength[:-1] >= strength[1:])
+
+    raw = fit_bernoulli_csp_mcem(
+        X,
+        prop,
+        B_list,
+        A_list,
+        C=1,
+        max_iter=1,
+        t_spike=[0.03, 0.05],
+        temperature=0.9,
+        threshold=0.1,
+        optimizer_maxiter=2,
+        random_state=954,
+        verbose=False,
+    )
+    assert raw["canonicalized_initial_order"] is True
+    assert raw["initial_permutations"] == tuple(
+        tuple(int(index) for index in permutation)
+        for permutation in permutations
     )
 
 
@@ -505,7 +623,13 @@ def test_sparse_bernoulli_coordinate_probability_matches_dense_reference(
             np.testing.assert_array_equal(sparse_eta_zero, dense_eta_zero)
 
 
-def test_sparse_bernoulli_gibbs_matches_dense_fixed_seed_sweep():
+@pytest.mark.parametrize(
+    ("eligible_widths", "temperature"),
+    ((None, 1.0), ((2, 1), 0.82)),
+)
+def test_sparse_bernoulli_gibbs_matches_dense_fixed_seed_sweep(
+    eligible_widths, temperature
+):
     X, prop, B_list, A_list = _bernoulli_state(942)
     rng = np.random.default_rng(943)
     B_sparse = [coefficient.copy() for coefficient in B_list]
@@ -525,6 +649,8 @@ def test_sparse_bernoulli_gibbs_matches_dense_fixed_seed_sweep():
             family=BERNOULLI_FAMILY,
             rng=np.random.default_rng(944),
             sparse_bernoulli=True,
+            eligible_widths=eligible_widths,
+            temperature=temperature,
         )
     )
     dense_samples, dense_top_probability = (
@@ -538,6 +664,8 @@ def test_sparse_bernoulli_gibbs_matches_dense_fixed_seed_sweep():
             family=BERNOULLI_FAMILY,
             rng=np.random.default_rng(944),
             sparse_bernoulli=False,
+            eligible_widths=eligible_widths,
+            temperature=temperature,
         )
     )
     for sparse_sample, dense_sample in zip(sparse_samples, dense_samples):
@@ -1131,10 +1259,7 @@ def test_public_fixed_bernoulli_supports_three_latent_layers():
     assert all(np.all(np.isfinite(B)) for B in result.B_list)
 
 
-@pytest.mark.parametrize(
-    "backend", ("mcem", "mcem_reinitialize", "mcem_cap_only")
-)
-def test_public_bernoulli_csp_routes_all_backends_reproducibly(backend):
+def test_public_bernoulli_csp_defaults_to_mcem_reproducibly():
     X, prop, B_list, A_list = _bernoulli_state(921)
     arguments = dict(
         method="DDE",
@@ -1153,7 +1278,6 @@ def test_public_bernoulli_csp_routes_all_backends_reproducibly(backend):
         optimizer_maxiter=20,
         mcem_stage_min_iter=1,
         mcem_stage_width_window=1,
-        csp_backend=backend,
         random_state=922,
         verbose=False,
     )
@@ -1162,13 +1286,68 @@ def test_public_bernoulli_csp_routes_all_backends_reproducibly(backend):
     second = fit(X, **arguments)
     _assert_result_equal(first, second)
     assert first.diagnostics["family"] == "Bernoulli"
-    assert first.diagnostics["backend"] == backend
+    assert first.diagnostics["backend"] == "mcem"
+    assert (
+        first.diagnostics["kernel"]
+        == "systematic_gibbs_mcem_csp"
+    )
+    assert (
+        first.diagnostics["latent_transition"]
+        == "systematic_coordinate_gibbs"
+    )
+    assert first.diagnostics["mc_state_update"] == "last_draw"
+    assert first.diagnostics["canonicalized_initial_order"] is True
+    assert set(
+        first.diagnostics["active_columns_precanonical_index"]
+    ) == {"layer_1", "layer_2"}
+
+
+@pytest.mark.parametrize(
+    ("backend", "transition_mode"),
+    (
+        ("mcem_reinitialize", "reinitialize"),
+        ("mcem_cap_only", "cap_only"),
+    ),
+)
+def test_public_bernoulli_csp_accepts_explicit_staged_backends(
+    backend, transition_mode
+):
+    X, prop, B_list, A_list = _bernoulli_state(923)
+    result = fit(
+        X,
+        method="DDE",
+        family="Bernoulli",
+        D=2,
+        dimension_method="csp",
+        prop_in=prop,
+        B_list_in=B_list,
+        A_list_in=A_list,
+        t_spike=[0.03, 0.05],
+        temp=0.9,
+        tau=0.1,
+        C=1,
+        tol=0.0,
+        max_it=2,
+        optimizer_maxiter=2,
+        mcem_stage_min_iter=1,
+        mcem_stage_width_window=1,
+        csp_backend=backend,
+        random_state=924,
+        verbose=False,
+    )
+
+    assert result.diagnostics["backend"] == backend
+    assert result.diagnostics["transition_mode"] == transition_mode
+    assert result.diagnostics["stagewise"] is True
+    assert (
+        result.diagnostics["latent_transition"]
+        == "systematic_coordinate_gibbs"
+    )
 
 
 def test_public_bernoulli_csp_uses_data_initialization():
     X, _, _, _ = _bernoulli_state(927)
-    result = fit(
-        X,
+    arguments = dict(
         method="DDE",
         family="Bernoulli",
         D=2,
@@ -1183,11 +1362,140 @@ def test_public_bernoulli_csp_uses_data_initialization():
         random_state=928,
         verbose=False,
     )
+    result = fit(X, **arguments)
+    repeated = fit(X, **arguments)
 
+    _assert_result_equal(result, repeated)
     assert result.gamma is None
     assert result.diagnostics["family"] == "Bernoulli"
+    assert result.diagnostics["backend"] == "mcem"
     assert result.diagnostics["initialization"] == "data"
     assert result.diagnostics["K_max_list"] == (3, 1)
+
+
+def test_public_bernoulli_csp_shrinkage_burn_delays_allocation():
+    X, prop, B_list, A_list = _bernoulli_state(929)
+    result = fit(
+        X,
+        method="DDE",
+        family="Bernoulli",
+        D=2,
+        dimension_method="csp",
+        prop_in=prop,
+        B_list_in=B_list,
+        A_list_in=A_list,
+        t_spike=[0.03, 0.05],
+        temp=0.9,
+        tau=0.1,
+        C=1,
+        tol=0.0,
+        max_it=4,
+        optimizer_maxiter=5,
+        mcem_shrinkage_burn=2,
+        random_state=930,
+        keep_trace=True,
+        verbose=False,
+    )
+
+    assert [entry["shrinkage_active"] for entry in result.diagnostics["trace"]] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert [
+        entry["num_active"].tolist() for entry in result.diagnostics["trace"][:2]
+    ] == [[3, 1], [3, 1]]
+    assert result.diagnostics["shrinkage_burn"] == 2
+    assert result.diagnostics["warmup_reordered"] is True
+
+
+def test_bernoulli_csp_depth_adaptive_defaults_are_narrowly_scoped():
+    penalty, burn, policy = _resolve_mcem_shrinkage_defaults(
+        family_key="bernoulli",
+        D=3,
+        N=8000,
+        backend="mcem",
+        max_iter=50,
+        penalty_strength=None,
+        shrinkage_burn=None,
+    )
+    assert penalty == pytest.approx(4.0)
+    assert burn == 10
+    assert policy == {
+        "name": "bernoulli_depth_adaptive",
+        "penalty_strength_was_automatic": True,
+        "shrinkage_burn_was_automatic": True,
+    }
+
+    for family_key, D, backend in (
+        ("bernoulli", 2, "mcem"),
+        ("normal", 3, "mcem"),
+        ("bernoulli", 3, "mcem_cap_only"),
+    ):
+        penalty, burn, policy = _resolve_mcem_shrinkage_defaults(
+            family_key=family_key,
+            D=D,
+            N=8000,
+            backend=backend,
+            max_iter=50,
+            penalty_strength=None,
+            shrinkage_burn=None,
+        )
+        assert penalty == 1.0
+        assert burn == 0
+        assert policy["name"] == "legacy_or_explicit"
+
+    penalty, burn, policy = _resolve_mcem_shrinkage_defaults(
+        family_key="bernoulli",
+        D=3,
+        N=8000,
+        backend="mcem",
+        max_iter=50,
+        penalty_strength=1.25,
+        shrinkage_burn=3,
+    )
+    assert penalty == 1.25
+    assert burn == 3
+    assert policy["name"] == "legacy_or_explicit"
+
+
+def test_bernoulli_csp_d2_automatic_defaults_are_bitwise_legacy():
+    X, prop, B_list, A_list = _bernoulli_state(931)
+    arguments = dict(
+        method="DDE",
+        family="Bernoulli",
+        D=2,
+        dimension_method="csp",
+        prop_in=prop,
+        B_list_in=B_list,
+        A_list_in=A_list,
+        t_spike=[0.03, 0.05],
+        temp=0.9,
+        tau=0.1,
+        C=1,
+        tol=0.0,
+        max_it=3,
+        optimizer_maxiter=10,
+        random_state=932,
+        verbose=False,
+    )
+    automatic = fit(X, **arguments)
+    legacy = fit(
+        X,
+        **arguments,
+        mcem_penalty_strength=1.0,
+        mcem_shrinkage_burn=0,
+    )
+
+    np.testing.assert_array_equal(automatic.prop, legacy.prop)
+    for automatic_B, legacy_B in zip(automatic.B_list, legacy.B_list):
+        np.testing.assert_array_equal(automatic_B, legacy_B)
+    for automatic_A, legacy_A in zip(automatic.A_list, legacy.A_list):
+        np.testing.assert_array_equal(automatic_A, legacy_A)
+    assert automatic.K_list == legacy.K_list
+    assert automatic.diagnostics["penalty_strength"] == (1.0, 1.0)
+    assert automatic.diagnostics["shrinkage_burn"] == 0
 
 
 def test_bernoulli_conditional_scoring_and_simulation_are_stable():

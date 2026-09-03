@@ -22,6 +22,60 @@ from .semi_saem import get_SAEM_parametric
 
 
 DEFAULT_PARAMETRIC_CONVERGENCE_TOL = 0.005
+_BERNOULLI_CSP_PENALTY_REFERENCE_N = 1000.0
+_BERNOULLI_CSP_PENALTY_POWER = 2.0 / 3.0
+_BERNOULLI_CSP_SHRINKAGE_BURN = 10
+
+
+def _resolve_mcem_shrinkage_defaults(
+    *,
+    family_key: str,
+    D: int,
+    N: int,
+    backend: str,
+    max_iter: int,
+    penalty_strength,
+    shrinkage_burn,
+):
+    """Resolve validated family-specific MCEM shrinkage defaults."""
+    adaptive_bernoulli = (
+        family_key == "bernoulli" and D >= 3 and backend == "mcem"
+    )
+    penalty_was_automatic = penalty_strength is None
+    burn_was_automatic = shrinkage_burn is None
+
+    if penalty_was_automatic:
+        penalty_strength = (
+            max(
+                1.0,
+                (N / _BERNOULLI_CSP_PENALTY_REFERENCE_N)
+                ** _BERNOULLI_CSP_PENALTY_POWER,
+            )
+            if adaptive_bernoulli
+            else 1.0
+        )
+    if burn_was_automatic:
+        shrinkage_burn = (
+            _BERNOULLI_CSP_SHRINKAGE_BURN
+            if adaptive_bernoulli
+            and max_iter >= 2 * _BERNOULLI_CSP_SHRINKAGE_BURN
+            else 0
+        )
+
+    return (
+        penalty_strength,
+        shrinkage_burn,
+        {
+            "name": (
+                "bernoulli_depth_adaptive"
+                if adaptive_bernoulli
+                and (penalty_was_automatic or burn_was_automatic)
+                else "legacy_or_explicit"
+            ),
+            "penalty_strength_was_automatic": penalty_was_automatic,
+            "shrinkage_burn_was_automatic": burn_was_automatic,
+        },
+    )
 
 
 def _validate_pen_list(pen_list: Sequence[float], D: int) -> list[float]:
@@ -72,7 +126,9 @@ def fit_parametric_dde(
     mcem_stage_min_iter: int = 20,
     mcem_stage_width_window: int = 10,
     mcem_stage_freeze_deeper: bool = True,
-    mcem_penalty_strength=1.0,
+    mcem_penalty_strength=None,
+    mcem_shrinkage_burn=None,
+    mcem_reorder_after_shrinkage_burn: bool = True,
     mcem_stage_spectral_gap_threshold=None,
     csp_backend: str = "mcem",
     burn: int = 5,
@@ -97,10 +153,10 @@ def fit_parametric_dde(
     For fixed-width fits, ``tol`` is the postprocessed parameter-update RMSE.
     Its default is ``0.005`` for a dimension-independent convergence scale.
 
-    CSP accepts ``csp_backend="mcem"`` for the original simultaneous
-    updates, ``"mcem_reinitialize"`` for staged parent rebuilding, and
-    ``"mcem_cap_only"`` for staged child-implied caps that preserve eligible
-    parent state.
+    Parametric CSP defaults to the simultaneous ``csp_backend="mcem"`` path.
+    The explicit ``"mcem_reinitialize"`` backend performs staged parent
+    rebuilding, while ``"mcem_cap_only"`` applies staged child-implied caps
+    and preserves eligible parent state.
     """
     family_adapter = resolve_parametric_family(family)
     if kwargs:
@@ -214,6 +270,7 @@ def fit_parametric_dde(
                 K_tuple,
                 epsilon=epsilon,
                 mode="data",
+                random_state=random_state if method == "csp" else None,
             )
         elif initialization == "oracle":
             if B_list_true is None or G_list_true is None:
@@ -227,6 +284,7 @@ def fit_parametric_dde(
                 G_list_true=G_list_true,
                 epsilon=epsilon,
                 mode="oracle",
+                random_state=random_state if method == "csp" else None,
             )
         else:
             raise ValueError("initialize must be 'data' or 'oracle'.")
@@ -293,6 +351,19 @@ def fit_parametric_dde(
             "mcem_stage_spectral_gap_threshold is only valid when "
             "csp_backend='mcem_reinitialize'."
         )
+    (
+        resolved_penalty_strength,
+        resolved_shrinkage_burn,
+        shrinkage_default_policy,
+    ) = _resolve_mcem_shrinkage_defaults(
+        family_key=family_adapter.key,
+        D=D,
+        N=X.shape[0],
+        backend=backend,
+        max_iter=max_it,
+        penalty_strength=mcem_penalty_strength,
+        shrinkage_burn=mcem_shrinkage_burn,
+    )
     raw = fit_parametric_csp_mcem(
         X,
         prop,
@@ -320,13 +391,18 @@ def fit_parametric_dde(
         stage_min_iter=mcem_stage_min_iter,
         stage_width_window=mcem_stage_width_window,
         stage_freeze_deeper=bool(mcem_stage_freeze_deeper),
-        penalty_strength=mcem_penalty_strength,
+        penalty_strength=resolved_penalty_strength,
+        shrinkage_burn=resolved_shrinkage_burn,
+        reorder_after_shrinkage_burn=bool(
+            mcem_reorder_after_shrinkage_burn
+        ),
         stage_transition_mode=stage_transition_mode,
         stage_spectral_gap_threshold=mcem_stage_spectral_gap_threshold,
         family=family_adapter,
     )
 
     X_result = X.copy()
+    latent_transition = raw["latent_transition"]
     diagnostics = {
         "iterations": raw["iterations"],
         "D": D,
@@ -337,9 +413,19 @@ def fit_parametric_dde(
         "dimension_method": "csp",
         "initialization": initialization,
         "backend": backend,
-        "kernel": "approximate_mcem_csp",
+        "kernel": (
+            "systematic_gibbs_mcem_csp"
+            if latent_transition == "systematic_coordinate_gibbs"
+            else "approximate_mcem_csp"
+        ),
+        "latent_transition": latent_transition,
+        "mc_state_update": raw["mc_state_update"],
         "transition_mode": stage_transition_mode,
         "threshold_rule": "first_two_layers",
+        "canonicalized_initial_order": raw[
+            "canonicalized_initial_order"
+        ],
+        "initial_permutations": raw["initial_permutations"],
         "num_active": raw["num_active"].copy(),
         "allocation": [value.copy() for value in raw["allocation"]],
         "omega": [value.copy() for value in raw["omega"]],
@@ -354,6 +440,12 @@ def fit_parametric_dde(
             "final_stage": raw["final_stage"],
             "stage_freeze_deeper": raw["stage_freeze_deeper"],
             "penalty_strength": raw["penalty_strength"],
+            "shrinkage_burn": raw["shrinkage_burn"],
+            "shrinkage_default_policy": shrinkage_default_policy,
+            "reorder_after_shrinkage_burn": raw[
+                "reorder_after_shrinkage_burn"
+            ],
+            "warmup_reordered": raw["warmup_reordered"],
             "stage_spectral_gap_threshold": raw["stage_spectral_gap_threshold"],
             "stage_transition_events": raw["stage_transition_events"],
             "stage_caps": raw["stage_caps"],
@@ -372,6 +464,21 @@ def fit_parametric_dde(
         active_masks=raw["active_masks"],
         min_active=False,
     )
+    if raw["canonicalized_initial_order"]:
+        active_precanonical = {}
+        active_canonical = compressed["diagnostics"][
+            "active_columns_original_index"
+        ]
+        for layer, permutation in enumerate(raw["initial_permutations"]):
+            canonical_indices = np.asarray(
+                active_canonical[f"layer_{layer + 1}"], dtype=int
+            )
+            active_precanonical[f"layer_{layer + 1}"] = (
+                np.asarray(permutation, dtype=int)[canonical_indices - 1] + 1
+            ).tolist()
+        compressed["diagnostics"][
+            "active_columns_precanonical_index"
+        ] = active_precanonical
     return DDEResult(
         model="DDE",
         K_list=list(compressed["diagnostics"]["K_list"]),

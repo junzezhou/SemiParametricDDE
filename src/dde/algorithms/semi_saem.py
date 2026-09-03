@@ -715,16 +715,29 @@ def _binary_coordinate_loglik_delta(
     return delta
 
 
-def _coordinate_prior_logit(prop, B_list, A_list, layer, coordinate):
+def _coordinate_prior_logit(
+    prop,
+    B_list,
+    A_list,
+    layer,
+    coordinate,
+    *,
+    eligible_widths=None,
+):
     """Return the prior log-odds shared by dense and sparse Gibbs paths."""
     if layer == len(A_list) - 1:
         probability = np.clip(prop[coordinate], 1e-15, 1.0 - 1e-15)
         return np.log(probability / (1.0 - probability))
     coefficient_above = np.asarray(B_list[layer + 1], dtype=float)
+    parent_width = (
+        coefficient_above.shape[1] - 1
+        if eligible_widths is None
+        else int(eligible_widths[layer + 1])
+    )
     return (
         coefficient_above[coordinate, 0]
-        + np.asarray(A_list[layer + 1], dtype=float)
-        @ coefficient_above[coordinate, 1:]
+        + np.asarray(A_list[layer + 1], dtype=float)[:, :parent_width]
+        @ coefficient_above[coordinate, 1 : parent_width + 1]
     )
 
 
@@ -740,6 +753,8 @@ def _sparse_bernoulli_coordinate_probability(
     *,
     child_linear=None,
     row_chunk_size=2048,
+    eligible_widths=None,
+    temperature=1.0,
 ):
     """Evaluate one Bernoulli full conditional on nonzero child slopes only."""
     state = np.asarray(A_list[layer], dtype=np.uint8)
@@ -771,9 +786,17 @@ def _sparse_bernoulli_coordinate_probability(
         likelihood_logit = np.zeros(state.shape[0], dtype=float)
 
     prior_logit = _coordinate_prior_logit(
-        prop, B_list, A_list, layer, coordinate
+        prop,
+        B_list,
+        A_list,
+        layer,
+        coordinate,
+        eligible_widths=eligible_widths,
     )
-    return expit(prior_logit + likelihood_logit), eta_zero_active
+    return (
+        expit(float(temperature) * (prior_logit + likelihood_logit)),
+        eta_zero_active,
+    )
 
 
 def _sparse_observed_child_linear_cache(X, coefficient, active_children):
@@ -802,6 +825,8 @@ def _latent_coordinate_probability_parametric(
     child_eta=None,
     row_chunk_size=2048,
     sparse_bernoulli=True,
+    eligible_widths=None,
+    temperature=1.0,
 ):
     """Return one exact full conditional and its zero-coordinate child eta."""
     family = resolve_parametric_family(family)
@@ -811,14 +836,31 @@ def _latent_coordinate_probability_parametric(
     coordinate = int(coordinate)
     state = np.asarray(A_list[layer], dtype=np.uint8)
     coefficient = np.asarray(B_list[layer], dtype=float)
+    parent_width = (
+        state.shape[1]
+        if eligible_widths is None
+        else int(eligible_widths[layer])
+    )
+    child_width = (
+        coefficient.shape[0]
+        if layer == 0 or eligible_widths is None
+        else int(eligible_widths[layer - 1])
+    )
+    coefficient_active = coefficient[
+        :child_width, : parent_width + 1
+    ]
     if child_eta is None:
         child_eta = (
-            coefficient[:, 0][None, :]
-            + state @ coefficient[:, 1:].T
+            coefficient_active[:, 0][None, :]
+            + state[:, :parent_width] @ coefficient_active[:, 1:].T
         )
     else:
         child_eta = np.asarray(child_eta, dtype=float)
-    slope = coefficient[:, coordinate + 1]
+        if child_eta.shape != (state.shape[0], child_width):
+            raise ValueError(
+                "Child natural parameters have an incompatible shape."
+            )
+    slope = coefficient_active[:, coordinate + 1]
 
     if family.key == "bernoulli" and sparse_bernoulli:
         active_children = np.flatnonzero(slope != 0.0)
@@ -833,6 +875,8 @@ def _latent_coordinate_probability_parametric(
                 child_eta,
                 active_children,
                 row_chunk_size=row_chunk_size,
+                eligible_widths=eligible_widths,
+                temperature=temperature,
             )
         )
         eta_zero = child_eta.copy()
@@ -852,13 +896,23 @@ def _latent_coordinate_probability_parametric(
         )
     else:
         likelihood_logit = _binary_coordinate_loglik_delta(
-            A_list[layer - 1], eta_zero, slope
+            np.asarray(A_list[layer - 1])[:, :child_width],
+            eta_zero,
+            slope,
         )
 
     prior_logit = _coordinate_prior_logit(
-        prop, B_list, A_list, layer, coordinate
+        prop,
+        B_list,
+        A_list,
+        layer,
+        coordinate,
+        eligible_widths=eligible_widths,
     )
-    return expit(prior_logit + likelihood_logit), eta_zero
+    return (
+        expit(float(temperature) * (prior_logit + likelihood_logit)),
+        eta_zero,
+    )
 
 
 def _sample_latent_layers_parametric(
@@ -873,6 +927,8 @@ def _sample_latent_layers_parametric(
     row_chunk_size=2048,
     rng=None,
     sparse_bernoulli=True,
+    eligible_widths=None,
+    temperature=1.0,
 ):
     """Draw a persistent sequence of systematic coordinate-Gibbs sweeps.
 
@@ -886,9 +942,23 @@ def _sample_latent_layers_parametric(
     if C < 1:
         raise ValueError("C must be a positive integer.")
     initial_state = [np.asarray(A, dtype=np.uint8) for A in A_list]
+    widths = tuple(state.shape[1] for state in initial_state)
+    if eligible_widths is None:
+        eligible_widths = widths
+    eligible_widths = tuple(int(width) for width in eligible_widths)
+    if len(eligible_widths) != len(widths) or any(
+        width < 1 or width > maximum
+        for width, maximum in zip(eligible_widths, widths)
+    ):
+        raise ValueError(
+            "eligible_widths must contain one value in [1, K_d] per layer."
+        )
+    temperature = float(temperature)
+    if not np.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("temperature must be finite and positive.")
     N = X.shape[0]
     samples = [
-        np.empty((N, state.shape[1] + 1, C), dtype=np.uint8)
+        np.zeros((N, state.shape[1] + 1, C), dtype=np.uint8)
         for state in initial_state
     ]
     for sample in samples:
@@ -896,6 +966,8 @@ def _sample_latent_layers_parametric(
     top_probability_sum = np.zeros_like(initial_state[-1], dtype=float)
     random = np.random.random if rng is None else rng.random
     state = [A.copy() for A in initial_state]
+    for layer, width in enumerate(eligible_widths):
+        state[layer][:, width:] = 0
     use_sparse_bernoulli = family.key == "bernoulli" and sparse_bernoulli
     active_children_by_layer = None
     observed_child_linear = None
@@ -903,11 +975,19 @@ def _sample_latent_layers_parametric(
         active_children_by_layer = [
             [
                 np.flatnonzero(
-                    np.asarray(coefficient)[:, coordinate + 1] != 0.0
+                    np.asarray(coefficient)[
+                        : (
+                            np.asarray(coefficient).shape[0]
+                            if layer == 0
+                            else eligible_widths[layer - 1]
+                        ),
+                        coordinate + 1,
+                    ]
+                    != 0.0
                 )
-                for coordinate in range(np.asarray(coefficient).shape[1] - 1)
+                for coordinate in range(eligible_widths[layer])
             ]
-            for coefficient in B_list
+            for layer, coefficient in enumerate(B_list)
         ]
         observed_child_linear = _sparse_observed_child_linear_cache(
             X, B_list[0], active_children_by_layer[0]
@@ -916,11 +996,21 @@ def _sample_latent_layers_parametric(
     for draw_index in range(C):
         for layer, coefficient in enumerate(B_list):
             coefficient = np.asarray(coefficient, dtype=float)
-            child_eta = (
-                coefficient[:, 0][None, :]
-                + state[layer] @ coefficient[:, 1:].T
+            parent_width = eligible_widths[layer]
+            child_width = (
+                coefficient.shape[0]
+                if layer == 0
+                else eligible_widths[layer - 1]
             )
-            for coordinate in range(state[layer].shape[1]):
+            coefficient_active = coefficient[
+                :child_width, : parent_width + 1
+            ]
+            child_eta = (
+                coefficient_active[:, 0][None, :]
+                + state[layer][:, :parent_width]
+                @ coefficient_active[:, 1:].T
+            )
+            for coordinate in range(parent_width):
                 if use_sparse_bernoulli:
                     active_children = active_children_by_layer[layer][coordinate]
                     probability, eta_zero_active = (
@@ -939,6 +1029,8 @@ def _sample_latent_layers_parametric(
                                 else None
                             ),
                             row_chunk_size=row_chunk_size,
+                            eligible_widths=eligible_widths,
+                            temperature=temperature,
                         )
                     )
                 else:
@@ -954,12 +1046,14 @@ def _sample_latent_layers_parametric(
                         child_eta=child_eta,
                         row_chunk_size=row_chunk_size,
                         sparse_bernoulli=False,
+                        eligible_widths=eligible_widths,
+                        temperature=temperature,
                     )
                 updated = (random(N) < probability).astype(np.uint8)
                 state[layer][:, coordinate] = updated
                 if use_sparse_bernoulli:
                     if active_children.size:
-                        active_slope = coefficient[
+                        active_slope = coefficient_active[
                             active_children, coordinate + 1
                         ]
                         child_eta[:, active_children] = (
@@ -967,7 +1061,7 @@ def _sample_latent_layers_parametric(
                             + updated[:, None] * active_slope[None, :]
                         )
                 else:
-                    slope = coefficient[:, coordinate + 1]
+                    slope = coefficient_active[:, coordinate + 1]
                     child_eta = eta_zero + updated[:, None] * slope[None, :]
                 if layer == len(state) - 1:
                     top_probability_sum[:, coordinate] += probability

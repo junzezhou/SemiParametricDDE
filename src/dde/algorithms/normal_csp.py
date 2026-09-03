@@ -25,7 +25,12 @@ from .parametric_families import (
 )
 from .semi_saem import (
     _compute_bernoulli_probabilities_parametric,
+    _sample_latent_layers_parametric,
 )
+
+
+_LEGACY_SYNCHRONOUS = "legacy_synchronous"
+_SYSTEMATIC_GIBBS = "systematic_coordinate_gibbs"
 
 
 def _as_rng(random_state=None):
@@ -455,6 +460,8 @@ def fit_parametric_csp_mcem(
     stage_width_window: int = 10,
     stage_freeze_deeper: bool = True,
     penalty_strength=1.0,
+    shrinkage_burn: int = 0,
+    reorder_after_shrinkage_burn: bool = True,
     stage_transition_mode: str = "none",
     stage_spectral_gap_threshold=None,
     burn: int = 5,
@@ -466,6 +473,8 @@ def fit_parametric_csp_mcem(
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
+    latent_transition=None,
+    canonicalize_initial_order=None,
     family,
 ):
     """Fit a maximal-width parametric DDE under layer-wise CSP priors.
@@ -474,7 +483,8 @@ def fit_parametric_csp_mcem(
     deepest layer and advances only after the current layer's width has been
     stable for a full window.  ``stage_transition_mode`` selects whether a
     waiting parent is rebuilt, only capped while preserving its state, or
-    left untouched.
+    left untouched.  Bernoulli CSP defaults to persistent systematic Gibbs;
+    Normal keeps its established synchronous approximate-MCEM transition.
     """
     family = resolve_parametric_family(family)
     X = np.asarray(X, dtype=float)
@@ -482,16 +492,45 @@ def fit_parametric_csp_mcem(
     B_list = [np.asarray(B, dtype=float).copy() for B in B_list_in]
     dispersion = family.copy_dispersion(dispersion_in)
     A_list = [np.asarray(A, dtype=np.uint8).copy() for A in A_list_in]
+    if canonicalize_initial_order is None:
+        canonicalize_initial_order = family.key == "bernoulli"
+    canonicalize_initial_order = bool(canonicalize_initial_order)
+    if canonicalize_initial_order:
+        prop, B_list, A_list, initial_permutations = (
+            _canonicalize_csp_layer_order(prop, B_list, A_list)
+        )
+    else:
+        initial_permutations = [
+            np.arange(B.shape[1] - 1, dtype=int) for B in B_list
+        ]
     D = len(B_list)
     K = [B.shape[1] - 1 for B in B_list]
     J = X.shape[1]
     response_cache = family.make_response_cache(X)
+
+    if latent_transition is None:
+        latent_transition = (
+            _SYSTEMATIC_GIBBS
+            if family.key == "bernoulli"
+            else _LEGACY_SYNCHRONOUS
+        )
+    latent_transition = str(latent_transition).strip().lower()
+    if latent_transition not in {
+        _LEGACY_SYNCHRONOUS,
+        _SYSTEMATIC_GIBBS,
+    }:
+        raise ValueError(
+            "latent_transition must be 'legacy_synchronous' or "
+            "'systematic_coordinate_gibbs'."
+        )
 
     C = int(C)
     max_iter = int(max_iter)
     convergence_window = int(convergence_window)
     stage_min_iter = int(stage_min_iter)
     stage_width_window = int(stage_width_window)
+    shrinkage_burn = int(shrinkage_burn)
+    reorder_after_shrinkage_burn = bool(reorder_after_shrinkage_burn)
     burn = int(burn)
     optimizer_maxiter = int(optimizer_maxiter)
     temperature = float(temperature)
@@ -505,6 +544,8 @@ def fit_parametric_csp_mcem(
         )
     if not stagewise and stage_transition_mode != "none":
         raise ValueError("stage_transition_mode requires stagewise=True.")
+    if stagewise and shrinkage_burn:
+        raise ValueError("shrinkage_burn is only supported by simultaneous MCEM.")
     if (
         stage_transition_mode != "reinitialize"
         and stage_spectral_gap_threshold is not None
@@ -522,12 +563,16 @@ def fit_parametric_csp_mcem(
         or stage_min_iter < 1
         or stage_width_window < 1
         or burn < 0
+        or shrinkage_burn < 0
         or optimizer_maxiter < 1
     ):
         raise ValueError(
             "convergence_window, stage_min_iter, stage_width_window, and "
-            "optimizer_maxiter must be positive, and burn nonnegative."
+            "optimizer_maxiter must be positive, and burn and shrinkage_burn "
+            "nonnegative."
         )
+    if shrinkage_burn >= max_iter:
+        raise ValueError("shrinkage_burn must be smaller than max_iter.")
     if not np.isfinite(temperature) or not 0.0 < temperature <= 1.0:
         raise ValueError("temperature must lie in (0, 1].")
     if not np.isfinite(threshold) or threshold <= 0:
@@ -555,7 +600,7 @@ def fit_parametric_csp_mcem(
     rng = _as_rng(random_state)
     slab_scale = [np.ones(Kd, dtype=float) for Kd in K]
     omega = [np.ones(Kd + 1, dtype=float) / (Kd + 1) for Kd in K]
-    if stagewise:
+    if stagewise or shrinkage_burn:
         allocation = [np.full(Kd, Kd + 1, dtype=int) for Kd in K]
         penalty_scale = [
             np.ones((J if d == 0 else K[d - 1], K[d]), dtype=float) for d in range(D)
@@ -578,43 +623,81 @@ def fit_parametric_csp_mcem(
     stage_transition_events = []
     stage_caps = np.asarray(K, dtype=int)
     stopped_by_convergence = False
+    warmup_reordered = False
 
     iterations = 0
     while iterations < max_iter:
+        shrinkage_active = iterations >= shrinkage_burn
+        if (
+            shrinkage_active
+            and shrinkage_burn
+            and reorder_after_shrinkage_burn
+            and not warmup_reordered
+        ):
+            prop, B_list, A_list, warmup_permutations = (
+                _canonicalize_csp_layer_order(prop, B_list, A_list)
+            )
+            initial_permutations = [
+                np.asarray(initial, dtype=int)[np.asarray(warmup, dtype=int)]
+                for initial, warmup in zip(
+                    initial_permutations, warmup_permutations
+                )
+            ]
+            warmup_reordered = True
         iteration_stage = active_stage
-        probabilities = _compute_bernoulli_probabilities_parametric(
-            X,
-            prop,
-            B_list,
-            dispersion,
-            A_list,
-            family=family,
-            row_chunk_size=estep_row_chunk_size,
-            coordinate_chunk_size=estep_coordinate_chunk_size,
-            eligible_widths=stage_caps,
-            temperature=current_temperature,
-        )
-        A_samples = _sample_latent_layers(probabilities, C, rng)
-        for d in range(D):
-            if stage_caps[d] < K[d]:
-                probabilities[d][:, stage_caps[d] :] = 0.0
-                A_samples[d][:, stage_caps[d] + 1 :, :] = 0
+        if latent_transition == _SYSTEMATIC_GIBBS:
+            A_samples, top_probability = _sample_latent_layers_parametric(
+                X,
+                prop,
+                B_list,
+                dispersion,
+                A_list,
+                C,
+                family=family,
+                row_chunk_size=estep_row_chunk_size,
+                rng=rng,
+                eligible_widths=stage_caps,
+                temperature=current_temperature,
+            )
+        else:
+            probabilities = _compute_bernoulli_probabilities_parametric(
+                X,
+                prop,
+                B_list,
+                dispersion,
+                A_list,
+                family=family,
+                row_chunk_size=estep_row_chunk_size,
+                coordinate_chunk_size=estep_coordinate_chunk_size,
+                eligible_widths=stage_caps,
+                temperature=current_temperature,
+            )
+            A_samples = _sample_latent_layers(probabilities, C, rng)
+            for d in range(D):
+                if stage_caps[d] < K[d]:
+                    probabilities[d][:, stage_caps[d] :] = 0.0
+                    A_samples[d][:, stage_caps[d] + 1 :, :] = 0
+            top_probability = probabilities[-1]
 
         for d in range(iteration_stage, -1, -1):
-            num_rows = J if d == 0 else int(num_active[d - 1])
-            (
-                allocation[d],
-                penalty_scale[d],
-                slab_scale[d],
-                omega[d],
-            ) = update_csp_layer(
-                B_list[d],
-                omega[d],
-                spike_scales[d],
-                slab_scale[d],
-                num_rows,
-                rng=rng,
-            )
+            if shrinkage_active:
+                num_rows = J if d == 0 else int(num_active[d - 1])
+                (
+                    allocation[d],
+                    penalty_scale[d],
+                    slab_scale[d],
+                    omega[d],
+                ) = update_csp_layer(
+                    B_list[d],
+                    omega[d],
+                    spike_scales[d],
+                    slab_scale[d],
+                    num_rows,
+                    rng=rng,
+                )
+            else:
+                allocation[d].fill(K[d] + 1)
+                penalty_scale[d][:] = slab_scale[d][None, :]
             penalty_scale[d] /= penalty_strengths[d]
             if stage_caps[d] < K[d]:
                 ineligible = np.arange(K[d]) >= stage_caps[d]
@@ -624,7 +707,7 @@ def fit_parametric_csp_mcem(
         if stagewise and stage_freeze_deeper and iteration_stage < D - 1:
             prop_update = prop.copy()
         else:
-            prop_update = np.mean(probabilities[-1], axis=0)
+            prop_update = np.mean(top_probability, axis=0)
         B_update = [None] * D
         observed_bounds = family.csp_coefficient_bounds(
             B_list[0].shape[1], bound_val, observed=True
@@ -680,9 +763,10 @@ def fit_parametric_csp_mcem(
         thresholded_layers = min(2, D)
         if stagewise:
             thresholded_layers = min(thresholded_layers, iteration_stage + 1)
-        for d in range(thresholded_layers):
-            slopes = B_update[d][:, 1:]
-            slopes[np.abs(slopes) < threshold] = 0.0
+        if shrinkage_active:
+            for d in range(thresholded_layers):
+                slopes = B_update[d][:, 1:]
+                slopes[np.abs(slopes) < threshold] = 0.0
 
         for d in range(D):
             if stage_caps[d] < K[d]:
@@ -699,6 +783,8 @@ def fit_parametric_csp_mcem(
             )
 
         stop_now = not stagewise or active_stage == D - 1
+        if not shrinkage_active:
+            stop_now = False
         current_relative = []
         for d in range(D):
             relative = np.linalg.norm(
@@ -760,13 +846,17 @@ def fit_parametric_csp_mcem(
                     ],
                     "relative_change": tuple(current_relative),
                     "temperature": float(current_temperature),
+                    "shrinkage_active": bool(shrinkage_active),
                 }
             )
 
-        A_list = [
-            (np.mean(sample[:, 1:, :], axis=2) > 0.5).astype(np.uint8)
-            for sample in A_samples
-        ]
+        if latent_transition == _SYSTEMATIC_GIBBS:
+            A_list = [sample[:, 1:, -1].copy() for sample in A_samples]
+        else:
+            A_list = [
+                (np.mean(sample[:, 1:, :], axis=2) > 0.5).astype(np.uint8)
+                for sample in A_samples
+            ]
         B_list = [B.copy() for B in B_update]
         dispersion = family.copy_dispersion(dispersion_update)
         prop = prop_update.copy()
@@ -825,12 +915,26 @@ def fit_parametric_csp_mcem(
         "final_stage": active_stage + 1,
         "stage_freeze_deeper": bool(stage_freeze_deeper),
         "penalty_strength": tuple(float(value) for value in penalty_strengths),
+        "shrinkage_burn": shrinkage_burn,
+        "reorder_after_shrinkage_burn": reorder_after_shrinkage_burn,
+        "warmup_reordered": warmup_reordered,
         "stage_transition_mode": stage_transition_mode,
         "stage_spectral_gap_threshold": stage_spectral_gap_threshold,
         "stage_transition_events": tuple(stage_transition_events),
         "stage_caps": tuple(int(value) for value in stage_caps),
         "stopped_by_convergence": bool(stopped_by_convergence),
         "temperature": float(current_temperature),
+        "canonicalized_initial_order": canonicalize_initial_order,
+        "initial_permutations": tuple(
+            tuple(int(index) for index in permutation)
+            for permutation in initial_permutations
+        ),
+        "latent_transition": latent_transition,
+        "mc_state_update": (
+            "last_draw"
+            if latent_transition == _SYSTEMATIC_GIBBS
+            else "draw_majority"
+        ),
         "relative_history": [tuple(values) for values in relative_history],
         "trace": trace,
     }

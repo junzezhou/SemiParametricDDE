@@ -468,7 +468,9 @@ class NormalFamilyAdapter:
         mode,
         B_list_true=None,
         G_list_true=None,
+        random_state=None,
     ):
+        del random_state
         working_response = self.initial_working_response(X, epsilon=epsilon)
         if mode == "data":
             return Normal_init_semi(
@@ -736,6 +738,7 @@ class BernoulliFamilyAdapter:
         mode,
         B_list_true=None,
         G_list_true=None,
+        random_state=None,
     ):
         return Bernoulli_init(
             X,
@@ -744,6 +747,7 @@ class BernoulliFamilyAdapter:
             mode=mode,
             B_list=B_list_true,
             G_list=G_list_true,
+            random_state=random_state,
         )
 
     def observed_conditional_logit(

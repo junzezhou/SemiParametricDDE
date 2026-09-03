@@ -44,7 +44,8 @@ Parametric CSP provides three MCEM backends.  ``"mcem"`` retains the original
 simultaneous MCEM updates, ``"mcem_reinitialize"`` activates CSP layer by
 layer and rebuilds each waiting parent, and ``"mcem_cap_only"`` uses the same
 staged schedule while preserving eligible parent states and only enforcing the
-child-implied structural cap.
+child-implied structural cap. Bernoulli CSP selects ``"mcem"`` by default when
+``csp_backend`` is omitted; the staged backends remain explicit options.
 
 Bernoulli DDE uses the same fixed and CSP interfaces, requires a binary 0/1
 matrix, and has no `gamma` dispersion parameter. For fixed-width parametric
@@ -65,3 +66,16 @@ result = fit(
     tol=0.005,
 )
 ```
+
+Bernoulli CSP uses the simultaneous MCEM path with a persistent systematic
+coordinate-Gibbs transition: its
+`C` draws are consecutive sweeps, and the last draw becomes the next MCEM
+state.  The transition respects CSP stage caps and the current annealing
+temperature.  For simultaneous MCEM with three or more layers, its automatic
+defaults delay irreversible CSP shrinkage for 10 iterations when at least 20
+outer iterations are requested, and scale the CSP penalty by
+`max(1, (N / 1000) ** (2 / 3))`.  Supplying
+`mcem_shrinkage_burn` or `mcem_penalty_strength` overrides the corresponding
+automatic value.  Two-layer Bernoulli CSP and Normal CSP retain their
+established settings; Normal also retains its synchronous approximate-MCEM
+transition for numerical backward compatibility.

@@ -1,0 +1,95 @@
+{
+  "created_utc": "2026-09-03T03:25:01.714919+00:00",
+  "command": [
+    "scripts/evaluate_bernoulli_csp_recovery.py",
+    "--scenarios",
+    "d3",
+    "--sample-sizes",
+    "500",
+    "8000",
+    "--replicates",
+    "5",
+    "--workers",
+    "4",
+    "--backend",
+    "mcem",
+    "--C",
+    "1",
+    "--max-iter",
+    "50",
+    "--optimizer-maxiter",
+    "100",
+    "--base-seed",
+    "20260902",
+    "--shrinkage-burn",
+    "10",
+    "--shrinkage-patience",
+    "2",
+    "--penalty-n-power",
+    "0.6666666666666666",
+    "--penalty-reference-n",
+    "1000",
+    "--penalty-min-strength",
+    "1",
+    "--output-dir",
+    "results/bernoulli_csp_patience2_pilot"
+  ],
+  "python": "3.12.9",
+  "numpy": "1.26.4",
+  "scipy": "1.13.1",
+  "sample_sizes": [
+    500,
+    8000
+  ],
+  "replicates": 5,
+  "workers": 4,
+  "settings": {
+    "backend": "mcem",
+    "C": 1,
+    "max_iter": 50,
+    "optimizer_maxiter": 100,
+    "optimizer_tol": 1e-06,
+    "tol": 0.005,
+    "convergence_window": 7,
+    "convergence_mean_tol": 0.01,
+    "burn": 5,
+    "tau": 0.3,
+    "penalty_n_power": 0.6666666666666666,
+    "penalty_reference_n": 1000.0,
+    "penalty_min_strength": 1.0,
+    "shrinkage_burn": 10,
+    "shrinkage_patience": 2,
+    "t_spike_multiplier": 1.0,
+    "initialization": "data",
+    "base_seed": 20260902,
+    "keep_trace": false
+  },
+  "scenarios": {
+    "d3": {
+      "name": "D3_Bs_overspecified_J64",
+      "D": 3,
+      "J": 64,
+      "K_true": [
+        18,
+        6,
+        2
+      ],
+      "extra_observed": 10,
+      "t_spike": [
+        0.01,
+        0.03,
+        0.005
+      ],
+      "temperature": 0.9,
+      "K_max": [
+        21,
+        7,
+        2
+      ]
+    }
+  },
+  "completed_rows": 10,
+  "successful_rows": 10,
+  "failed_rows": 0,
+  "wall_seconds_this_invocation": 106.29982283298159
+}
