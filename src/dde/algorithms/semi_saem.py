@@ -19,6 +19,8 @@ Python list indexing (0-based):
   K[d] = K_{d+1}           number of nodes in layer d+1
 """
  
+import time
+
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import expit, logsumexp as _logsumexp
@@ -27,6 +29,7 @@ from .normal_init_semi import Normal_init_semi
 from .parametric_families import (
     BERNOULLI_FAMILY,
     NORMAL_FAMILY,
+    POISSON_FAMILY,
     _ObservedNormalAccumulator,
     _binary_child_conditional_logit,
     _matlab_debias,
@@ -52,6 +55,8 @@ def _flatten_bernoulli_children(children, C):
     """Align fixed or Monte Carlo binary children with flattened parents."""
     children = np.asarray(children)
     if children.ndim == 2:
+        if int(C) == 1:
+            return children
         return np.repeat(children, int(C), axis=0)
     if children.ndim == 3:
         return np.moveaxis(children[:, 1:, :], 1, 2).reshape(
@@ -368,7 +373,6 @@ class _BinaryHistoryBernoulliLayerAccumulator:
         ).reshape(-1, self.K_upper)
         children = _flatten_bernoulli_children(A_lower_samples, C)
         parents = np.ascontiguousarray(parents, dtype=np.uint8)
-        children_float = np.ascontiguousarray(children, dtype=float)
         packed_children = np.packbits(
             np.ascontiguousarray(children, dtype=np.uint8),
             axis=1,
@@ -376,10 +380,18 @@ class _BinaryHistoryBernoulliLayerAccumulator:
         )
 
         current_response_stats = np.empty_like(self._response_stats)
-        current_response_stats[:, 0] = np.sum(children_float, axis=0) / C
-        current_response_stats[:, 1:] = (
-            children_float.T @ parents.astype(float)
+        current_response_stats[:, 0] = np.sum(
+            children, axis=0, dtype=np.float64
         ) / C
+        current_response_stats[:, 1:] = 0.0
+        for start in range(0, parents.shape[0], 2048):
+            stop = min(start + 2048, parents.shape[0])
+            parent_chunk = parents[start:stop].astype(float)
+            child_chunk = children[start:stop].astype(float)
+            current_response_stats[:, 1:] += (
+                child_chunk.T @ parent_chunk
+            )
+        current_response_stats[:, 1:] /= C
         self._response_stats = (
             (1.0 - alpha) * self._response_stats
             + alpha * current_response_stats
@@ -799,6 +811,65 @@ def _sparse_bernoulli_coordinate_probability(
     )
 
 
+def _sparse_poisson_coordinate_probability(
+    X,
+    prop,
+    B_list,
+    A_list,
+    coordinate,
+    child_eta,
+    active_children,
+    *,
+    row_chunk_size=2048,
+    eligible_widths=None,
+    temperature=1.0,
+):
+    """Evaluate a Poisson observed-coordinate update on nonzero slopes."""
+    X = np.asarray(X, dtype=float)
+    state = np.asarray(A_list[0], dtype=np.uint8)
+    coefficient = np.asarray(B_list[0], dtype=float)
+    active_children = np.asarray(active_children, dtype=np.intp)
+    if active_children.ndim != 1:
+        raise ValueError("Active Poisson child indices must be one-dimensional.")
+
+    if active_children.size:
+        slope = coefficient[active_children, coordinate + 1]
+        eta_zero_active = (
+            np.asarray(child_eta[:, active_children], dtype=float)
+            - state[:, coordinate, None] * slope[None, :]
+        )
+        if row_chunk_size is None:
+            row_chunk_size = X.shape[0]
+        row_chunk_size = max(1, int(row_chunk_size))
+        likelihood_logit = np.empty(X.shape[0], dtype=float)
+        for start in range(0, X.shape[0], row_chunk_size):
+            stop = min(start + row_chunk_size, X.shape[0])
+            likelihood_logit[start:stop] = (
+                POISSON_FAMILY.observed_coordinate_loglik_delta(
+                    X[start:stop][:, active_children],
+                    eta_zero_active[start:stop],
+                    slope,
+                    None,
+                )
+            )
+    else:
+        eta_zero_active = np.empty((state.shape[0], 0), dtype=float)
+        likelihood_logit = np.zeros(state.shape[0], dtype=float)
+
+    prior_logit = _coordinate_prior_logit(
+        prop,
+        B_list,
+        A_list,
+        0,
+        coordinate,
+        eligible_widths=eligible_widths,
+    )
+    return (
+        expit(float(temperature) * (prior_logit + likelihood_logit)),
+        eta_zero_active,
+    )
+
+
 def _sparse_observed_child_linear_cache(X, coefficient, active_children):
     """Cache ``X @ slope`` for the observed Bernoulli Gibbs layer."""
     X = np.asarray(X)
@@ -968,10 +1039,12 @@ def _sample_latent_layers_parametric(
     state = [A.copy() for A in initial_state]
     for layer, width in enumerate(eligible_widths):
         state[layer][:, width:] = 0
-    use_sparse_bernoulli = family.key == "bernoulli" and sparse_bernoulli
+    use_sparse_updates = (
+        bool(sparse_bernoulli) and family.key in {"bernoulli", "poisson"}
+    )
     active_children_by_layer = None
     observed_child_linear = None
-    if use_sparse_bernoulli:
+    if use_sparse_updates:
         active_children_by_layer = [
             [
                 np.flatnonzero(
@@ -989,9 +1062,10 @@ def _sample_latent_layers_parametric(
             ]
             for layer, coefficient in enumerate(B_list)
         ]
-        observed_child_linear = _sparse_observed_child_linear_cache(
-            X, B_list[0], active_children_by_layer[0]
-        )
+        if family.key == "bernoulli":
+            observed_child_linear = _sparse_observed_child_linear_cache(
+                X, B_list[0], active_children_by_layer[0]
+            )
 
     for draw_index in range(C):
         for layer, coefficient in enumerate(B_list):
@@ -1011,28 +1085,45 @@ def _sample_latent_layers_parametric(
                 @ coefficient_active[:, 1:].T
             )
             for coordinate in range(parent_width):
-                if use_sparse_bernoulli:
+                if use_sparse_updates:
                     active_children = active_children_by_layer[layer][coordinate]
-                    probability, eta_zero_active = (
-                        _sparse_bernoulli_coordinate_probability(
-                            X,
-                            prop,
-                            B_list,
-                            state,
-                            layer,
-                            coordinate,
-                            child_eta,
-                            active_children,
-                            child_linear=(
-                                observed_child_linear[:, coordinate]
-                                if layer == 0
-                                else None
-                            ),
-                            row_chunk_size=row_chunk_size,
-                            eligible_widths=eligible_widths,
-                            temperature=temperature,
+                    if layer == 0 and family.key == "poisson":
+                        probability, eta_zero_active = (
+                            _sparse_poisson_coordinate_probability(
+                                X,
+                                prop,
+                                B_list,
+                                state,
+                                coordinate,
+                                child_eta,
+                                active_children,
+                                row_chunk_size=row_chunk_size,
+                                eligible_widths=eligible_widths,
+                                temperature=temperature,
+                            )
                         )
-                    )
+                    else:
+                        probability, eta_zero_active = (
+                            _sparse_bernoulli_coordinate_probability(
+                                X,
+                                prop,
+                                B_list,
+                                state,
+                                layer,
+                                coordinate,
+                                child_eta,
+                                active_children,
+                                child_linear=(
+                                    observed_child_linear[:, coordinate]
+                                    if layer == 0
+                                    and observed_child_linear is not None
+                                    else None
+                                ),
+                                row_chunk_size=row_chunk_size,
+                                eligible_widths=eligible_widths,
+                                temperature=temperature,
+                            )
+                        )
                 else:
                     probability, eta_zero = _latent_coordinate_probability_parametric(
                         X,
@@ -1051,7 +1142,7 @@ def _sample_latent_layers_parametric(
                     )
                 updated = (random(N) < probability).astype(np.uint8)
                 state[layer][:, coordinate] = updated
-                if use_sparse_bernoulli:
+                if use_sparse_updates:
                     if active_children.size:
                         active_slope = coefficient_active[
                             active_children, coordinate + 1
@@ -1062,7 +1153,8 @@ def _sample_latent_layers_parametric(
                         )
                 else:
                     slope = coefficient_active[:, coordinate + 1]
-                    child_eta = eta_zero + updated[:, None] * slope[None, :]
+                    eta_zero += updated[:, None] * slope[None, :]
+                    child_eta = eta_zero
                 if layer == len(state) - 1:
                     top_probability_sum[:, coordinate] += probability
         for layer, layer_state in enumerate(state):
@@ -1104,6 +1196,40 @@ def _postprocess_and_measure_fixed_update(
     return B_processed, float(np.sqrt(squared_error / n_parameters))
 
 
+def _owned_array_nbytes(owner):
+    """Return bytes owned by arrays already materialized on an accumulator."""
+    seen = set()
+    total = 0
+    for value in vars(owner).values():
+        values = value if isinstance(value, (list, tuple)) else (value,)
+        for item in values:
+            if isinstance(item, np.ndarray) and id(item) not in seen:
+                seen.add(id(item))
+                total += item.nbytes
+    return int(total)
+
+
+def _fixed_accumulator_trace_summary(accumulator):
+    """Return scalar-only diagnostics without materializing lazy designs."""
+    if hasattr(accumulator, "pattern_count"):
+        pattern_count = int(accumulator.pattern_count)
+    elif hasattr(accumulator, "patterns"):
+        pattern_count = int(accumulator.patterns.shape[0])
+    elif hasattr(accumulator, "codes"):
+        pattern_count = int(accumulator.codes.size)
+    elif hasattr(accumulator, "_size"):
+        pattern_count = int(accumulator._size)
+    elif hasattr(accumulator, "counts"):
+        pattern_count = int(np.count_nonzero(accumulator.counts))
+    else:
+        pattern_count = 0
+    return {
+        "backend": type(accumulator).__name__,
+        "pattern_count": pattern_count,
+        "storage_bytes": _owned_array_nbytes(accumulator),
+    }
+
+
 def _compute_bernoulli_probabilities_normal(
     X,
     prop,
@@ -1138,7 +1264,7 @@ def _compute_bernoulli_probabilities_normal(
 def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                         pen_list, tau, A_list_in, C, tol,
                         max_iter=50, bound_val=10.0, verbose=True,
-                        estep_row_chunk_size=2048, *, family):
+                        estep_row_chunk_size=2048, trace=None, *, family):
     """Run fixed-width SAEM with observed behavior supplied by ``family``.
 
     ``tol`` is compared with the root-mean-square parameter change after the
@@ -1180,6 +1306,8 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
  
     t = 1
     while True:
+        iteration_started = time.perf_counter()
+        estep_started = time.perf_counter()
         A_samples, top_probability = _sample_latent_layers_parametric(
             X,
             prop,
@@ -1190,6 +1318,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
             family=family,
             row_chunk_size=estep_row_chunk_size,
         )
+        estep_seconds = time.perf_counter() - estep_started
 
         p_top = (
             (1.0 - 1.0 / t) * p_top
@@ -1197,6 +1326,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
         )
         prop_update = np.mean(p_top, axis=0)
 
+        observed_mstep_started = time.perf_counter()
         B1_update, dispersion_update = family.fixed_mstep(
             X,
             A_samples[0],
@@ -1210,16 +1340,18 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
             bound_val=bound_val,
             response_cache=response_cache,
         )
+        mstep_seconds = [time.perf_counter() - observed_mstep_started]
  
         B_updates = [B1_update]
         for d_idx in range(1, D):
+            latent_mstep_started = time.perf_counter()
             n_rows = B_list[d_idx].shape[0]
             bidx = d_idx - 1
             f_acc_bern[bidx].update(
                 A_samples[d_idx - 1], A_samples[d_idx], t
             )
             bounds = family.fixed_latent_bounds(K[d_idx] + 1, bound_val)
-            if family.key == "bernoulli":
+            if family.key in {"bernoulli", "poisson"}:
                 B_d_upd = _solve_bernoulli_tlp_batched(
                     f_acc_bern[bidx],
                     B_list[d_idx],
@@ -1251,6 +1383,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                     )
                     B_d_upd[k, :] = res.x
             B_updates.append(B_d_upd)
+            mstep_seconds.append(time.perf_counter() - latent_mstep_started)
  
         B_updates, err = _postprocess_and_measure_fixed_update(
             prop,
@@ -1263,6 +1396,33 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
             tau=tau,
             depth=D,
         )
+
+        if trace is not None:
+            trace.append(
+                {
+                    "iteration": int(t),
+                    "error": float(err),
+                    "prop_update_rmse": float(
+                        np.sqrt(np.mean((prop_update - prop) ** 2))
+                    ),
+                    "layer_update_rmse": [
+                        float(np.sqrt(np.mean((new - old) ** 2)))
+                        for old, new in zip(B_list, B_updates)
+                    ],
+                    "e_step_seconds": float(estep_seconds),
+                    "m_step_seconds": [float(value) for value in mstep_seconds],
+                    "iteration_seconds": float(
+                        time.perf_counter() - iteration_started
+                    ),
+                    "accumulators": {
+                        "observed": _fixed_accumulator_trace_summary(f_acc_obs),
+                        "latent": [
+                            _fixed_accumulator_trace_summary(accumulator)
+                            for accumulator in f_acc_bern
+                        ],
+                    },
+                }
+            )
  
         A_list_new = [
             A_samples[d][:, 1:, -1].copy() for d in range(D)
@@ -1325,6 +1485,29 @@ def get_SAEM_bernoulli(X, prop_in, B_list_in,
         verbose=verbose,
         estep_row_chunk_size=estep_row_chunk_size,
         family=BERNOULLI_FAMILY,
+    )
+
+
+def get_SAEM_poisson(X, prop_in, B_list_in,
+                     pen_list, tau, A_list_in, C, tol,
+                     max_iter=50, bound_val=10.0, verbose=True,
+                     estep_row_chunk_size=2048):
+    """Compatibility wrapper for the arbitrary-depth fixed Poisson kernel."""
+    return get_SAEM_parametric(
+        X,
+        prop_in,
+        B_list_in,
+        None,
+        pen_list,
+        tau,
+        A_list_in,
+        C,
+        tol,
+        max_iter=max_iter,
+        bound_val=bound_val,
+        verbose=verbose,
+        estep_row_chunk_size=estep_row_chunk_size,
+        family=POISSON_FAMILY,
     )
  
  

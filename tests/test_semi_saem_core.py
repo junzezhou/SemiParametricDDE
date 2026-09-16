@@ -7,6 +7,7 @@ from dde.algorithms.semi_saem import (
     _BinaryHistoryBernoulliLayerAccumulator,
     _BernoulliLayerAccumulator,
     _DirectAddressBernoulliLayerAccumulator,
+    _flatten_bernoulli_children,
     _ObservedNormalAccumulator,
     _compute_bernoulli_probabilities_normal,
     _latent_coordinate_probability_parametric,
@@ -20,6 +21,14 @@ from dde.algorithms.semi_saem import (
     get_SAEM_normal,
 )
 from dde.utils import logistic
+
+
+def test_flatten_bernoulli_children_reuses_two_dimensional_input_for_one_draw():
+    children = np.arange(18, dtype=np.uint8).reshape(6, 3)
+    flattened = _flatten_bernoulli_children(children, 1)
+
+    assert np.shares_memory(flattened, children)
+    np.testing.assert_array_equal(flattened, children)
 
 
 def test_tlp_penalty_matches_paper_and_matlab_parameterization():

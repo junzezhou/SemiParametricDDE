@@ -16,6 +16,7 @@ from .normal_csp import fit_parametric_csp_mcem
 from .parametric_families import (
     BERNOULLI_FAMILY,
     NORMAL_FAMILY,
+    POISSON_FAMILY,
     resolve_parametric_family,
 )
 from .semi_saem import get_SAEM_parametric
@@ -171,6 +172,18 @@ def fit_parametric_dde(
     if D < 1:
         raise ValueError("D must be a positive integer.")
     method = str(dimension_method).strip().lower()
+    if method not in {"fixed", "csp"}:
+        raise ValueError(
+            f"{family_adapter.name} DDE dimension_method must be 'fixed' or 'csp'."
+        )
+    if method not in family_adapter.supported_dimension_methods:
+        supported = " or ".join(
+            repr(value) for value in family_adapter.supported_dimension_methods
+        )
+        raise NotImplementedError(
+            f"{family_adapter.name} DDE currently supports "
+            f"dimension_method={supported} only."
+        )
     if method == "fixed":
         if K_list is None:
             raise ValueError("K_list is required when dimension_method='fixed'.")
@@ -195,10 +208,6 @@ def fit_parametric_dde(
             )
         K_tuple = maximal_identifiable_widths(X.shape[1], D)
         penalties = None
-    else:
-        raise ValueError(
-            f"{family_adapter.name} DDE dimension_method must be 'fixed' or 'csp'."
-        )
 
     tau = float(tau)
     tol = float(tol)
@@ -294,6 +303,7 @@ def fit_parametric_dde(
             raise ValueError(
                 "random_state is currently supported by the CSP path only."
             )
+        fixed_trace = [] if keep_trace else None
         prop, B_list, gamma, A_list, iterations = get_SAEM_parametric(
             X,
             prop,
@@ -308,10 +318,25 @@ def fit_parametric_dde(
             bound_val=bound_val,
             verbose=bool(verbose),
             estep_row_chunk_size=estep_row_chunk_size,
+            trace=fixed_trace,
             family=family_adapter,
         )
 
         X_result = X.copy()
+        diagnostics = {
+            "iterations": iterations,
+            "D": D,
+            "K_list": list(K_tuple),
+            "family": family_adapter.name,
+            "dimension_method": "fixed",
+            "initialization": initialization,
+            "latent_transition": "systematic_coordinate_gibbs",
+            "mc_state_update": "last_draw",
+            "convergence_metric": "postprocessed_parameter_rmse",
+            "convergence_tol": tol,
+        }
+        if fixed_trace is not None:
+            diagnostics["trace"] = fixed_trace
         return DDEResult(
             model="DDE",
             K_list=list(K_tuple),
@@ -320,18 +345,7 @@ def fit_parametric_dde(
             gamma=gamma,
             A_list=A_list,
             transformed=X_result,
-            diagnostics={
-                "iterations": iterations,
-                "D": D,
-                "K_list": list(K_tuple),
-                "family": family_adapter.name,
-                "dimension_method": "fixed",
-                "initialization": initialization,
-                "latent_transition": "systematic_coordinate_gibbs",
-                "mc_state_update": "last_draw",
-                "convergence_metric": "postprocessed_parameter_rmse",
-                "convergence_tol": tol,
-            },
+            diagnostics=diagnostics,
             raw=(X_result, prop, B_list, gamma, A_list, iterations),
         )
 
@@ -506,4 +520,16 @@ def fit_dde_bernoulli(Y, **kwargs) -> DDEResult:
     return fit_parametric_dde(Y, family=BERNOULLI_FAMILY, **kwargs)
 
 
-__all__ = ["fit_dde_bernoulli", "fit_dde_normal", "fit_parametric_dde"]
+def fit_dde_poisson(Y, **kwargs) -> DDEResult:
+    """Compatibility wrapper for the public Poisson DDE fitting function."""
+    if "family" in kwargs:
+        raise TypeError("Unexpected Poisson DDE argument(s): family.")
+    return fit_parametric_dde(Y, family=POISSON_FAMILY, **kwargs)
+
+
+__all__ = [
+    "fit_dde_bernoulli",
+    "fit_dde_normal",
+    "fit_dde_poisson",
+    "fit_parametric_dde",
+]

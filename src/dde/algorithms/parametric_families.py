@@ -5,8 +5,8 @@ this module own only observed-layer behavior: data validation and
 initialization, the observed contribution to latent conditional log-odds,
 observed-layer M-steps, dispersion semantics, scoring, and simulation.
 
-Normal and Bernoulli adapters share the same fixed-width SAEM and CSP-MCEM
-control loops.  Poisson and Lognormal can follow the same adapter boundary.
+Normal, Bernoulli, and Poisson adapters share the fixed-width SAEM control
+loop. Normal and Bernoulli additionally support the CSP-MCEM control path.
 """
 
 from __future__ import annotations
@@ -15,12 +15,13 @@ from dataclasses import dataclass
 from typing import Optional
 import numpy as np
 from scipy.optimize import minimize
-from scipy.special import expit
+from scipy.special import expit, gammaln
 
 from dde.utils import TLP, thres
 
 from .bernoulli_init import Bernoulli_init, _bernoulli_working_response
 from .normal_init_semi import Normal_init_semi
+from .poisson_init import Poisson_init, _poisson_working_response
 
 
 def _tlp_penalty(x, pen, tau):
@@ -120,6 +121,40 @@ def _solve_bernoulli_tlp_batched(
     return result.x.reshape(shape)
 
 
+def _solve_poisson_tlp_rowwise(
+    accumulator,
+    B_start,
+    penalty,
+    tau,
+    bounds,
+    *,
+    max_iter=10,
+):
+    """Fit independent Poisson responses with the MATLAB TLP objective."""
+    B_start = np.asarray(B_start, dtype=float)
+    B_update = np.zeros_like(B_start)
+    for response_index in range(B_start.shape[0]):
+
+        def objective(x, __index=response_index):
+            value, gradient = accumulator.value_and_grad(__index, x)
+            penalty_value, penalty_gradient = _tlp_penalty_value_grad(
+                x[1:], penalty, tau
+            )
+            gradient[1:] += penalty_gradient
+            return value + penalty_value, gradient
+
+        result = minimize(
+            objective,
+            B_start[response_index],
+            method="L-BFGS-B",
+            jac=True,
+            bounds=bounds,
+            options={"maxiter": int(max_iter)},
+        )
+        B_update[response_index] = result.x
+    return B_update
+
+
 def _matlab_debias(x, tau):
     """Match the deep-Normal MATLAB ``debias.m`` elementwise."""
     x = np.asarray(x, dtype=float)
@@ -154,6 +189,156 @@ class _ObservedNormalAccumulator:
         grad = 2.0 * (self.Q @ x - q)
         return value, grad
 
+
+_POISSON_OPTIMIZATION_EXP_LIMIT = 500.0
+
+
+def _poisson_optimization_rate(eta):
+    """Exponentiate natural parameters with a finite optimization guard."""
+    eta = np.asarray(eta, dtype=float)
+    return np.exp(np.minimum(eta, _POISSON_OPTIMIZATION_EXP_LIMIT))
+
+
+def _poisson_optimization_exp_value(eta):
+    """Return a finite convex continuation of ``exp`` above the guard."""
+    eta = np.asarray(eta, dtype=float)
+    rate = _poisson_optimization_rate(eta)
+    excess = np.maximum(eta - _POISSON_OPTIMIZATION_EXP_LIMIT, 0.0)
+    return rate * (1.0 + excess)
+
+
+class _ObservedPoissonAccumulator:
+    """SA statistics for conditionally independent Poisson responses.
+
+    Binary Monte Carlo designs are aggregated by unique parent pattern.  The
+    response-dependent linear term is retained as a conventional running
+    sufficient statistic, so its storage does not grow with the number of
+    observed variables or SAEM iterations.
+    """
+
+    def __init__(self, n_responses, n_features):
+        self.n_responses = int(n_responses)
+        self.n_features = int(n_features)
+        self.parent_width = self.n_features - 1
+        self.packed_width = (self.parent_width + 7) // 8
+        self._packed_patterns = np.empty(
+            (0, self.packed_width), dtype=np.uint8
+        )
+        self.counts = np.empty(0, dtype=float)
+        self.q_all = np.zeros(
+            (self.n_responses, self.n_features), dtype=float
+        )
+        self._design = None
+
+    @property
+    def design(self):
+        if self._design is None:
+            patterns = np.unpackbits(
+                self._packed_patterns,
+                axis=1,
+                count=self.parent_width,
+                bitorder="little",
+            )
+            self._design = np.column_stack(
+                [np.ones(self.pattern_count, dtype=float), patterns]
+            )
+        return self._design
+
+    @property
+    def patterns(self):
+        """Return unpacked patterns for compatibility and diagnostics."""
+        return np.unpackbits(
+            self._packed_patterns,
+            axis=1,
+            count=self.parent_width,
+            bitorder="little",
+        )
+
+    @property
+    def pattern_count(self):
+        return int(self._packed_patterns.shape[0])
+
+    @property
+    def storage_nbytes(self):
+        return int(
+            self._packed_patterns.nbytes
+            + self.counts.nbytes
+            + self.q_all.nbytes
+            + (0 if self._design is None else self._design.nbytes)
+        )
+
+    def update(self, X, A_samples, t):
+        X = np.asarray(X, dtype=float)
+        A_samples = np.asarray(A_samples, dtype=np.uint8)
+        if X.ndim != 2 or X.shape[1] != self.n_responses:
+            raise ValueError("Poisson responses have an incompatible shape.")
+        if (
+            A_samples.ndim != 3
+            or A_samples.shape[0] != X.shape[0]
+            or A_samples.shape[1] != self.n_features
+        ):
+            raise ValueError("Poisson Monte Carlo designs have an incompatible shape.")
+        t = int(t)
+        if t < 1:
+            raise ValueError("Poisson accumulator iteration must be positive.")
+        alpha = 1.0 / t
+        C = A_samples.shape[2]
+        parents = np.moveaxis(
+            A_samples[:, 1:, :], 1, 2
+        ).reshape(-1, self.parent_width)
+        packed = np.packbits(
+            np.ascontiguousarray(parents, dtype=np.uint8),
+            axis=1,
+            bitorder="little",
+        )
+        new_patterns, inverse = np.unique(
+            packed, axis=0, return_inverse=True
+        )
+        new_counts = np.bincount(inverse).astype(float) / C
+
+        if self._packed_patterns.size:
+            stacked = np.vstack([self._packed_patterns, new_patterns])
+            all_patterns, positions = np.unique(
+                stacked, axis=0, return_inverse=True
+            )
+            old_positions = positions[: self.pattern_count]
+            new_positions = positions[self.pattern_count :]
+            merged_counts = np.zeros(all_patterns.shape[0], dtype=float)
+            merged_counts[old_positions] = (1.0 - alpha) * self.counts
+            merged_counts[new_positions] += alpha * new_counts
+            self._packed_patterns = all_patterns.astype(
+                np.uint8, copy=False
+            )
+            self.counts = merged_counts
+        else:
+            self._packed_patterns = new_patterns.astype(
+                np.uint8, copy=False
+            )
+            self.counts = alpha * new_counts
+
+        q_new = X.T @ np.mean(A_samples, axis=2)
+        self.q_all = (1.0 - alpha) * self.q_all + alpha * q_new
+        self._design = None
+
+    def value(self, response_index, x):
+        x = np.asarray(x, dtype=float)
+        eta = self.design @ x
+        exp_value = _poisson_optimization_exp_value(eta)
+        return float(
+            self.counts @ exp_value - self.q_all[int(response_index)] @ x
+        )
+
+    def value_and_grad(self, response_index, x):
+        response_index = int(response_index)
+        x = np.asarray(x, dtype=float)
+        eta = self.design @ x
+        rate = _poisson_optimization_rate(eta)
+        excess = np.maximum(eta - _POISSON_OPTIMIZATION_EXP_LIMIT, 0.0)
+        exp_value = rate * (1.0 + excess)
+        q = self.q_all[response_index]
+        value = float(self.counts @ exp_value - q @ x)
+        gradient = self.design.T @ (self.counts * rate) - q
+        return value, gradient
 
 def _normal_sample_statistics(X, A_samples):
     """Return current-MC Normal design cross-products, averaged over draws."""
@@ -420,6 +605,7 @@ class NormalFamilyAdapter:
     name: str = "Normal"
     key: str = "normal"
     aliases: tuple[str, ...] = ("normal", "gaussian")
+    supported_dimension_methods: tuple[str, ...] = ("fixed", "csp")
     has_dispersion: bool = True
     dispersion_name: str = "conditional_variance"
 
@@ -677,12 +863,269 @@ class NormalFamilyAdapter:
 
 
 @dataclass(frozen=True)
+class PoissonFamilyAdapter:
+    """Observed-layer operations for a log-link Poisson DDE."""
+
+    name: str = "Poisson"
+    key: str = "poisson"
+    aliases: tuple[str, ...] = ("poisson",)
+    supported_dimension_methods: tuple[str, ...] = ("fixed",)
+    has_dispersion: bool = False
+    dispersion_name: Optional[str] = None
+
+    def inverse_mean_link(self, mean, *, epsilon=1e-4):
+        epsilon = float(epsilon)
+        if not np.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError("epsilon must be finite and positive.")
+        return np.log(np.maximum(np.asarray(mean, dtype=float), epsilon))
+
+    def initial_working_response(self, Y, *, epsilon, K1=None):
+        if K1 is None:
+            raise ValueError("Poisson initial_working_response requires K1.")
+        return _poisson_working_response(
+            self.validate_y(Y), int(K1), float(epsilon)
+        )
+
+    def validate_y(self, Y) -> np.ndarray:
+        X = np.asarray(Y)
+        if X.ndim != 2:
+            raise ValueError(
+                f"Y must be a two-dimensional matrix; got shape {X.shape}."
+            )
+        if X.shape[0] < 1 or X.shape[1] < 1:
+            raise ValueError("Y must contain at least one observation and one variable.")
+        try:
+            valid = (
+                np.all(np.isfinite(X))
+                and np.all(X >= 0)
+                and np.all(X == np.floor(X))
+            )
+        except TypeError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                "Poisson DDE requires finite nonnegative integer counts in Y."
+            )
+        return X.astype(float, copy=False)
+
+    def validate_dispersion(self, dispersion, n_responses):
+        del n_responses
+        if dispersion is not None:
+            raise ValueError(
+                "Poisson has no dispersion parameter; gamma_in must be omitted."
+            )
+        return None
+
+    def initialize(
+        self,
+        X,
+        K_list,
+        *,
+        epsilon,
+        mode,
+        B_list_true=None,
+        G_list_true=None,
+        random_state=None,
+    ):
+        return Poisson_init(
+            X,
+            K_list,
+            epsilon=epsilon,
+            mode=mode,
+            B_list=B_list_true,
+            G_list=G_list_true,
+            random_state=random_state,
+        )
+
+    def observed_conditional_logit(
+        self,
+        X,
+        B1,
+        dispersion,
+        A1,
+        *,
+        width,
+        row_chunk_size,
+        coordinate_chunk_size=1,
+    ):
+        """Return Poisson observed-layer log-likelihood odds for ``A_1``."""
+        del dispersion
+        X = np.asarray(X, dtype=float)
+        B1 = np.asarray(B1, dtype=float)
+        A1 = np.asarray(A1, dtype=float)
+        N = X.shape[0]
+        width = int(width)
+        if row_chunk_size is None:
+            row_chunk_size = N
+        row_chunk_size = max(1, int(row_chunk_size))
+        coordinate_chunk_size = max(1, int(coordinate_chunk_size))
+        slopes = B1[:, 1 : width + 1]
+        like_logit = np.empty((N, width), dtype=float)
+        for start in range(0, N, row_chunk_size):
+            stop = min(start + row_chunk_size, N)
+            A_chunk = A1[start:stop, :width]
+            eta = B1[:, 0][None, :] + A_chunk @ slopes.T
+            data_linear = X[start:stop] @ slopes
+            for block_start in range(0, width, coordinate_chunk_size):
+                block_stop = min(
+                    block_start + coordinate_chunk_size, width
+                )
+                for coordinate in range(block_start, block_stop):
+                    slope = slopes[:, coordinate]
+                    eta_zero = (
+                        eta
+                        - A_chunk[:, coordinate, None] * slope[None, :]
+                    )
+                    rate_delta = _poisson_optimization_rate(eta_zero)
+                    rate_delta *= np.expm1(slope)[None, :]
+                    like_logit[start:stop, coordinate] = (
+                        data_linear[:, coordinate]
+                        - np.sum(rate_delta, axis=1)
+                    )
+        return like_logit
+
+    def observed_coordinate_loglik_delta(
+        self, X, eta_zero, slope, dispersion
+    ):
+        """Return Poisson log-likelihood odds for one latent coordinate."""
+        del dispersion
+        X = np.asarray(X, dtype=float)
+        eta_zero = np.asarray(eta_zero, dtype=float)
+        slope = np.asarray(slope, dtype=float)
+        rate_delta = _poisson_optimization_rate(eta_zero)
+        rate_delta *= np.expm1(slope)[None, :]
+        return X @ slope - np.sum(rate_delta, axis=1)
+
+    def make_fixed_accumulator(self, n_responses, n_features):
+        return _ObservedPoissonAccumulator(n_responses, n_features)
+
+    def make_response_cache(self, X):
+        del X
+        return None
+
+    def copy_dispersion(self, dispersion):
+        return self.validate_dispersion(dispersion, 0)
+
+    def fixed_mstep(
+        self,
+        X,
+        A_samples,
+        B_start,
+        dispersion,
+        accumulator,
+        *,
+        iteration,
+        depth,
+        penalty,
+        tau,
+        bound_val,
+        response_cache,
+    ):
+        del dispersion, depth, response_cache
+        accumulator.update(X, A_samples, iteration)
+        bounds = self.fixed_latent_bounds(B_start.shape[1], bound_val)
+        return (
+            _solve_poisson_tlp_rowwise(
+                accumulator,
+                B_start,
+                penalty,
+                tau,
+                bounds,
+                max_iter=10,
+            ),
+            None,
+        )
+
+    def csp_mstep(
+        self,
+        X,
+        A_samples,
+        B_start,
+        dispersion,
+        penalty_scale,
+        temperature,
+        *,
+        response_cache,
+        max_iter,
+        tol,
+        bound,
+        bounds,
+        row_chunk_size,
+        coordinate_chunk_size,
+    ):
+        del (
+            X,
+            A_samples,
+            B_start,
+            dispersion,
+            penalty_scale,
+            temperature,
+            response_cache,
+            max_iter,
+            tol,
+            bound,
+            bounds,
+            row_chunk_size,
+            coordinate_chunk_size,
+        )
+        raise NotImplementedError(
+            "Poisson DDE currently supports dimension_method='fixed' only."
+        )
+
+    def dispersion_distance_sq(self, old, new) -> float:
+        if old is not None or new is not None:
+            raise ValueError("Poisson has no dispersion parameter.")
+        return 0.0
+
+    def fixed_latent_bounds(self, n_parameters, bound_val):
+        bound_val = float(bound_val)
+        upper = min(5.0, bound_val)
+        intercept_lower = -upper
+        slope_lower = -min(2.5, bound_val)
+        return [(intercept_lower, upper)] + [
+            (slope_lower, upper)
+        ] * (int(n_parameters) - 1)
+
+    def csp_coefficient_bounds(self, n_parameters, bound_val, *, observed):
+        del n_parameters, bound_val, observed
+        raise NotImplementedError(
+            "Poisson DDE currently supports dimension_method='fixed' only."
+        )
+
+    def postprocess_fixed_coefficients(self, B_updates, *, tau, depth):
+        del depth
+        for B_update in B_updates:
+            B_update[:, 1:] = thres(B_update[:, 1:], tau)
+        return B_updates
+
+    def conditional_log_prob(self, Y, eta, dispersion):
+        del dispersion
+        Y = np.asarray(Y, dtype=float)
+        eta = np.asarray(eta, dtype=float)
+        with np.errstate(over="ignore"):
+            rate = np.exp(eta)
+        return Y * eta - rate - gammaln(Y + 1.0)
+
+    def sample_observed(self, eta, dispersion, rng):
+        del dispersion
+        eta = np.asarray(eta, dtype=float)
+        with np.errstate(over="ignore"):
+            rate = np.exp(eta)
+        if not np.all(np.isfinite(rate)) or np.any(rate > 1.0e18):
+            raise ValueError(
+                "Poisson natural parameters produce rates too large to sample."
+            )
+        return rng.poisson(rate, size=rate.shape)
+
+
+@dataclass(frozen=True)
 class BernoulliFamilyAdapter:
     """Observed-layer operations for a conditionally Bernoulli DDE."""
 
     name: str = "Bernoulli"
     key: str = "bernoulli"
     aliases: tuple[str, ...] = ("bernoulli", "binary")
+    supported_dimension_methods: tuple[str, ...] = ("fixed", "csp")
     has_dispersion: bool = False
     dispersion_name: Optional[str] = None
 
@@ -917,12 +1360,16 @@ class BernoulliFamilyAdapter:
 
 NORMAL_FAMILY = NormalFamilyAdapter()
 BERNOULLI_FAMILY = BernoulliFamilyAdapter()
+POISSON_FAMILY = PoissonFamilyAdapter()
 
 _FAMILY_REGISTRY = {
     alias: NORMAL_FAMILY for alias in NORMAL_FAMILY.aliases
 }
 _FAMILY_REGISTRY.update(
     {alias: BERNOULLI_FAMILY for alias in BERNOULLI_FAMILY.aliases}
+)
+_FAMILY_REGISTRY.update(
+    {alias: POISSON_FAMILY for alias in POISSON_FAMILY.aliases}
 )
 
 
@@ -946,6 +1393,8 @@ def resolve_parametric_family(value):
         required = (
             "aliases",
             "name",
+            "key",
+            "supported_dimension_methods",
             "has_dispersion",
             "validate_y",
             "validate_dispersion",
@@ -973,7 +1422,8 @@ def resolve_parametric_family(value):
     if normalized in _FAMILY_REGISTRY:
         return _FAMILY_REGISTRY[normalized]
     raise NotImplementedError(
-        "The current DDE interface implements Normal and Bernoulli families only."
+        "The current DDE interface implements Normal, Bernoulli, and Poisson "
+        "families only."
     )
 
 
@@ -983,6 +1433,9 @@ __all__ = [
     "NORMAL_FAMILY",
     "NormalFamilyAdapter",
     "_ObservedNormalAccumulator",
+    "POISSON_FAMILY",
+    "PoissonFamilyAdapter",
+    "_ObservedPoissonAccumulator",
     "_binary_child_conditional_logit",
     "_largest_eigenvalue_psd",
     "_matlab_debias",
@@ -992,6 +1445,7 @@ __all__ = [
     "_solve_gaussian_weighted_l1_from_statistics",
     "_solve_bernoulli_tlp_batched",
     "_solve_bernoulli_tlp_rowwise",
+    "_solve_poisson_tlp_rowwise",
     "_tlp_penalty",
     "_tlp_penalty_value_grad",
     "_update_deep_normal_observed",

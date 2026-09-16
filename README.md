@@ -1,7 +1,7 @@
 # dde
 
 `dde` is a Python package for Deep Discrete Encoder models, including
-parametric Normal and Bernoulli DDE estimation,
+parametric Normal, Bernoulli, and Poisson DDE estimation,
 semi-parametric DDE estimation for continuous observations and copula/rank
 likelihood DDE estimation for mixed-scale observations.
 
@@ -67,6 +67,12 @@ result = fit(
 )
 ```
 
+For a lightweight fixed-width convergence trace, pass `keep_trace=True`.
+The returned `result.diagnostics["trace"]` records per-sweep update RMSEs,
+E/M-step timings, and accumulator sizes. It does not retain coefficient
+matrices or latent draws, so tracing does not scale with parameter-history
+storage.
+
 Bernoulli CSP uses the simultaneous MCEM path with a persistent systematic
 coordinate-Gibbs transition: its
 `C` draws are consecutive sweeps, and the last draw becomes the next MCEM
@@ -79,3 +85,22 @@ outer iterations are requested, and scale the CSP penalty by
 automatic value.  Two-layer Bernoulli CSP and Normal CSP retain their
 established settings; Normal also retains its synchronous approximate-MCEM
 transition for numerical backward compatibility.
+
+Poisson DDE uses a canonical log link, requires finite nonnegative integer
+counts, and has no `gamma` dispersion parameter. It currently supports only
+fixed-width estimation, with any positive number of latent layers:
+
+```python
+result = fit(
+    Y_counts,
+    method="DDE",
+    family="Poisson",
+    D=3,
+    dimension_method="fixed",
+    K_list=[9, 3, 1],
+    pen_list=[0.1, 0.1, 0.1],
+    tau=0.3,
+    C=1,
+    tol=0.005,
+)
+```

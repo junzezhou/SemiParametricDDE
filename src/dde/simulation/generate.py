@@ -4,6 +4,8 @@
 import numpy as np
 from scipy.special import expit  # logistic sigmoid
 
+from .generate_copula_D import simulate_latent_layers_D
+
 def generate_X_bernoulli(N, prop_true, B1, B2):
     """
     Generate binary data according to a hierarchical Bernoulli model.
@@ -151,51 +153,54 @@ def generate_X_normal(N, prop_true, B_list, gamma):
 
 # utilities/generate_X_poisson.py
 
-def generate_X_poisson(N, prop_true, B1, B2):
-    """
-    Generate count data according to a hierarchical Bernoulli–Poisson model.
-    Equivalent to Matlab generate_X_poisson.m.
+def generate_X_poisson(N, prop_true, B_list, random_state=None):
+    """Generate observations from an arbitrary-depth Poisson DDE.
+
+    ``B_list`` follows the package convention: the first matrix maps ``A_1``
+    to the Poisson log-rate, and each remaining matrix maps a binary parent
+    layer to the binary layer immediately below it.
 
     Parameters
     ----------
     N : int
         Number of samples.
     prop_true : array_like
-        Probabilities for generating A2 (length K2).
-    B1 : np.ndarray
-        Coefficient matrix for Poisson rate generation (shape: p x (1+K1)).
-    B2 : np.ndarray
-        Coefficient matrix for A1 generation (shape: K1 x (1+K2)).
+        Deepest-layer Bernoulli probabilities.
+    B_list : sequence of np.ndarray
+        Arbitrary-depth DDE coefficient matrices.
+    random_state : optional
+        Seed or NumPy generator.
 
     Returns
     -------
     X : np.ndarray
         Poisson-distributed data (N x p).
-    A1 : np.ndarray
-        Latent binary variables (N x K1).
-    A2 : np.ndarray
-        Latent binary variables (N x K2).
+    A_list : list of np.ndarray
+        Latent binary matrices ordered from shallowest to deepest.
     """
 
-    prop_true = np.asarray(prop_true)
-    K2 = prop_true.shape[0]
+    if isinstance(random_state, np.random.Generator):
+        rng = random_state
+    else:
+        rng = np.random.default_rng(random_state)
+    B_list = [np.asarray(B, dtype=float) for B in B_list]
+    if not B_list:
+        raise ValueError("B_list must contain at least one latent layer.")
+    N = int(N)
+    if N < 1:
+        raise ValueError("N must be a positive integer.")
 
-    # --- Generate A2 ---
-    A2 = np.zeros((N, K2))
-    for k in range(K2):
-        A2[:, k] = np.random.binomial(1, prop_true[k], size=N)
-
-    # --- Generate A1 ---
-    logits_A1 = np.dot(np.column_stack((np.ones(N), A2)), B2.T)
-    probs_A1 = expit(logits_A1)
-    A1 = np.random.binomial(1, probs_A1)
-
-    # --- Generate X ---
-    # Equivalent to Matlab: poissrnd(exp([ones(N,1), A1] * B1'))
-    lam = np.exp(np.dot(np.column_stack((np.ones(N), A1)), B1.T))
-    X = np.random.poisson(lam)
-
-    return X, A1, A2
+    A_list, _ = simulate_latent_layers_D(N, prop_true, B_list, rng)
+    design = np.column_stack((np.ones(N), A_list[0]))
+    eta = design @ B_list[0].T
+    with np.errstate(over="ignore"):
+        rate = np.exp(eta)
+    if not np.all(np.isfinite(rate)) or np.any(rate > 1.0e18):
+        raise ValueError(
+            "Poisson natural parameters produce rates too large to sample."
+        )
+    X = rng.poisson(rate, size=rate.shape)
+    return X, A_list
 
 # For 1 layer DDE model
 
@@ -236,4 +241,3 @@ def generate_X_normal_single_layer(N, prop_true, B1, gamma):
     X = np.random.normal(loc=mean_X, scale=std_X, size=mean_X.shape)
 
     return X, A1
-    
