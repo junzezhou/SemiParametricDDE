@@ -5,8 +5,8 @@ this module own only observed-layer behavior: data validation and
 initialization, the observed contribution to latent conditional log-odds,
 observed-layer M-steps, dispersion semantics, scoring, and simulation.
 
-Normal, Bernoulli, and Poisson adapters share the fixed-width SAEM control
-loop. Normal and Bernoulli additionally support the CSP-MCEM control path.
+Normal, Bernoulli, and Poisson adapters share the fixed-width SAEM and
+CSP-MCEM control paths.
 """
 
 from __future__ import annotations
@@ -96,7 +96,9 @@ def _solve_bernoulli_tlp_batched(
         raise ValueError("Bernoulli coefficient start must be a matrix.")
     bounds = list(bounds)
     if len(bounds) != B_start.shape[1]:
-        raise ValueError("Bernoulli coefficient bounds have an incompatible width.")
+        raise ValueError(
+            "Bernoulli coefficient bounds have an incompatible width."
+        )
     shape = B_start.shape
 
     def objective(flattened):
@@ -225,9 +227,7 @@ class _ObservedPoissonAccumulator:
             (0, self.packed_width), dtype=np.uint8
         )
         self.counts = np.empty(0, dtype=float)
-        self.q_all = np.zeros(
-            (self.n_responses, self.n_features), dtype=float
-        )
+        self.q_all = np.zeros((self.n_responses, self.n_features), dtype=float)
         self._design = None
 
     @property
@@ -277,23 +277,23 @@ class _ObservedPoissonAccumulator:
             or A_samples.shape[0] != X.shape[0]
             or A_samples.shape[1] != self.n_features
         ):
-            raise ValueError("Poisson Monte Carlo designs have an incompatible shape.")
+            raise ValueError(
+                "Poisson Monte Carlo designs have an incompatible shape."
+            )
         t = int(t)
         if t < 1:
             raise ValueError("Poisson accumulator iteration must be positive.")
         alpha = 1.0 / t
         C = A_samples.shape[2]
-        parents = np.moveaxis(
-            A_samples[:, 1:, :], 1, 2
-        ).reshape(-1, self.parent_width)
+        parents = np.moveaxis(A_samples[:, 1:, :], 1, 2).reshape(
+            -1, self.parent_width
+        )
         packed = np.packbits(
             np.ascontiguousarray(parents, dtype=np.uint8),
             axis=1,
             bitorder="little",
         )
-        new_patterns, inverse = np.unique(
-            packed, axis=0, return_inverse=True
-        )
+        new_patterns, inverse = np.unique(packed, axis=0, return_inverse=True)
         new_counts = np.bincount(inverse).astype(float) / C
 
         if self._packed_patterns.size:
@@ -306,14 +306,10 @@ class _ObservedPoissonAccumulator:
             merged_counts = np.zeros(all_patterns.shape[0], dtype=float)
             merged_counts[old_positions] = (1.0 - alpha) * self.counts
             merged_counts[new_positions] += alpha * new_counts
-            self._packed_patterns = all_patterns.astype(
-                np.uint8, copy=False
-            )
+            self._packed_patterns = all_patterns.astype(np.uint8, copy=False)
             self.counts = merged_counts
         else:
-            self._packed_patterns = new_patterns.astype(
-                np.uint8, copy=False
-            )
+            self._packed_patterns = new_patterns.astype(np.uint8, copy=False)
             self.counts = alpha * new_counts
 
         q_new = X.T @ np.mean(A_samples, axis=2)
@@ -339,6 +335,7 @@ class _ObservedPoissonAccumulator:
         value = float(self.counts @ exp_value - q @ x)
         gradient = self.design.T @ (self.counts * rate) - q
         return value, gradient
+
 
 def _normal_sample_statistics(X, A_samples):
     """Return current-MC Normal design cross-products, averaged over draws."""
@@ -422,8 +419,7 @@ def _binary_child_conditional_logit(
         for coordinate, indices in enumerate(active_children):
             if indices.size:
                 child_linear[:, coordinate] = (
-                    children[:, indices]
-                    @ B_active[indices, coordinate + 1]
+                    children[:, indices] @ B_active[indices, coordinate + 1]
                 )
 
     for start in range(0, N, row_chunk_size):
@@ -448,23 +444,16 @@ def _binary_child_conditional_logit(
                     normalizer_delta = np.logaddexp(
                         0.0, eta_zero + slope[None, :]
                     ) - np.logaddexp(0.0, eta_zero)
-                    like_logit[start:stop, coordinate] = (
-                        child_linear[start:stop, coordinate]
-                        - np.sum(normalizer_delta, axis=1)
-                    )
+                    like_logit[start:stop, coordinate] = child_linear[
+                        start:stop, coordinate
+                    ] - np.sum(normalizer_delta, axis=1)
             continue
 
         base_softplus = np.logaddexp(0.0, base_eta)
-        child_linear = (
-            children[start:stop, :child_width] @ B_active[:, 1:]
-        )
+        child_linear = children[start:stop, :child_width] @ B_active[:, 1:]
         for block_start in range(0, parent_width, coordinate_chunk_size):
-            block_stop = min(
-                block_start + coordinate_chunk_size, parent_width
-            )
-            slopes_block = B_active[
-                :, block_start + 1 : block_stop + 1
-            ].T
+            block_stop = min(block_start + coordinate_chunk_size, parent_width)
+            slopes_block = B_active[:, block_start + 1 : block_stop + 1].T
             direction = 1.0 - 2.0 * parent_chunk[
                 :, block_start:block_stop
             ].astype(float)
@@ -482,14 +471,11 @@ def _binary_child_conditional_logit(
                 )
             else:
                 shifted_eta -= base_softplus[:, None, :]
-                log_normalizer_delta = direction * np.sum(
-                    shifted_eta, axis=2
-                )
-            like_logit[start:stop, block_start:block_stop] = (
-                child_linear[:, block_start:block_stop]
-                - np.asarray(log_normalizer_delta).reshape(
-                    stop - start, block_stop - block_start
-                )
+                log_normalizer_delta = direction * np.sum(shifted_eta, axis=2)
+            like_logit[start:stop, block_start:block_stop] = child_linear[
+                :, block_start:block_stop
+            ] - np.asarray(log_normalizer_delta).reshape(
+                stop - start, block_stop - block_start
             )
     return like_logit
 
@@ -544,9 +530,13 @@ def _solve_gaussian_weighted_l1_from_statistics(
             )
             candidate[:, 1:] = np.clip(candidate[:, 1:], -bound, bound)
 
-            relative = np.linalg.norm(candidate - B) / (np.linalg.norm(B) + 1e-12)
+            relative = np.linalg.norm(candidate - B) / (
+                np.linalg.norm(B) + 1e-12
+            )
             next_momentum = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * momentum**2))
-            Y = candidate + ((momentum - 1.0) / next_momentum) * (candidate - B)
+            Y = candidate + ((momentum - 1.0) / next_momentum) * (
+                candidate - B
+            )
             B = candidate
             momentum = next_momentum
             if relative <= tol:
@@ -559,7 +549,9 @@ def _solve_gaussian_weighted_l1_from_statistics(
     else:
         x_sq_sum = np.asarray(x_sq_sum, dtype=float).reshape(-1)
         if x_sq_sum.shape != (X.shape[1],):
-            raise ValueError("x_sq_sum must have one entry per observed column.")
+            raise ValueError(
+                "x_sq_sum must have one entry per observed column."
+            )
     sse_average = np.maximum(x_sq_sum - 2.0 * cross + quadratic, 0.0)
     sse = C * sse_average
     N = X.shape[0]
@@ -630,7 +622,9 @@ class NormalFamilyAdapter:
                 f"Y must be a two-dimensional matrix; got shape {X.shape}."
             )
         if X.shape[0] < 1 or X.shape[1] < 1:
-            raise ValueError("Y must contain at least one observation and one variable.")
+            raise ValueError(
+                "Y must contain at least one observation and one variable."
+            )
         if not np.all(np.isfinite(X)):
             raise ValueError("Normal DDE requires finite values in Y.")
         return X
@@ -712,19 +706,14 @@ class NormalFamilyAdapter:
             )
         return like_logit
 
-    def observed_coordinate_loglik_delta(
-        self, X, eta_zero, slope, dispersion
-    ):
+    def observed_coordinate_loglik_delta(self, X, eta_zero, slope, dispersion):
         """Return Normal log-likelihood odds for one latent coordinate."""
         X = np.asarray(X, dtype=float)
         eta_zero = np.asarray(eta_zero, dtype=float)
         slope = np.asarray(slope, dtype=float)
         gamma = np.asarray(dispersion, dtype=float)
         return np.sum(
-            (
-                (X - eta_zero) * slope[None, :]
-                - 0.5 * slope[None, :] ** 2
-            )
+            ((X - eta_zero) * slope[None, :] - 0.5 * slope[None, :] ** 2)
             / gamma[None, :],
             axis=1,
         )
@@ -836,9 +825,9 @@ class NormalFamilyAdapter:
         """Preserve the existing Normal CSP bounds policy."""
         if observed:
             return [(-bound_val, bound_val)] * int(n_parameters)
-        return [(-5.0, bound_val)] + [
-            (-bound_val, bound_val)
-        ] * (int(n_parameters) - 1)
+        return [(-5.0, bound_val)] + [(-bound_val, bound_val)] * (
+            int(n_parameters) - 1
+        )
 
     def postprocess_fixed_coefficients(self, B_updates, *, tau, depth):
         for B_update in B_updates:
@@ -852,9 +841,7 @@ class NormalFamilyAdapter:
         Y = np.asarray(Y, dtype=float)
         eta = np.asarray(eta, dtype=float)
         gamma = np.asarray(dispersion, dtype=float).reshape(1, -1)
-        return -0.5 * (
-            np.log(2.0 * np.pi * gamma) + ((Y - eta) ** 2) / gamma
-        )
+        return -0.5 * (np.log(2.0 * np.pi * gamma) + ((Y - eta) ** 2) / gamma)
 
     def sample_observed(self, eta, dispersion, rng):
         eta = np.asarray(eta, dtype=float)
@@ -869,7 +856,7 @@ class PoissonFamilyAdapter:
     name: str = "Poisson"
     key: str = "poisson"
     aliases: tuple[str, ...] = ("poisson",)
-    supported_dimension_methods: tuple[str, ...] = ("fixed",)
+    supported_dimension_methods: tuple[str, ...] = ("fixed", "csp")
     has_dispersion: bool = False
     dispersion_name: Optional[str] = None
 
@@ -893,7 +880,9 @@ class PoissonFamilyAdapter:
                 f"Y must be a two-dimensional matrix; got shape {X.shape}."
             )
         if X.shape[0] < 1 or X.shape[1] < 1:
-            raise ValueError("Y must contain at least one observation and one variable.")
+            raise ValueError(
+                "Y must contain at least one observation and one variable."
+            )
         try:
             valid = (
                 np.all(np.isfinite(X))
@@ -967,26 +956,20 @@ class PoissonFamilyAdapter:
             eta = B1[:, 0][None, :] + A_chunk @ slopes.T
             data_linear = X[start:stop] @ slopes
             for block_start in range(0, width, coordinate_chunk_size):
-                block_stop = min(
-                    block_start + coordinate_chunk_size, width
-                )
+                block_stop = min(block_start + coordinate_chunk_size, width)
                 for coordinate in range(block_start, block_stop):
                     slope = slopes[:, coordinate]
                     eta_zero = (
-                        eta
-                        - A_chunk[:, coordinate, None] * slope[None, :]
+                        eta - A_chunk[:, coordinate, None] * slope[None, :]
                     )
                     rate_delta = _poisson_optimization_rate(eta_zero)
                     rate_delta *= np.expm1(slope)[None, :]
-                    like_logit[start:stop, coordinate] = (
-                        data_linear[:, coordinate]
-                        - np.sum(rate_delta, axis=1)
-                    )
+                    like_logit[start:stop, coordinate] = data_linear[
+                        :, coordinate
+                    ] - np.sum(rate_delta, axis=1)
         return like_logit
 
-    def observed_coordinate_loglik_delta(
-        self, X, eta_zero, slope, dispersion
-    ):
+    def observed_coordinate_loglik_delta(self, X, eta_zero, slope, dispersion):
         """Return Poisson log-likelihood odds for one latent coordinate."""
         del dispersion
         X = np.asarray(X, dtype=float)
@@ -1053,23 +1036,24 @@ class PoissonFamilyAdapter:
         row_chunk_size,
         coordinate_chunk_size,
     ):
-        del (
-            X,
-            A_samples,
-            B_start,
-            dispersion,
-            penalty_scale,
-            temperature,
-            response_cache,
-            max_iter,
-            tol,
-            bound,
-            bounds,
-            row_chunk_size,
-            coordinate_chunk_size,
-        )
-        raise NotImplementedError(
-            "Poisson DDE currently supports dimension_method='fixed' only."
+        del dispersion, response_cache
+        from .normal_csp import _solve_poisson_weighted_l1
+
+        return (
+            _solve_poisson_weighted_l1(
+                X,
+                A_samples,
+                B_start,
+                penalty_scale,
+                temperature,
+                max_iter=max_iter,
+                tol=tol,
+                bound=bound,
+                bounds=bounds,
+                row_chunk_size=row_chunk_size,
+                coordinate_chunk_size=coordinate_chunk_size,
+            ),
+            None,
         )
 
     def dispersion_distance_sq(self, old, new) -> float:
@@ -1082,15 +1066,14 @@ class PoissonFamilyAdapter:
         upper = min(5.0, bound_val)
         intercept_lower = -upper
         slope_lower = -min(2.5, bound_val)
-        return [(intercept_lower, upper)] + [
-            (slope_lower, upper)
-        ] * (int(n_parameters) - 1)
+        return [(intercept_lower, upper)] + [(slope_lower, upper)] * (
+            int(n_parameters) - 1
+        )
 
     def csp_coefficient_bounds(self, n_parameters, bound_val, *, observed):
-        del n_parameters, bound_val, observed
-        raise NotImplementedError(
-            "Poisson DDE currently supports dimension_method='fixed' only."
-        )
+        """Use the fixed-path validated bounds throughout Poisson CSP."""
+        del observed
+        return self.fixed_latent_bounds(n_parameters, bound_val)
 
     def postprocess_fixed_coefficients(self, B_updates, *, tau, depth):
         del depth
@@ -1137,9 +1120,7 @@ class BernoulliFamilyAdapter:
 
     def initial_working_response(self, Y, *, epsilon, K1=None):
         if K1 is None:
-            raise ValueError(
-                "Bernoulli initial_working_response requires K1."
-            )
+            raise ValueError("Bernoulli initial_working_response requires K1.")
         return _bernoulli_working_response(
             self.validate_y(Y), int(K1), float(epsilon)
         )
@@ -1151,7 +1132,9 @@ class BernoulliFamilyAdapter:
                 f"Y must be a two-dimensional matrix; got shape {X.shape}."
             )
         if X.shape[0] < 1 or X.shape[1] < 1:
-            raise ValueError("Y must contain at least one observation and one variable.")
+            raise ValueError(
+                "Y must contain at least one observation and one variable."
+            )
         try:
             finite = np.isfinite(X)
         except TypeError as exc:
@@ -1159,9 +1142,7 @@ class BernoulliFamilyAdapter:
                 "Bernoulli DDE requires numeric binary 0/1 values in Y."
             ) from exc
         if not np.all(finite) or not np.all((X == 0) | (X == 1)):
-            raise ValueError(
-                "Bernoulli DDE requires binary 0/1 values in Y."
-            )
+            raise ValueError("Bernoulli DDE requires binary 0/1 values in Y.")
         return X.astype(float, copy=False)
 
     def validate_dispersion(self, dispersion, n_responses):
@@ -1216,22 +1197,16 @@ class BernoulliFamilyAdapter:
             sparse="auto",
         )
 
-    def observed_coordinate_loglik_delta(
-        self, X, eta_zero, slope, dispersion
-    ):
+    def observed_coordinate_loglik_delta(self, X, eta_zero, slope, dispersion):
         """Return Bernoulli log-likelihood odds for one latent coordinate."""
         del dispersion
         X = np.asarray(X, dtype=float)
         eta_zero = np.asarray(eta_zero, dtype=float)
         slope = np.asarray(slope, dtype=float)
         eta_one = eta_zero + slope[None, :]
-        return (
-            X @ slope
-            - np.sum(
-                np.logaddexp(0.0, eta_one)
-                - np.logaddexp(0.0, eta_zero),
-                axis=1,
-            )
+        return X @ slope - np.sum(
+            np.logaddexp(0.0, eta_one) - np.logaddexp(0.0, eta_zero),
+            axis=1,
         )
 
     def make_fixed_accumulator(self, n_responses, n_features):
@@ -1327,9 +1302,9 @@ class BernoulliFamilyAdapter:
         upper = min(5.0, bound_val)
         intercept_lower = -upper
         slope_lower = -min(2.5, bound_val)
-        return [(intercept_lower, upper)] + [
-            (slope_lower, upper)
-        ] * (int(n_parameters) - 1)
+        return [(intercept_lower, upper)] + [(slope_lower, upper)] * (
+            int(n_parameters) - 1
+        )
 
     def csp_coefficient_bounds(self, n_parameters, bound_val, *, observed):
         """Use the validated Bernoulli bounds for observed and latent logits."""
@@ -1362,9 +1337,7 @@ NORMAL_FAMILY = NormalFamilyAdapter()
 BERNOULLI_FAMILY = BernoulliFamilyAdapter()
 POISSON_FAMILY = PoissonFamilyAdapter()
 
-_FAMILY_REGISTRY = {
-    alias: NORMAL_FAMILY for alias in NORMAL_FAMILY.aliases
-}
+_FAMILY_REGISTRY = {alias: NORMAL_FAMILY for alias in NORMAL_FAMILY.aliases}
 _FAMILY_REGISTRY.update(
     {alias: BERNOULLI_FAMILY for alias in BERNOULLI_FAMILY.aliases}
 )
@@ -1381,7 +1354,9 @@ def register_parametric_family(adapter):
     for alias in aliases:
         existing = _FAMILY_REGISTRY.get(alias)
         if existing is not None and existing is not adapter:
-            raise ValueError(f"Parametric family alias {alias!r} is already registered.")
+            raise ValueError(
+                f"Parametric family alias {alias!r} is already registered."
+            )
     for alias in aliases:
         _FAMILY_REGISTRY[alias] = adapter
     return adapter

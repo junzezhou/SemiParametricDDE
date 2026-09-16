@@ -1,6 +1,6 @@
 """Shared cumulative-shrinkage-process primitives for DDE estimators.
 
-The current CopDDE and Normal-DDE CSP paths use the scale parameterization
+The CopDDE and parametric-DDE CSP paths use the scale parameterization
 
     beta | scale ~ Laplace(0, scale),
 

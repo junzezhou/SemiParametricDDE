@@ -6,6 +6,11 @@ from scipy.special import gammaln
 import dde.algorithms.parametric_families as parametric_families
 import dde.algorithms.semi_saem as semi_saem_module
 from dde import fit
+from dde.algorithms.normal_csp import (
+    _poisson_mc_design_and_response_statistic,
+    _poisson_mc_value_and_grad,
+    _solve_poisson_weighted_l1,
+)
 from dde.algorithms.parametric_families import (
     POISSON_FAMILY,
     _ObservedPoissonAccumulator,
@@ -103,15 +108,13 @@ def _small_poisson_state(seed=20260903):
     B1 = rng.normal(0.0, 0.25, size=(K_list[0], K_list[1] + 1))
     B1[:, 0] = -0.2
     B_list = [B0, B1]
-    X, A_list = generate_X_poisson(
-        N, prop, B_list, random_state=seed + 1
-    )
+    X, A_list = generate_X_poisson(N, prop, B_list, random_state=seed + 1)
     return X, prop, B_list, A_list
 
 
 def test_poisson_family_registry_validation_and_dispersion_semantics():
     assert resolve_parametric_family("Poisson") is POISSON_FAMILY
-    assert POISSON_FAMILY.supported_dimension_methods == ("fixed",)
+    assert POISSON_FAMILY.supported_dimension_methods == ("fixed", "csp")
     assert POISSON_FAMILY.has_dispersion is False
     assert POISSON_FAMILY.validate_dispersion(None, 4) is None
 
@@ -138,9 +141,7 @@ def test_poisson_working_response_matches_matlab_full_svd_formula():
         max(K1 + 1, int(np.sum(singular_values > 1.01 * np.sqrt(X.shape[0])))),
         singular_values.size,
     )
-    reconstructed = (
-        U[:, :rank] * singular_values[:rank][None, :]
-    ) @ Vt[:rank]
+    reconstructed = (U[:, :rank] * singular_values[:rank][None, :]) @ Vt[:rank]
     expected = np.log(np.maximum(reconstructed, epsilon))
     expected -= np.mean(expected, axis=0, keepdims=True)
 
@@ -161,9 +162,7 @@ def test_poisson_initialization_supports_arbitrary_depth():
         rng.normal(0.0, 0.18, size=(3, 2)),
     ]
     B_list[0][:, 0] = -0.2
-    X, _ = generate_X_poisson(
-        48, np.array([0.5]), B_list, random_state=43
-    )
+    X, _ = generate_X_poisson(48, np.array([0.5]), B_list, random_state=43)
 
     prop, B_initial, dispersion, A_initial, graph_errors = Poisson_init(
         X, K_list, mode="data"
@@ -184,9 +183,7 @@ def test_poisson_closed_coordinate_delta_matches_log_probability_difference():
     eta_zero = rng.normal(scale=0.7, size=X.shape)
     slope = rng.normal(scale=0.5, size=X.shape[1])
     expected = np.sum(
-        POISSON_FAMILY.conditional_log_prob(
-            X, eta_zero + slope[None, :], None
-        )
+        POISSON_FAMILY.conditional_log_prob(X, eta_zero + slope[None, :], None)
         - POISSON_FAMILY.conditional_log_prob(X, eta_zero, None),
         axis=1,
     )
@@ -243,9 +240,7 @@ def test_poisson_fixed_accumulator_matches_matlab_objective_and_gradient():
     X = rng.poisson(2.0, size=(N, J)).astype(float)
     parent = np.empty((N, K + 1, C), dtype=np.uint8)
     parent[:, 0, :] = 1
-    parent[:, 1:, :] = rng.integers(
-        0, 2, size=(N, K, C), dtype=np.uint8
-    )
+    parent[:, 1:, :] = rng.integers(0, 2, size=(N, K, C), dtype=np.uint8)
     accumulator = _ObservedPoissonAccumulator(J, K + 1)
     accumulator.update(X, parent, 1)
 
@@ -255,13 +250,10 @@ def test_poisson_fixed_accumulator_matches_matlab_objective_and_gradient():
     for response_index in range(J):
         eta = design @ point
         expected = (
-            np.sum(np.exp(eta))
-            - response[:, response_index] @ eta
+            np.sum(np.exp(eta)) - response[:, response_index] @ eta
         ) / C
         expected_gradient = (
-            design.T
-            @ (np.exp(eta) - response[:, response_index])
-            / C
+            design.T @ (np.exp(eta) - response[:, response_index]) / C
         )
         value, gradient = accumulator.value_and_grad(response_index, point)
         assert value == pytest.approx(expected, rel=1e-12, abs=1e-12)
@@ -279,9 +271,9 @@ def test_poisson_fixed_accumulator_matches_matlab_objective_and_gradient():
     parent_second[:, 1:, :] = rng.integers(
         0, 2, size=(N, K, C), dtype=np.uint8
     )
-    second_design = np.moveaxis(parent_second, 1, 2).reshape(
-        N * C, K + 1
-    ).astype(float)
+    second_design = (
+        np.moveaxis(parent_second, 1, 2).reshape(N * C, K + 1).astype(float)
+    )
     accumulator.update(X, parent_second, 2)
     eta_first = design @ point
     eta_second = second_design @ point
@@ -294,11 +286,122 @@ def test_poisson_fixed_accumulator_matches_matlab_objective_and_gradient():
     )
 
 
+def test_poisson_csp_mc_objective_and_gradient_match_direct_calculation():
+    rng = np.random.default_rng(901)
+    N, J, K, C = 7, 4, 3, 2
+    X = rng.poisson(1.7, size=(N, J)).astype(float)
+    parent_sample = np.empty((N, K + 1, C), dtype=np.uint8)
+    parent_sample[:, 0, :] = 1
+    parent_sample[:, 1:, :] = rng.binomial(1, 0.45, size=(N, K, C))
+    coefficients = rng.normal(0.0, 0.2, size=(J, K + 1))
+    temperature = 0.8
+    design, response_statistic, *_ = _poisson_mc_design_and_response_statistic(
+        X, parent_sample
+    )
+
+    value, gradient = _poisson_mc_value_and_grad(
+        coefficients,
+        design,
+        response_statistic,
+        temperature=temperature,
+        mc_samples=C,
+        row_chunk_size=3,
+        coordinate_chunk_size=2,
+    )
+    eta = design @ coefficients.T
+    expected_value = (
+        temperature
+        / C
+        * (np.sum(np.exp(eta)) - np.sum(response_statistic * coefficients))
+    )
+    expected_gradient = (
+        temperature / C * (np.exp(eta).T @ design - response_statistic)
+    )
+    np.testing.assert_allclose(value, expected_value, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        gradient, expected_gradient, rtol=1e-12, atol=1e-12
+    )
+
+    numerical = _central_difference(
+        lambda flat: _poisson_mc_value_and_grad(
+            flat.reshape(coefficients.shape),
+            design,
+            response_statistic,
+            temperature=temperature,
+            mc_samples=C,
+            row_chunk_size=design.shape[0],
+            coordinate_chunk_size=J,
+        )[0],
+        coefficients.ravel(),
+    ).reshape(coefficients.shape)
+    np.testing.assert_allclose(gradient, numerical, rtol=2e-6, atol=2e-6)
+
+
+def test_poisson_csp_weighted_l1_solver_reduces_objective_and_satisfies_kkt():
+    rng = np.random.default_rng(902)
+    N, J, K, C = 80, 4, 2, 2
+    X = rng.poisson(1.4, size=(N, J)).astype(float)
+    parent_sample = np.empty((N, K + 1, C), dtype=np.uint8)
+    parent_sample[:, 0, :] = 1
+    parent_sample[:, 1:, :] = rng.binomial(1, 0.5, size=(N, K, C))
+    start = np.zeros((J, K + 1), dtype=float)
+    penalty_scale = np.full((J, K), 0.8)
+    temperature = 0.9
+    design, response_statistic, *_ = _poisson_mc_design_and_response_statistic(
+        X, parent_sample
+    )
+
+    def objective(coefficients):
+        smooth, _ = _poisson_mc_value_and_grad(
+            coefficients,
+            design,
+            response_statistic,
+            temperature=temperature,
+            mc_samples=C,
+            row_chunk_size=31,
+            coordinate_chunk_size=2,
+        )
+        return smooth + np.sum(np.abs(coefficients[:, 1:]) / penalty_scale)
+
+    fitted = _solve_poisson_weighted_l1(
+        X,
+        parent_sample,
+        start,
+        penalty_scale,
+        temperature,
+        max_iter=1000,
+        tol=1e-10,
+        bounds=[(-5.0, 5.0), (-2.5, 5.0), (-2.5, 5.0)],
+        row_chunk_size=31,
+        coordinate_chunk_size=2,
+    )
+    assert objective(fitted) < objective(start)
+    _, gradient = _poisson_mc_value_and_grad(
+        fitted,
+        design,
+        response_statistic,
+        temperature=temperature,
+        mc_samples=C,
+        row_chunk_size=31,
+        coordinate_chunk_size=2,
+    )
+    assert np.max(np.abs(gradient[:, 0])) < 3e-4
+    weights = 1.0 / penalty_scale
+    nonzero = np.abs(fitted[:, 1:]) > 1e-7
+    residual = gradient[:, 1:] + np.sign(fitted[:, 1:]) * weights
+    assert np.max(np.abs(residual[nonzero]), initial=0.0) < 3e-4
+    assert (
+        np.max(
+            np.abs(gradient[:, 1:][~nonzero]) - weights[~nonzero],
+            initial=-np.inf,
+        )
+        < 3e-4
+    )
+
+
 def test_poisson_accumulator_reuses_rate_in_value_and_gradient(monkeypatch):
     X, _, _, A_list = _small_poisson_state(451)
-    samples = np.empty(
-        (X.shape[0], A_list[0].shape[1] + 1, 1), dtype=np.uint8
-    )
+    samples = np.empty((X.shape[0], A_list[0].shape[1] + 1, 1), dtype=np.uint8)
     samples[:, 0, 0] = 1
     samples[:, 1:, 0] = A_list[0]
     accumulator = _ObservedPoissonAccumulator(X.shape[1], samples.shape[1])
@@ -315,9 +418,7 @@ def test_poisson_accumulator_reuses_rate_in_value_and_gradient(monkeypatch):
     monkeypatch.setattr(
         parametric_families, "_poisson_optimization_rate", counted_rate
     )
-    value, gradient = accumulator.value_and_grad(
-        0, np.zeros(samples.shape[1])
-    )
+    value, gradient = accumulator.value_and_grad(0, np.zeros(samples.shape[1]))
 
     assert calls == 1
     assert np.isfinite(value)
@@ -330,9 +431,7 @@ def test_poisson_accumulator_bit_packs_wide_parent_patterns_exactly():
     X = rng.poisson(1.5, size=(N, J)).astype(float)
     samples = np.empty((N, K + 1, 1), dtype=np.uint8)
     samples[:, 0, 0] = 1
-    samples[:, 1:, 0] = rng.integers(
-        0, 2, size=(N, K), dtype=np.uint8
-    )
+    samples[:, 1:, 0] = rng.integers(0, 2, size=(N, K), dtype=np.uint8)
     accumulator = _ObservedPoissonAccumulator(J, K + 1)
     accumulator.update(X, samples, 1)
 
@@ -351,18 +450,14 @@ def test_poisson_fixed_mstep_preserves_responsewise_optimizer(monkeypatch):
     X = rng.poisson(1.8, size=(N, J)).astype(float)
     samples = np.empty((N, K + 1, 1), dtype=np.uint8)
     samples[:, 0, 0] = 1
-    samples[:, 1:, 0] = rng.integers(
-        0, 2, size=(N, K), dtype=np.uint8
-    )
+    samples[:, 1:, 0] = rng.integers(0, 2, size=(N, K), dtype=np.uint8)
     accumulator = _ObservedPoissonAccumulator(J, K + 1)
     B_start = rng.normal(scale=0.08, size=(J, K + 1))
     expected = B_start + 0.125
     calls = []
 
     def responsewise(accumulator_arg, B_arg, penalty, tau, bounds, **kwargs):
-        calls.append(
-            (accumulator_arg, B_arg, penalty, tau, bounds, kwargs)
-        )
+        calls.append((accumulator_arg, B_arg, penalty, tau, bounds, kwargs))
         return expected
 
     monkeypatch.setattr(
@@ -443,10 +538,7 @@ def test_poisson_batched_latent_mstep_matches_rowwise_recovery(monkeypatch):
 def test_sparse_poisson_observed_coordinate_matches_dense_probability():
     prop, B_list = _matlab_poisson_parameters()
     X, A_list = generate_X_poisson(45, prop, B_list, random_state=456)
-    child_eta = (
-        B_list[0][:, 0][None, :]
-        + A_list[0] @ B_list[0][:, 1:].T
-    )
+    child_eta = B_list[0][:, 0][None, :] + A_list[0] @ B_list[0][:, 1:].T
     for coordinate in range(B_list[0].shape[1] - 1):
         active = np.flatnonzero(B_list[0][:, coordinate + 1] != 0.0)
         dense_probability, dense_eta_zero = (
@@ -602,8 +694,7 @@ def test_matlab_poisson_setting_runs_through_fixed_family_kernel():
         assert np.all(B[:, 1:] >= -2.5)
         assert np.all(B[:, 1:] <= 5.0)
     recovered_support = sum(
-        np.sum((B[:, 1:] != 0) == G)
-        for B, G in zip(result.B_list, G_list)
+        np.sum((B[:, 1:] != 0) == G) for B, G in zip(result.B_list, G_list)
     ) / sum(G.size for G in G_list)
     squared_error = np.sum((result.prop - prop) ** 2) + sum(
         np.sum((fitted - truth) ** 2)
@@ -624,9 +715,7 @@ def test_public_fixed_poisson_supports_three_latent_layers():
         rng.normal(0.0, 0.15, size=(3, 2)),
     ]
     B_list[0][:, 0] = -0.3
-    X, A_list = generate_X_poisson(
-        30, prop, B_list, random_state=54
-    )
+    X, A_list = generate_X_poisson(30, prop, B_list, random_state=54)
 
     np.random.seed(55)
     result = fit(
@@ -692,9 +781,7 @@ def test_public_fixed_poisson_smoke_tests_depth_four_and_five(K_list):
         (child_width, parent_width + 1)
         for child_width, parent_width in zip(child_widths, K_list)
     ]
-    assert [A.shape for A in result.A_list] == [
-        (8, width) for width in K_list
-    ]
+    assert [A.shape for A in result.A_list] == [(8, width) for width in K_list]
     assert np.all(np.isfinite(result.prop))
     assert all(np.all(np.isfinite(B)) for B in result.B_list)
 
@@ -787,22 +874,170 @@ def test_poisson_conditional_scoring_and_d_layer_simulation():
     assert np.all(X_first == np.floor(X_first))
 
 
-def test_public_poisson_rejects_csp_and_gamma():
+def test_public_poisson_csp_uses_maximum_width_and_is_reproducible():
     X, _, _, _ = _small_poisson_state(52)
-    with pytest.raises(NotImplementedError, match="dimension_method='fixed' only"):
-        fit(
-            X,
-            method="DDE",
-            family="Poisson",
-            D=2,
-            dimension_method="csp",
-            t_spike=[0.03, 0.05],
-            temp=0.9,
-            tau=0.3,
-            C=1,
-            max_it=1,
-            verbose=False,
-        )
+    arguments = dict(
+        method="DDE",
+        family="Poisson",
+        D=2,
+        dimension_method="csp",
+        t_spike=[0.03, 0.05],
+        temp=0.9,
+        tau=0.1,
+        C=2,
+        tol=0.0,
+        max_it=2,
+        optimizer_maxiter=20,
+        random_state=53,
+        verbose=False,
+    )
+    first = fit(X, **arguments)
+    second = fit(X, **arguments)
+
+    assert first.gamma is None
+    assert first.diagnostics["K_max_list"] == (3, 1)
+    assert first.diagnostics["original_K_list"] == (3, 1)
+    assert first.diagnostics["family"] == "Poisson"
+    assert first.diagnostics["kernel"] == "systematic_gibbs_mcem_csp"
+    assert first.diagnostics["latent_transition"] == (
+        "systematic_coordinate_gibbs"
+    )
+    assert first.diagnostics["mc_state_update"] == "last_draw"
+    assert first.diagnostics["canonicalized_initial_order"] is True
+    assert len(first.K_list) == 2
+    assert all(
+        fitted <= maximum for fitted, maximum in zip(first.K_list, (3, 1))
+    )
+    np.testing.assert_array_equal(first.prop, second.prop)
+    for first_B, second_B in zip(first.B_list, second.B_list):
+        np.testing.assert_array_equal(first_B, second_B)
+    for first_A, second_A in zip(first.A_list, second.A_list):
+        np.testing.assert_array_equal(first_A, second_A)
+    assert first.K_list == second.K_list
+
+
+def test_public_poisson_csp_supports_arbitrary_depth():
+    rng = np.random.default_rng(55)
+    B_list = [
+        rng.normal(0.0, 0.08, size=(27, 10)),
+        rng.normal(0.0, 0.15, size=(9, 4)),
+        rng.normal(0.0, 0.15, size=(3, 2)),
+    ]
+    B_list[0][:, 0] = -0.3
+    X, _ = generate_X_poisson(32, np.array([0.5]), B_list, random_state=56)
+
+    result = fit(
+        X,
+        method="DDE",
+        family="Poisson",
+        D=3,
+        dimension_method="csp",
+        t_spike=[0.01, 0.03, 0.005],
+        temp=0.9,
+        tau=0.1,
+        C=1,
+        tol=0.0,
+        max_it=1,
+        optimizer_maxiter=3,
+        random_state=57,
+        verbose=False,
+    )
+
+    assert result.diagnostics["K_max_list"] == (9, 3, 1)
+    assert len(result.K_list) == 3
+    assert all(
+        fitted <= maximum for fitted, maximum in zip(result.K_list, (9, 3, 1))
+    )
+    assert [B.shape[0] for B in result.B_list] == [
+        27,
+        result.K_list[0],
+        result.K_list[1],
+    ]
+    assert all(np.all(np.isfinite(B)) for B in result.B_list)
+
+
+def test_poisson_csp_recovers_matlab_dimensions_from_maximum_width():
+    data_seed = 40_460_917
+    fit_seed = 540_460_917
+    prop_true, B_true = _matlab_poisson_parameters()
+    B_true[0] = np.row_stack([B_true[0], np.zeros((9, 7), dtype=float)])
+    X, A_true = generate_X_poisson(
+        200, prop_true, B_true, random_state=data_seed
+    )
+
+    B_start = [np.zeros((27, 10), dtype=float), np.zeros((9, 4), dtype=float)]
+    B_start[0][:, 0] = B_true[0][:, 0]
+    B_start[0][:, 1:7] = B_true[0][:, 1:]
+    B_start[1][:6, 0] = B_true[1][:, 0]
+    B_start[1][:6, 1:3] = B_true[1][:, 1:]
+    rng = np.random.default_rng(data_seed + 101)
+    A_start = [
+        rng.integers(0, 2, size=(200, 9), dtype=np.uint8),
+        rng.integers(0, 2, size=(200, 3), dtype=np.uint8),
+    ]
+    A_start[0][:, :6] = A_true[0]
+    A_start[1][:, :2] = A_true[1]
+    prop_start = np.full(3, 0.5)
+
+    result = fit(
+        X,
+        method="DDE",
+        family="Poisson",
+        D=2,
+        dimension_method="csp",
+        prop_in=prop_start,
+        B_list_in=B_start,
+        A_list_in=A_start,
+        t_spike=[0.03, 0.05],
+        temp=0.9,
+        tau=0.3,
+        C=1,
+        tol=0.005,
+        max_it=10,
+        optimizer_maxiter=20,
+        mcem_penalty_strength=1.0,
+        mcem_shrinkage_burn=0,
+        random_state=fit_seed,
+        verbose=False,
+    )
+
+    true_dimensions = np.array([6, 2])
+    fitted_dimensions = np.asarray(result.K_list)
+    assert result.diagnostics["K_max_list"] == (9, 3)
+    assert int(np.array_equal(fitted_dimensions, true_dimensions)) == 1
+    assert int(np.sum(np.abs(fitted_dimensions - true_dimensions))) == 0
+
+
+def test_poisson_csp_data_initialization_recovers_matlab_dimensions():
+    data_seed = 40_760_918
+    fit_seed = 540_760_918
+    prop_true, B_true = _matlab_poisson_parameters()
+    B_true[0] = np.row_stack([B_true[0], np.zeros((9, 7), dtype=float)])
+    X, _ = generate_X_poisson(500, prop_true, B_true, random_state=data_seed)
+
+    result = fit(
+        X,
+        method="DDE",
+        family="Poisson",
+        D=2,
+        dimension_method="csp",
+        t_spike=[0.03, 0.05],
+        temp=0.9,
+        tau=0.3,
+        C=1,
+        max_it=50,
+        optimizer_maxiter=100,
+        random_state=fit_seed,
+        verbose=False,
+    )
+
+    assert result.diagnostics["K_max_list"] == (9, 3)
+    assert result.K_list == [6, 2]
+    assert all(np.all(np.isfinite(B)) for B in result.B_list)
+
+
+def test_public_poisson_rejects_gamma():
+    X, _, _, _ = _small_poisson_state(54)
 
     with pytest.raises(ValueError, match="no dispersion"):
         fit(

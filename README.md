@@ -87,8 +87,8 @@ established settings; Normal also retains its synchronous approximate-MCEM
 transition for numerical backward compatibility.
 
 Poisson DDE uses a canonical log link, requires finite nonnegative integer
-counts, and has no `gamma` dispersion parameter. It currently supports only
-fixed-width estimation, with any positive number of latent layers:
+counts, and has no `gamma` dispersion parameter. Fixed-width estimation
+supports any positive number of latent layers:
 
 ```python
 result = fit(
@@ -104,3 +104,27 @@ result = fit(
     tol=0.005,
 )
 ```
+
+Poisson CSP uses the same maximum-width initialization and cumulative
+shrinkage state as the other parametric families. Its observed M-step solves
+the tempered Poisson likelihood with CSP-weighted L1 penalties by bounded
+backtracking FISTA, while its latent E-step uses persistent systematic Gibbs:
+
+```python
+result = fit(
+    Y_counts,
+    method="DDE",
+    family="Poisson",
+    D=3,
+    dimension_method="csp",
+    t_spike=[0.01, 0.03, 0.005],
+    temp=0.9,
+    tau=0.3,
+    C=1,
+    random_state=123,
+)
+```
+
+Run `scripts/evaluate_poisson_csp_recovery.py` for checkpointed dimension
+recovery experiments. Its primary summary columns are the exact shrinkage
+recovery rate and the mean L1 distance between fitted and true width vectors.
