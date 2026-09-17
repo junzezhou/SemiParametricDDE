@@ -730,6 +730,7 @@ def fit_parametric_csp_mcem(
     verbose: bool = True,
     latent_transition=None,
     canonicalize_initial_order=None,
+    initial_csp_state=None,
     family,
 ):
     """Fit a maximal-width parametric DDE under layer-wise CSP priors.
@@ -865,25 +866,73 @@ def fit_parametric_csp_mcem(
             "penalty_strength entries must be finite and positive."
         )
     rng = _as_rng(random_state)
-    slab_scale = [np.ones(Kd, dtype=float) for Kd in K]
-    omega = [np.ones(Kd + 1, dtype=float) / (Kd + 1) for Kd in K]
-    if stagewise or shrinkage_burn:
-        allocation = [np.full(Kd, Kd + 1, dtype=int) for Kd in K]
-        penalty_scale = [
-            np.ones((J if d == 0 else K[d - 1], K[d]), dtype=float)
-            for d in range(D)
-        ]
+    if initial_csp_state is None:
+        slab_scale = [np.ones(Kd, dtype=float) for Kd in K]
+        omega = [np.ones(Kd + 1, dtype=float) / (Kd + 1) for Kd in K]
+        if stagewise or shrinkage_burn:
+            allocation = [np.full(Kd, Kd + 1, dtype=int) for Kd in K]
+            penalty_scale = [
+                np.ones((J if d == 0 else K[d - 1], K[d]), dtype=float)
+                for d in range(D)
+            ]
+        else:
+            allocation = [np.full(Kd, np.floor(Kd / 2), dtype=int) for Kd in K]
+            penalty_scale = [
+                np.full((J if d == 0 else K[d - 1], K[d]), spike_scales[d])
+                for d in range(D)
+            ]
+        active_masks = [np.ones(Kd, dtype=bool) for Kd in K]
+        num_active = np.asarray(K, dtype=int)
+        current_temperature = temperature
     else:
-        allocation = [np.full(Kd, np.floor(Kd / 2), dtype=int) for Kd in K]
-        penalty_scale = [
-            np.full((J if d == 0 else K[d - 1], K[d]), spike_scales[d])
-            for d in range(D)
+        if stagewise or shrinkage_burn:
+            raise ValueError(
+                "initial_csp_state only supports simultaneous CSP without "
+                "shrinkage_burn."
+            )
+        slab_scale = [
+            np.asarray(value, dtype=float).copy()
+            for value in initial_csp_state["slab_scale"]
         ]
-    active_masks = [np.ones(Kd, dtype=bool) for Kd in K]
-    num_active = np.asarray(K, dtype=int)
+        omega = [
+            np.asarray(value, dtype=float).copy()
+            for value in initial_csp_state["omega"]
+        ]
+        allocation = [
+            np.asarray(value, dtype=int).copy()
+            for value in initial_csp_state["allocation"]
+        ]
+        active_masks = [csp_active_mask(value) for value in allocation]
+        num_active = np.asarray(
+            [np.sum(value) for value in active_masks], dtype=int
+        )
+        penalty_scale = [
+            np.broadcast_to(
+                np.where(mask, slab, spike)[None, :],
+                (J if d == 0 else K[d - 1], K[d]),
+            ).copy()
+            for d, (mask, slab, spike) in enumerate(
+                zip(active_masks, slab_scale, spike_scales)
+            )
+        ]
+        current_temperature = float(
+            initial_csp_state.get("temperature", temperature)
+        )
+        expected_shapes = [
+            (Kd, Kd + 1, (J if d == 0 else K[d - 1], Kd))
+            for d, Kd in enumerate(K)
+        ]
+        for d, (Kd, omega_size, penalty_shape) in enumerate(expected_shapes):
+            if slab_scale[d].shape != (Kd,):
+                raise ValueError("initial_csp_state slab_scale shape mismatch.")
+            if omega[d].shape != (omega_size,):
+                raise ValueError("initial_csp_state omega shape mismatch.")
+            if allocation[d].shape != (Kd,):
+                raise ValueError("initial_csp_state allocation shape mismatch.")
+            if penalty_scale[d].shape != penalty_shape:
+                raise ValueError("initial_csp_state penalty_scale shape mismatch.")
     relative_history = [[] for _ in range(D)]
     trace = [] if keep_trace else None
-    current_temperature = temperature
     active_stage = 0 if stagewise else D - 1
     stage_iteration = 0
     stage_width_history = []

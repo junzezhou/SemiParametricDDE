@@ -1,0 +1,2 @@
+scenario,true_widths,max_widths,n_requested,n_successful,dimension_shrinkage_accuracy,mean_dimension_l1_error
+"D=2, J=54","[9, 3]","[18, 6]",100,100,0.83,0.18

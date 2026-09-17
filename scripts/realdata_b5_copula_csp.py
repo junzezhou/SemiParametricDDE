@@ -1,4 +1,4 @@
-"""Run the Big Five real-data CopDDE-CSP analysis with semidde.
+"""Run the Big Five real-data CopDDE-CSP analysis with dde.
 
 The workflow mirrors ``DDE-Copula-m/Scripts/B5.m`` as closely as the package
 interface allows:
@@ -37,7 +37,7 @@ from sklearn.tree import DecisionTreeClassifier
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SEMIDDE_ROOT = REPO_ROOT / "SemiDDE"
+DDE_ROOT = REPO_ROOT / "dde"
 DATA_DIR = REPO_ROOT / "Data"
 DEFAULT_SAV = DATA_DIR / "WASU0003_B5_OUTPUT.sav"
 DEFAULT_OUT_DIR = REPO_ROOT / "Results" / "realdata_b5_copula_csp"
@@ -77,8 +77,8 @@ def _json_default(obj: Any) -> Any:
     return str(obj)
 
 
-def _ensure_semidde_on_path() -> None:
-    src = str(SEMIDDE_ROOT / "src")
+def _ensure_dde_on_path() -> None:
+    src = str(DDE_ROOT / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
 
@@ -404,10 +404,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    _ensure_semidde_on_path()
-    from semidde import select_hyperparameters
-    from semidde.algorithms.copula import normal_initialize_copula_dde
-    from semidde.copula import simulate_gaussian_mixture
+    _ensure_dde_on_path()
+    from dde import select_hyperparameters
+    from dde.algorithms.copula import normal_initialize_copula_dde
+    from dde.copula import simulate_gaussian_mixture
 
     data = load_b5_data(args.sav_path)
     Z_init = simulate_gaussian_mixture(

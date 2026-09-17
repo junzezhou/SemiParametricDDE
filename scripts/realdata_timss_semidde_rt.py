@@ -19,7 +19,7 @@ from scipy.optimize import linear_sum_assignment
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SEMIDDE_ROOT = REPO_ROOT / "SemiDDE"
+DDE_ROOT = REPO_ROOT / "dde"
 DATA_DIR = REPO_ROOT / "Deep-Discrete-Encoders" / "real data" / "TIMSS" / "dataset"
 DEFAULT_OUT_DIR = REPO_ROOT / "Results" / "realdata_timss_semidde_rt"
 
@@ -52,8 +52,8 @@ def _json_default(obj: Any) -> Any:
     return str(obj)
 
 
-def _ensure_semidde_on_path() -> None:
-    src = str(SEMIDDE_ROOT / "src")
+def _ensure_dde_on_path() -> None:
+    src = str(DDE_ROOT / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
 
@@ -74,7 +74,7 @@ def load_timss_rt() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def make_candidates(n: int, d: int, *, wide: bool = False) -> list[dict[str, Any]]:
-    from semidde import auto_grid
+    from dde import auto_grid
 
     if not wide:
         candidates = auto_grid(n, d)
@@ -176,8 +176,8 @@ def main() -> None:
     parser.add_argument("--ebic-gamma", type=float, default=1.0)
     args = parser.parse_args()
 
-    _ensure_semidde_on_path()
-    from semidde import select_hyperparameters
+    _ensure_dde_on_path()
+    from dde import select_hyperparameters
 
     y, q_matrix, survey = load_timss_rt()
     args.out_dir.mkdir(parents=True, exist_ok=True)

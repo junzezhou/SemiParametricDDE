@@ -1783,6 +1783,67 @@ def compute_marginal_pmf_A1(prop, B_list, query_patterns=None,
     return _marginalize_mc_forward(pmf, K_enum, B_chain, K_chain,
                                    B_last, query_patterns,
                                    mc_samples=mc_samples)
+
+
+def _semiparametric_g_step(
+    Y,
+    X,
+    prop,
+    B_list,
+    A1,
+    *,
+    delta,
+    max_enum_bits=20,
+    mc_samples=50000,
+    g_update_rho=1.0,
+):
+    """Update the SemiDDE pseudo-observations for one outer iteration.
+
+    Keeping this step independent of the inner estimator lets the fixed-width
+    SAEM and CSP-MCEM paths use exactly the same semiparametric observation
+    update.  ``B_list`` and ``A1`` may already be compressed to the currently
+    active CSP coordinates.
+    """
+    Y = np.asarray(Y, dtype=float)
+    X = np.asarray(X, dtype=float)
+    A1 = np.asarray(A1)
+    N, J = Y.shape
+    K1 = int(A1.shape[1])
+    sparse_mode = K1 > int(max_enum_bits)
+
+    if sparse_mode:
+        dec_full = patterns_to_int(A1)
+        unique_vals, dec = np.unique(dec_full, return_inverse=True)
+        unique_patterns = binary(unique_vals, K1)
+        pi_alpha = compute_marginal_pmf_A1(
+            prop,
+            B_list,
+            query_patterns=unique_patterns,
+            max_enum_bits=max_enum_bits,
+            mc_samples=mc_samples,
+        )
+        n_classes = unique_vals.shape[0]
+    else:
+        weights = np.int64(1) << np.arange(
+            K1 - 1, -1, -1, dtype=np.int64
+        )
+        dec = (A1.astype(np.int64) @ weights).astype(int)
+        n_classes = 1 << K1
+        pi_alpha = compute_marginal_pmf_A1(
+            prop,
+            B_list,
+            max_enum_bits=max_enum_bits,
+            mc_samples=mc_samples,
+        )
+
+    g_new = g_est_rversion(
+        Y, dec, N, J, n_classes, pi_alpha, delta
+    )
+    X_next = (1.0 - g_update_rho) * X + g_update_rho * g_new
+    diff = np.mean(np.abs(X_next - X)) / (
+        np.mean(np.abs(X)) + 1e-8
+    )
+    return X_next, g_new, float(diff)
  
  
 # ============================================================
@@ -1841,7 +1902,6 @@ def get_SAEM_semiparametricv1(
     D = len(B_list_in)
     K = [B_list_in[d].shape[1] - 1 for d in range(D)]
     K1 = K[0]
-    sparse_mode = (K1 > max_enum_bits)
  
     prop   = np.asarray(prop_in, dtype=float).copy()
     B_list = [np.asarray(B, dtype=float).copy() for B in B_list_in]
@@ -1863,29 +1923,17 @@ def get_SAEM_semiparametricv1(
         if verbose:
             print("Updating g ...")
  
-        if sparse_mode:
-            dec_full = patterns_to_int(A_list[0])
-            unique_vals, inverse = np.unique(dec_full, return_inverse=True)
-            n_classes = unique_vals.shape[0]
- 
-            unique_patterns = binary(unique_vals, K1)
-            unique_probs = compute_marginal_pmf_A1(
-                prop, B_list,
-                query_patterns=unique_patterns,
-                max_enum_bits=max_enum_bits,
-                mc_samples=mc_samples)
- 
-            dec = inverse
-            pi_alpha = unique_probs
-        else:
-            weights = np.int64(1) << np.arange(K1 - 1, -1, -1, dtype=np.int64)
-            dec = (A_list[0].astype(np.int64) @ weights).astype(int)
-            n_classes = 1 << K1
-            pi_alpha = compute_marginal_pmf_A1(
-                prop, B_list,
-                max_enum_bits=max_enum_bits)
- 
-        g_new = g_est_rversion(Y, dec, N, J, n_classes, pi_alpha, delta)
+        X_next, g_new, diff = _semiparametric_g_step(
+            Y,
+            X,
+            prop,
+            B_list,
+            A_list[0],
+            delta=delta,
+            max_enum_bits=max_enum_bits,
+            mc_samples=mc_samples,
+            g_update_rho=g_update_rho,
+        )
  
         if X_true is not None and verbose:
             rmse = np.sqrt(np.mean((X_true - g_new) ** 2))
@@ -1902,8 +1950,6 @@ def get_SAEM_semiparametricv1(
         #     X = g_new.copy()
         #     break
         # X = g_new.copy()
-        X_next = (1.0 - g_update_rho) * X + g_update_rho * g_new
-        diff = np.mean(np.abs(X_next - X)) / (np.mean(np.abs(X)) + 1e-8)
         if verbose:
             print(f"diff g = {diff:.3e}")
         if diff < 1e-2:

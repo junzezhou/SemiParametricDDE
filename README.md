@@ -40,6 +40,31 @@ result = fit(
 )
 ```
 
+SemiDDE supports the same maximum-width CSP initialization while retaining
+its semiparametric pseudo-observation update.  `D` fixes the hierarchy depth;
+the fitted active widths are returned in `result.K_list`:
+
+```python
+result = fit(
+    Y_continuous,
+    model="SemiDDE",
+    D=2,
+    dimension_method="csp",
+    t_spike=[0.04, 0.08],
+    temp=0.8,
+    tau=0.3,
+    C=1,
+    tol=0.005,
+    max_it=50,
+    random_state=123,
+)
+```
+
+Run `scripts/evaluate_semidde_csp_recovery.py` for checkpointed recovery
+experiments under nonlinear continuous margins. Its primary summary columns
+are the exact dimension-shrinkage recovery rate and the mean L1 distance
+between fitted and true width vectors.
+
 Parametric CSP provides three MCEM backends.  ``"mcem"`` retains the original
 simultaneous MCEM updates, ``"mcem_reinitialize"`` activates CSP layer by
 layer and rebuilds each waiting parent, and ``"mcem_cap_only"`` uses the same

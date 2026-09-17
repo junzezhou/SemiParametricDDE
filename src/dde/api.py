@@ -62,19 +62,22 @@ def fit(
         Alias for ``method`` retained for the manuscript's current examples.
         Supplying conflicting values raises an error.
     D:
-        Number of stochastic binary latent layers. Required for DDE fits.
+        Number of stochastic binary latent layers. Required for parametric DDE
+        fits and SemiDDE CSP fits; fixed-width SemiDDE can infer it from
+        ``K_list``.
     family:
         Parametric observed-data family. Required when ``method="DDE"``.
     K_list:
         Layer widths ordered from the shallowest latent layer to the deepest.
-        Required for fixed-width fits and omitted for parametric-DDE CSP fits,
-        whose maximal widths are derived recursively from the observed width.
+        Required for fixed-width fits and omitted for parametric-DDE and
+        SemiDDE CSP fits, whose maximal widths are derived recursively from
+        the observed width.
     variable_types:
         Optional variable type labels used when ``model="auto"``.
     dimension_method:
         ``"fixed"`` for supplied widths, or ``"csp"`` for CSP-based width
-        selection in supported parametric DDE and copula estimators. If omitted,
-        SemiDDE uses ``"fixed"`` and CopDDE uses ``"csp"``.
+        selection. If omitted, SemiDDE uses ``"fixed"`` and CopDDE uses
+        ``"csp"``.
     **kwargs:
         Algorithm-specific keyword arguments.
     """
@@ -113,9 +116,15 @@ def fit(
         from .algorithms.semi import fit_semidde
 
         method = "fixed" if dimension_method is None else str(dimension_method).lower()
-        if method != "fixed":
-            raise ValueError("SemiDDE supports only dimension_method='fixed'.")
-        return fit_semidde(Y, K_list=K_list, dimension_method=method, **kwargs)
+        if method not in {"fixed", "csp"}:
+            raise ValueError("SemiDDE dimension_method must be 'fixed' or 'csp'.")
+        return fit_semidde(
+            Y,
+            D=D,
+            K_list=K_list,
+            dimension_method=method,
+            **kwargs,
+        )
 
     if chosen in {"copula", "copdde"}:
         from .algorithms.copula import fit_copula_dde
