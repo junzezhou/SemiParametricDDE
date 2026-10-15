@@ -59,8 +59,9 @@ def _parse_args():
         choices=["first_two", "all_but_last", "none"],
     )
     parser.add_argument(
-        "--mstep-solver", default="hybrid", choices=["lbfgsb", "fista", "hybrid"],
-        help="copula backend M-step; 'lbfgsb' reproduces the main_r20 baseline",
+        "--mstep-solver", default="hybrid",
+        help="copula backend M-step: lbfgsb, fista, hybrid, or a comma-separated "
+             "per-layer list such as fista,fista,lbfgsb",
     )
     parser.add_argument("--fista-maxiter", type=int, default=None,
                         help="copula backend: FISTA budget (default: package default, 300)")
@@ -152,7 +153,8 @@ def _run_one(task):
     kwargs["optimizer_maxiter"] = optimizer_maxiter
     if backend == "copula":
         kwargs["csp_threshold_rule"] = settings["threshold_rule"]
-        kwargs["csp_mstep_solver"] = settings["mstep_solver"]
+        solver = settings["mstep_solver"]
+        kwargs["csp_mstep_solver"] = solver.split(",") if "," in solver else solver
         kwargs["csp_mstep_latent"] = settings.get("mstep_latent", "draw")
         kwargs["csp_observed_noise_scale"] = settings.get("observed_noise_scale", 0.0)
         kwargs["csp_fista_maxiter"] = settings.get("fista_maxiter")

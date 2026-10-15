@@ -186,6 +186,26 @@ def test_fit_forwards_hybrid_solver_controls():
     assert result.diagnostics["observed_noise_scale"] == 0.0
 
 
+def test_per_layer_mstep_solver_sequence():
+    inputs = _inputs()
+    args = (inputs["X"], inputs["prop"], inputs["gamma"],
+            _copy(inputs["B_list"]), _copy(inputs["A_list"]))
+    base = dict(C=1, it=2, t_spike=0.02, temp=0.9, tau=0.3, verbose=False,
+                random_state=3)
+    hybrid = fit_normal_csp_copula(*args, mstep_solver="hybrid", **base)
+    seq = fit_normal_csp_copula(*args, mstep_solver=["fista", "lbfgsb"], **base)
+    assert seq["mstep_solver"] == "hybrid"
+    assert seq["layer_solvers"] == ("fista", "lbfgsb")
+    for B_1, B_2 in zip(hybrid["B_list"], seq["B_list"]):
+        np.testing.assert_array_equal(B_1, B_2)
+    other = fit_normal_csp_copula(*args, mstep_solver=["lbfgsb", "fista"], **base)
+    assert other["mstep_solver"] == "lbfgsb+fista"
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, mstep_solver=["fista"], **base)
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, mstep_solver=["fista", "bogus"], **base)
+
+
 def test_invalid_controls_raise():
     inputs = _inputs()
     base = dict(C=1, it=1, t_spike=0.02, temp=0.9, tau=0.3, verbose=False)

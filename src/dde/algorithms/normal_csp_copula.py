@@ -165,8 +165,9 @@ def fit_normal_csp_copula(
         (MATLAB D-layer rule), or ``"none"``.
     mstep_solver : ``"hybrid"`` (default: FISTA for the observed Gaussian
         layer, L-BFGS-B for the logistic layers), ``"lbfgsb"`` (CopDDE:
-        L-BFGS-B in every layer), or ``"fista"`` (exact weighted lasso via
-        the Normal family's proximal solver in every layer).
+        L-BFGS-B in every layer), ``"fista"`` (exact weighted lasso via
+        the Normal family's proximal solver in every layer), or a length-``D``
+        sequence of ``"fista"`` / ``"lbfgsb"`` giving the solver per layer.
     fista_maxiter : iteration budget of the FISTA solves; ``None`` selects
         ``300``.  Budgets below about 100 leave duplicate columns at large
         ``N`` because the per-iteration transfer of loading mass scales with
@@ -239,11 +240,36 @@ def fit_normal_csp_copula(
         raise ValueError(
             "threshold_rule must be one of " + ", ".join(_THRESHOLD_RULES) + "."
         )
-    mstep_solver = str(mstep_solver).strip().lower()
-    if mstep_solver not in _MSTEP_SOLVERS:
-        raise ValueError(
-            "mstep_solver must be one of " + ", ".join(_MSTEP_SOLVERS) + "."
-        )
+    if isinstance(mstep_solver, str):
+        mstep_solver = mstep_solver.strip().lower()
+        if mstep_solver not in _MSTEP_SOLVERS:
+            raise ValueError(
+                "mstep_solver must be one of " + ", ".join(_MSTEP_SOLVERS)
+                + " or a length-D sequence of 'fista'/'lbfgsb'."
+            )
+        if mstep_solver == "fista":
+            layer_solvers = ("fista",) * D
+        elif mstep_solver == "lbfgsb":
+            layer_solvers = ("lbfgsb",) * D
+        else:
+            layer_solvers = ("fista",) + ("lbfgsb",) * (D - 1)
+    else:
+        layer_solvers = tuple(str(value).strip().lower() for value in mstep_solver)
+        if len(layer_solvers) != D or any(
+            value not in ("fista", "lbfgsb") for value in layer_solvers
+        ):
+            raise ValueError(
+                "A per-layer mstep_solver must be a length-D sequence of "
+                "'fista'/'lbfgsb'."
+            )
+        if all(value == "fista" for value in layer_solvers):
+            mstep_solver = "fista"
+        elif all(value == "lbfgsb" for value in layer_solvers):
+            mstep_solver = "lbfgsb"
+        elif layer_solvers == ("fista",) + ("lbfgsb",) * (D - 1):
+            mstep_solver = "hybrid"
+        else:
+            mstep_solver = "+".join(layer_solvers)
     mstep_latent = str(mstep_latent).strip().lower()
     if mstep_latent not in _MSTEP_LATENTS:
         raise ValueError(
@@ -255,8 +281,7 @@ def fit_normal_csp_copula(
     fista_maxiter = _DEFAULT_FISTA_MAXITER if fista_maxiter is None else int(fista_maxiter)
     if fista_maxiter < 1:
         raise ValueError("fista_maxiter must be a positive integer.")
-    observed_fista = mstep_solver in ("fista", "hybrid")
-    logistic_fista = mstep_solver == "fista"
+    observed_fista = layer_solvers[0] == "fista"
     slab_shape = float(slab_shape)
     slab_rate = float(slab_rate)
     penalty_scaling_power = np.asarray(penalty_scaling_power, dtype=float).reshape(-1)
@@ -387,7 +412,7 @@ def fit_normal_csp_copula(
 
         # 6) Logistic layers.
         for d in range(1, D):
-            if not logistic_fista:
+            if layer_solvers[d] != "fista":
                 B_update[d] = _optimize_logistic_layer(
                     A_mstep[d - 1], A_mstep[d], B_list[d], theta_mstep[d],
                     temp, lb[d], ub[d], optimizer_maxiter, n_jobs,
@@ -495,6 +520,7 @@ def fit_normal_csp_copula(
         "temperature": float(temp),
         "threshold_rule": threshold_rule,
         "mstep_solver": mstep_solver,
+        "layer_solvers": layer_solvers,
         "mstep_latent": mstep_latent,
         "observed_noise_scale": observed_noise_scale,
         "optimizer_maxiter": optimizer_maxiter,
