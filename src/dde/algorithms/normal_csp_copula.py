@@ -51,9 +51,9 @@ from .parametric_families import _solve_gaussian_weighted_l1
 
 
 _THRESHOLD_RULES = ("first_two", "all_but_last", "none")
-_MSTEP_SOLVERS = ("lbfgsb", "fista", "hybrid")
+_MSTEP_SOLVERS = ("lbfgsb", "fista", "hybrid", "fista_lower")
 _MSTEP_LATENTS = ("draw", "mean_field")
-_PENALTY_SCALING_LAYERS = ("all", "deep")
+_PENALTY_SCALING_LAYERS = ("all", "deep", "lower")
 _DEFAULT_OPTIMIZER_MAXITER = 15
 _DEFAULT_FISTA_MAXITER = 300
 
@@ -166,8 +166,10 @@ def fit_normal_csp_copula(
     mstep_solver : ``"hybrid"`` (default: FISTA for the observed Gaussian
         layer, L-BFGS-B for the logistic layers), ``"lbfgsb"`` (CopDDE:
         L-BFGS-B in every layer), ``"fista"`` (exact weighted lasso via
-        the Normal family's proximal solver in every layer), or a length-``D``
-        sequence of ``"fista"`` / ``"lbfgsb"`` giving the solver per layer.
+        the Normal family's proximal solver in every layer),
+        ``"fista_lower"`` (FISTA in layers 1..D-1 and L-BFGS-B in the deepest
+        layer), or a length-``D`` sequence of ``"fista"`` / ``"lbfgsb"``
+        giving the solver per layer.
     fista_maxiter : iteration budget of the FISTA solves; ``None`` selects
         ``300``.  Budgets below about 100 leave duplicate columns at large
         ``N`` because the per-iteration transfer of loading mass scales with
@@ -191,8 +193,9 @@ def fit_normal_csp_copula(
         to the CopDDE penalty on the average likelihood; power 0.5 is the
         ``sqrt(N)`` rate).  ``penalty_scaling_power`` may be a length-``D``
         sequence of per-layer powers.
-    penalty_scaling_layers : ``"all"`` or ``"deep"`` (layers 2..D only);
-        with a per-layer power sequence, ``"deep"`` zeroes the first power.
+    penalty_scaling_layers : ``"all"``, ``"deep"`` (layers 2..D only), or
+        ``"lower"`` (layers 1..D-1, leaving the deepest layer unscaled); with
+        a per-layer power sequence the excluded layers' powers are zeroed.
     penalty_scaling_allocation : when ``True`` the CUSP allocation evaluates
         the spike and slab densities on the scaled coefficients ``c_N * B``,
         which is the allocation implied by the scaled prior
@@ -251,6 +254,8 @@ def fit_normal_csp_copula(
             layer_solvers = ("fista",) * D
         elif mstep_solver == "lbfgsb":
             layer_solvers = ("lbfgsb",) * D
+        elif mstep_solver == "fista_lower":
+            layer_solvers = ("fista",) * (D - 1) + ("lbfgsb",)
         else:
             layer_solvers = ("fista",) + ("lbfgsb",) * (D - 1)
     else:
@@ -268,6 +273,8 @@ def fit_normal_csp_copula(
             mstep_solver = "lbfgsb"
         elif layer_solvers == ("fista",) + ("lbfgsb",) * (D - 1):
             mstep_solver = "hybrid"
+        elif layer_solvers == ("fista",) * (D - 1) + ("lbfgsb",):
+            mstep_solver = "fista_lower"
         else:
             mstep_solver = "+".join(layer_solvers)
     mstep_latent = str(mstep_latent).strip().lower()
@@ -337,6 +344,8 @@ def fit_normal_csp_copula(
     effective_power = penalty_scaling_power.copy()
     if penalty_scaling_layers == "deep":
         effective_power[0] = 0.0
+    elif penalty_scaling_layers == "lower":
+        effective_power[-1] = 0.0
     penalty_factor = (N / penalty_scaling_reference) ** effective_power
     theta_mstep = [value.copy() for value in theta]
     rel_hist = [[] for _ in range(D)]

@@ -200,6 +200,16 @@ def test_per_layer_mstep_solver_sequence():
         np.testing.assert_array_equal(B_1, B_2)
     other = fit_normal_csp_copula(*args, mstep_solver=["lbfgsb", "fista"], **base)
     assert other["mstep_solver"] == "lbfgsb+fista"
+    lower = fit_normal_csp_copula(*args, mstep_solver="fista_lower", **base)
+    assert lower["layer_solvers"] == ("fista", "lbfgsb")
+    assert lower["mstep_solver"] == "fista_lower"
+    for B_1, B_2 in zip(hybrid["B_list"], lower["B_list"]):
+        np.testing.assert_array_equal(B_1, B_2)  # identical for D=2
+    scaled_lower = fit_normal_csp_copula(
+        *args, penalty_scaling_power=1.0, penalty_scaling_reference=10.0,
+        penalty_scaling_layers="lower", **base
+    )
+    assert scaled_lower["penalty_factor"] == (inputs["X"].shape[0] / 10.0, 1.0)
     with pytest.raises(ValueError):
         fit_normal_csp_copula(*args, mstep_solver=["fista"], **base)
     with pytest.raises(ValueError):

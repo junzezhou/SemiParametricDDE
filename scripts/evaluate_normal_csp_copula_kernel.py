@@ -73,7 +73,7 @@ def _parse_args():
                         help="copula backend: penalty multiplier (N / reference) ** power; "
                              "one value or one per layer")
     parser.add_argument("--penalty-reference", type=float, default=500.0)
-    parser.add_argument("--penalty-layers", default="all", choices=["all", "deep"])
+    parser.add_argument("--penalty-layers", default="all", choices=["all", "deep", "lower"])
     parser.add_argument("--penalty-allocation", action="store_true",
                         help="copula backend: CUSP allocation sees the scaled coefficients")
     parser.add_argument(
