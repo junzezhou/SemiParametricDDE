@@ -68,8 +68,9 @@ def _parse_args():
                         help="copula backend: Gamma shape of the slab-rate hyperprior (CopDDE 1)")
     parser.add_argument("--slab-rate", type=float, default=5.0,
                         help="copula backend: Gamma rate of the slab-rate hyperprior (CopDDE 5)")
-    parser.add_argument("--penalty-power", type=float, default=0.0,
-                        help="copula backend: penalty multiplier (N / reference) ** power")
+    parser.add_argument("--penalty-power", type=float, nargs="+", default=[0.0],
+                        help="copula backend: penalty multiplier (N / reference) ** power; "
+                             "one value or one per layer")
     parser.add_argument("--penalty-reference", type=float, default=500.0)
     parser.add_argument("--penalty-layers", default="all", choices=["all", "deep"])
     parser.add_argument("--penalty-allocation", action="store_true",
@@ -157,7 +158,10 @@ def _run_one(task):
         kwargs["csp_fista_maxiter"] = settings.get("fista_maxiter")
         kwargs["csp_slab_shape"] = settings.get("slab_shape", 1.0)
         kwargs["csp_slab_rate"] = settings.get("slab_rate", 5.0)
-        kwargs["csp_penalty_scaling_power"] = settings.get("penalty_power", 0.0)
+        power = settings.get("penalty_power", 0.0)
+        kwargs["csp_penalty_scaling_power"] = (
+            power[0] if isinstance(power, (list, tuple)) and len(power) == 1 else power
+        )
         kwargs["csp_penalty_scaling_reference"] = settings.get("penalty_reference", 500.0)
         kwargs["csp_penalty_scaling_layers"] = settings.get("penalty_layers", "all")
         kwargs["csp_penalty_scaling_allocation"] = settings.get("penalty_allocation", False)

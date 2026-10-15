@@ -188,8 +188,10 @@ def fit_normal_csp_copula(
         (power 0, the CopDDE default, leaves the O(1) prior against the O(N)
         likelihood; power 1 makes the penalty proportional to N, equivalent
         to the CopDDE penalty on the average likelihood; power 0.5 is the
-        ``sqrt(N)`` rate).
-    penalty_scaling_layers : ``"all"`` or ``"deep"`` (layers 2..D only).
+        ``sqrt(N)`` rate).  ``penalty_scaling_power`` may be a length-``D``
+        sequence of per-layer powers.
+    penalty_scaling_layers : ``"all"`` or ``"deep"`` (layers 2..D only);
+        with a per-layer power sequence, ``"deep"`` zeroes the first power.
     penalty_scaling_allocation : when ``True`` the CUSP allocation evaluates
         the spike and slab densities on the scaled coefficients ``c_N * B``,
         which is the allocation implied by the scaled prior
@@ -257,11 +259,19 @@ def fit_normal_csp_copula(
     logistic_fista = mstep_solver == "fista"
     slab_shape = float(slab_shape)
     slab_rate = float(slab_rate)
-    penalty_scaling_power = float(penalty_scaling_power)
+    penalty_scaling_power = np.asarray(penalty_scaling_power, dtype=float).reshape(-1)
+    if penalty_scaling_power.size == 1:
+        penalty_scaling_power = np.repeat(penalty_scaling_power.item(), D)
+    if penalty_scaling_power.size != D:
+        raise ValueError(
+            "penalty_scaling_power must be a scalar or a length-D sequence."
+        )
     penalty_scaling_reference = float(penalty_scaling_reference)
     penalty_scaling_layers = str(penalty_scaling_layers).strip().lower()
     penalty_scaling_allocation = bool(penalty_scaling_allocation)
-    if not np.isfinite(penalty_scaling_power) or penalty_scaling_power < 0:
+    if not np.all(np.isfinite(penalty_scaling_power)) or np.any(
+        penalty_scaling_power < 0
+    ):
         raise ValueError("penalty_scaling_power must be finite and nonnegative.")
     if not np.isfinite(penalty_scaling_reference) or penalty_scaling_reference <= 0:
         raise ValueError("penalty_scaling_reference must be finite and positive.")
@@ -299,11 +309,10 @@ def fit_normal_csp_copula(
     ]
     num_act = np.asarray(K, dtype=int)
     ind_inact = [np.zeros(0, dtype=int) for _ in range(D)]
-    penalty_factor = np.ones(D, dtype=float)
-    if penalty_scaling_power > 0:
-        c_N = (N / penalty_scaling_reference) ** penalty_scaling_power
-        first_scaled = 1 if penalty_scaling_layers == "deep" else 0
-        penalty_factor[first_scaled:] = c_N
+    effective_power = penalty_scaling_power.copy()
+    if penalty_scaling_layers == "deep":
+        effective_power[0] = 0.0
+    penalty_factor = (N / penalty_scaling_reference) ** effective_power
     theta_mstep = [value.copy() for value in theta]
     rel_hist = [[] for _ in range(D)]
     trace = [] if keep_trace else None
@@ -492,7 +501,7 @@ def fit_normal_csp_copula(
         "fista_maxiter": fista_maxiter,
         "slab_shape": slab_shape,
         "slab_rate": slab_rate,
-        "penalty_scaling_power": penalty_scaling_power,
+        "penalty_scaling_power": tuple(float(value) for value in penalty_scaling_power),
         "penalty_scaling_reference": penalty_scaling_reference,
         "penalty_scaling_layers": penalty_scaling_layers,
         "penalty_scaling_allocation": penalty_scaling_allocation,

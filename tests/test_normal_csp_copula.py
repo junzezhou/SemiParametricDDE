@@ -360,6 +360,14 @@ def test_penalty_scaling_multiplies_mstep_weights_and_is_recorded():
         penalty_scaling_layers="deep", **base
     )
     assert deep["penalty_factor"] == (1.0, (N / 10.0) ** 0.5)
+    per_layer = fit_normal_csp_copula(
+        *args, penalty_scaling_power=[1.0, 0.5], penalty_scaling_reference=10.0,
+        **base
+    )
+    assert per_layer["penalty_factor"] == (N / 10.0, (N / 10.0) ** 0.5)
+    assert per_layer["penalty_scaling_power"] == (1.0, 0.5)
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, penalty_scaling_power=[1.0, 0.5, 0.2], **base)
     # A much larger penalty shrinks the coefficient mass.
     heavy = fit_normal_csp_copula(
         *args, penalty_scaling_power=1.0, penalty_scaling_reference=1e-3, **base
@@ -391,7 +399,7 @@ def test_fit_passes_slab_and_penalty_scaling_controls():
     )
     d = result.diagnostics
     assert d["slab_shape"] == 5.0 and d["slab_rate"] == 1.0
-    assert d["penalty_scaling_power"] == 0.5
+    assert d["penalty_scaling_power"] == (0.5, 0.5)
     assert d["penalty_scaling_layers"] == "deep"
     assert d["penalty_scaling_allocation"] is True
     assert d["penalty_factor"] == (1.0, (150 / 500.0) ** 0.5)
