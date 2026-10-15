@@ -61,6 +61,8 @@ def update_csp_layer(
     num_rows: int,
     *,
     rng: Optional[object] = None,
+    slab_shape: float = 1.0,
+    slab_rate: float = 5.0,
 ):
     """Perform the CopDDE CSP allocation, stick, and slab-scale update.
 
@@ -68,6 +70,15 @@ def update_csp_layer(
     and ``slab_scale`` are Laplace scales, not rates.  When ``rng`` is omitted,
     NumPy's legacy global RNG is used so the extracted implementation remains
     fixed-seed equivalent to the original CopDDE function.
+
+    The slab places a Gamma(``slab_shape``, ``slab_rate``) hyperprior on the
+    Laplace rate ``1 / slab_scale`` of each slab column; the CopDDE values are
+    shape 1 and rate 5.  The slab marginal density of a column with L1 norm
+    ``S`` over ``num_rows`` rows is then
+    ``rate^shape / Gamma(shape) * Gamma(shape + num_rows) / (2^num_rows
+    (rate + S)^(shape + num_rows))`` and the slab rate posterior is
+    Gamma(``shape + num_rows``, ``rate + S``), so larger ``shape`` or smaller
+    ``rate`` make the slab penalty stronger and more adaptive to weak columns.
     """
     B_d = np.asarray(B_d, dtype=float)
     omega = np.asarray(omega, dtype=float).reshape(-1)
@@ -87,6 +98,12 @@ def update_csp_layer(
         raise ValueError("spike_scale must be finite and positive.")
     if num_rows < 0:
         raise ValueError("num_rows must be a nonnegative integer.")
+    slab_shape = float(slab_shape)
+    slab_rate = float(slab_rate)
+    if not np.isfinite(slab_shape) or slab_shape <= 0:
+        raise ValueError("slab_shape must be finite and positive.")
+    if not np.isfinite(slab_rate) or slab_rate <= 0:
+        raise ValueError("slab_rate must be finite and positive.")
 
     random = np.random if rng is None else rng
     abs_sum = np.sum(np.abs(B_d[:, 1:]), axis=0)
@@ -94,10 +111,11 @@ def update_csp_layer(
         -num_rows * np.log(2.0 * spike_scale) - abs_sum / spike_scale
     )
     log_dens_slab = (
-        np.log(5.0)
+        slab_shape * np.log(slab_rate)
+        - gammaln(slab_shape)
         - num_rows * np.log(2.0)
-        + gammaln(1.0 + num_rows)
-        - (1.0 + num_rows) * np.log(5.0 + abs_sum)
+        + gammaln(slab_shape + num_rows)
+        - (slab_shape + num_rows) * np.log(slab_rate + abs_sum)
     )
     log_omega = np.log(np.maximum(omega, _FLOAT_TINY))
 
@@ -121,8 +139,8 @@ def update_csp_layer(
 
     for h in range(Kd):
         if allocation[h] > (h + 1):
-            shape_post = 1.0 + num_rows
-            rate_post = 5.0 + np.sum(np.abs(B_d[:, h + 1]))
+            shape_post = slab_shape + num_rows
+            rate_post = slab_rate + np.sum(np.abs(B_d[:, h + 1]))
             slab_scale[h] = 1.0 / random.gamma(
                 shape_post, 1.0 / rate_post
             )

@@ -53,6 +53,7 @@ from .parametric_families import _solve_gaussian_weighted_l1
 _THRESHOLD_RULES = ("first_two", "all_but_last", "none")
 _MSTEP_SOLVERS = ("lbfgsb", "fista", "hybrid")
 _MSTEP_LATENTS = ("draw", "mean_field")
+_PENALTY_SCALING_LAYERS = ("all", "deep")
 _DEFAULT_OPTIMIZER_MAXITER = 15
 _DEFAULT_FISTA_MAXITER = 300
 
@@ -136,6 +137,12 @@ def fit_normal_csp_copula(
     mstep_latent: str = "draw",
     observed_noise_scale: float = 0.0,
     fista_maxiter=None,
+    slab_shape: float = 1.0,
+    slab_rate: float = 5.0,
+    penalty_scaling_power: float = 0.0,
+    penalty_scaling_reference: float = 500.0,
+    penalty_scaling_layers: str = "all",
+    penalty_scaling_allocation: bool = False,
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
@@ -173,6 +180,21 @@ def fit_normal_csp_copula(
         standard Gaussian ``eps`` drawn each iteration, an SAEM-style
         surrogate for the CopDDE rank-likelihood resampling of ``Z``.  The
         conditional variances are still updated from the clean ``X``.
+    slab_shape, slab_rate : Gamma hyperprior on the slab Laplace rate (CopDDE:
+        1 and 5); see :func:`dde.algorithms.csp.update_csp_layer`.
+    penalty_scaling_power, penalty_scaling_reference : the weighted-L1
+        penalty of every M-step is multiplied by
+        ``c_N = (N / penalty_scaling_reference) ** penalty_scaling_power``
+        (power 0, the CopDDE default, leaves the O(1) prior against the O(N)
+        likelihood; power 1 makes the penalty proportional to N, equivalent
+        to the CopDDE penalty on the average likelihood; power 0.5 is the
+        ``sqrt(N)`` rate).
+    penalty_scaling_layers : ``"all"`` or ``"deep"`` (layers 2..D only).
+    penalty_scaling_allocation : when ``True`` the CUSP allocation evaluates
+        the spike and slab densities on the scaled coefficients ``c_N * B``,
+        which is the allocation implied by the scaled prior
+        Laplace(0, scale / c_N); when ``False`` only the M-step penalty is
+        scaled (a power prior) and the allocation sees the raw coefficients.
     random_state : ``None`` for the legacy global RNG, else a seed/Generator.
 
     Returns
@@ -233,6 +255,21 @@ def fit_normal_csp_copula(
         raise ValueError("fista_maxiter must be a positive integer.")
     observed_fista = mstep_solver in ("fista", "hybrid")
     logistic_fista = mstep_solver == "fista"
+    slab_shape = float(slab_shape)
+    slab_rate = float(slab_rate)
+    penalty_scaling_power = float(penalty_scaling_power)
+    penalty_scaling_reference = float(penalty_scaling_reference)
+    penalty_scaling_layers = str(penalty_scaling_layers).strip().lower()
+    penalty_scaling_allocation = bool(penalty_scaling_allocation)
+    if not np.isfinite(penalty_scaling_power) or penalty_scaling_power < 0:
+        raise ValueError("penalty_scaling_power must be finite and nonnegative.")
+    if not np.isfinite(penalty_scaling_reference) or penalty_scaling_reference <= 0:
+        raise ValueError("penalty_scaling_reference must be finite and positive.")
+    if penalty_scaling_layers not in _PENALTY_SCALING_LAYERS:
+        raise ValueError(
+            "penalty_scaling_layers must be one of "
+            + ", ".join(_PENALTY_SCALING_LAYERS) + "."
+        )
 
     t_spike = np.asarray(t_spike, dtype=float).reshape(-1)
     if t_spike.size == 1:
@@ -262,6 +299,12 @@ def fit_normal_csp_copula(
     ]
     num_act = np.asarray(K, dtype=int)
     ind_inact = [np.zeros(0, dtype=int) for _ in range(D)]
+    penalty_factor = np.ones(D, dtype=float)
+    if penalty_scaling_power > 0:
+        c_N = (N / penalty_scaling_reference) ** penalty_scaling_power
+        first_scaled = 1 if penalty_scaling_layers == "deep" else 0
+        penalty_factor[first_scaled:] = c_N
+    theta_mstep = [value.copy() for value in theta]
     rel_hist = [[] for _ in range(D)]
     trace = [] if keep_trace else None
     x_sq_sum = np.sum(X**2, axis=0) if observed_fista else None
@@ -291,12 +334,24 @@ def fit_normal_csp_copula(
         else:
             X_mstep = X
 
-        # 3) CUSP allocation, deepest layer first.
+        # 3) CUSP allocation, deepest layer first.  With penalty scaling the
+        #    M-step prior is Laplace(0, scale / c_N); the allocation either
+        #    sees c_N * B (the matching densities) or the raw B (power prior).
         for d in range(D - 1, -1, -1):
             num_rows = J if d == 0 else int(num_act[d - 1])
-            z_cusp[d], theta[d], theta_slab[d], omega[d] = update_csp_layer(
-                B_list[d], omega[d], t_spike[d], theta_slab[d], num_rows, rng=random
+            B_alloc = (
+                B_list[d] * penalty_factor[d]
+                if penalty_scaling_allocation and penalty_factor[d] != 1.0
+                else B_list[d]
             )
+            z_cusp[d], theta[d], theta_slab[d], omega[d] = update_csp_layer(
+                B_alloc, omega[d], t_spike[d], theta_slab[d], num_rows,
+                rng=random, slab_shape=slab_shape, slab_rate=slab_rate,
+            )
+            # The M-step prior scale on B is theta / c_N in both modes: with
+            # a scaled allocation ``theta`` describes c_N * B, and with a
+            # power prior the scaled penalty is the definition.
+            theta_mstep[d] = theta[d] / penalty_factor[d]
 
         # 4) Top-layer Bernoulli MAP.
         prop_update = np.mean(ber[-1], axis=0)
@@ -305,12 +360,12 @@ def fit_normal_csp_copula(
         B_update = [None] * D
         if not observed_fista:
             B_update[0], gamma_update = _optimize_gaussian_layer(
-                X_mstep, A_mstep[0], B_list[0], gamma, theta[0], temp,
+                X_mstep, A_mstep[0], B_list[0], gamma, theta_mstep[0], temp,
                 lb[0], ub[0], optimizer_maxiter, n_jobs, "weighted_l1", tau,
             )
         else:
             B_update[0], gamma_update = _solve_gaussian_weighted_l1(
-                X_mstep, A_mstep[0], B_list[0], gamma, theta[0], temp,
+                X_mstep, A_mstep[0], B_list[0], gamma, theta_mstep[0], temp,
                 x_sq_sum=None if X_mstep is not X else x_sq_sum,
                 max_iter=fista_maxiter, tol=optimizer_tol, bound=bound_val,
             )
@@ -325,13 +380,13 @@ def fit_normal_csp_copula(
         for d in range(1, D):
             if not logistic_fista:
                 B_update[d] = _optimize_logistic_layer(
-                    A_mstep[d - 1], A_mstep[d], B_list[d], theta[d],
+                    A_mstep[d - 1], A_mstep[d], B_list[d], theta_mstep[d],
                     temp, lb[d], ub[d], optimizer_maxiter, n_jobs,
                     "weighted_l1", tau,
                 )
             else:
                 B_update[d] = _solve_logistic_weighted_l1(
-                    A_mstep[d - 1], A_mstep[d], B_list[d], theta[d],
+                    A_mstep[d - 1], A_mstep[d], B_list[d], theta_mstep[d],
                     temp, max_iter=fista_maxiter, tol=optimizer_tol,
                     bound=bound_val, bounds=list(zip(lb[d], ub[d])),
                 )
@@ -435,6 +490,13 @@ def fit_normal_csp_copula(
         "observed_noise_scale": observed_noise_scale,
         "optimizer_maxiter": optimizer_maxiter,
         "fista_maxiter": fista_maxiter,
+        "slab_shape": slab_shape,
+        "slab_rate": slab_rate,
+        "penalty_scaling_power": penalty_scaling_power,
+        "penalty_scaling_reference": penalty_scaling_reference,
+        "penalty_scaling_layers": penalty_scaling_layers,
+        "penalty_scaling_allocation": penalty_scaling_allocation,
+        "penalty_factor": tuple(float(value) for value in penalty_factor),
         "latent_transition": "synchronous_mean_field",
         "mc_state_update": "draw_majority",
         "relative_history": [tuple(values) for values in rel_hist],

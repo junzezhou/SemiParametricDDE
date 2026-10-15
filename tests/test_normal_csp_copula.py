@@ -312,3 +312,86 @@ def test_standardize_applies_to_supplied_initialization():
     assert result.diagnostics["standardized"] is True
     assert np.all(np.isfinite(result.B_list[0]))
     assert np.all(result.gamma > 0)
+
+
+def test_slab_hyperprior_defaults_reproduce_copdde_and_change_allocation():
+    from dde.algorithms.csp import update_csp_layer
+
+    rng = np.random.default_rng(4)
+    B = rng.normal(scale=0.3, size=(20, 7))
+    B[:, 1:3] *= 6.0  # two strong columns
+    B[:, 5:] *= 0.05  # two near-zero columns
+    omega = np.ones(7) / 7
+    slab = np.ones(6)
+    base = update_csp_layer(B, omega, 0.03, slab.copy(), 20, rng=np.random.default_rng(1))
+    same = update_csp_layer(
+        B, omega, 0.03, slab.copy(), 20, rng=np.random.default_rng(1),
+        slab_shape=1.0, slab_rate=5.0,
+    )
+    for a, b in zip(base, same):
+        np.testing.assert_array_equal(a, b)
+    strong = update_csp_layer(
+        B, omega, 0.03, slab.copy(), 20, rng=np.random.default_rng(1),
+        slab_shape=20.0, slab_rate=1.0,
+    )
+    # A stronger slab hyperprior yields smaller slab scales (larger weights)
+    # on the active columns.
+    active = base[0] > np.arange(1, 7)
+    assert np.all(strong[2][active] < base[2][active])
+    with pytest.raises(ValueError):
+        update_csp_layer(B, omega, 0.03, slab.copy(), 20, slab_shape=0.0)
+
+
+def test_penalty_scaling_multiplies_mstep_weights_and_is_recorded():
+    inputs = _inputs()
+    args = (inputs["X"], inputs["prop"], inputs["gamma"],
+            _copy(inputs["B_list"]), _copy(inputs["A_list"]))
+    base = dict(C=1, it=2, t_spike=0.02, temp=0.9, tau=0.3, verbose=False,
+                random_state=3)
+    unscaled = fit_normal_csp_copula(*args, **base)
+    scaled = fit_normal_csp_copula(
+        *args, penalty_scaling_power=1.0, penalty_scaling_reference=10.0, **base
+    )
+    N = inputs["X"].shape[0]
+    assert scaled["penalty_factor"] == (N / 10.0, N / 10.0)
+    assert unscaled["penalty_factor"] == (1.0, 1.0)
+    deep = fit_normal_csp_copula(
+        *args, penalty_scaling_power=0.5, penalty_scaling_reference=10.0,
+        penalty_scaling_layers="deep", **base
+    )
+    assert deep["penalty_factor"] == (1.0, (N / 10.0) ** 0.5)
+    # A much larger penalty shrinks the coefficient mass.
+    heavy = fit_normal_csp_copula(
+        *args, penalty_scaling_power=1.0, penalty_scaling_reference=1e-3, **base
+    )
+    assert np.sum(np.abs(heavy["B_list"][0][:, 1:])) < np.sum(
+        np.abs(unscaled["B_list"][0][:, 1:])
+    )
+    consistent = fit_normal_csp_copula(
+        *args, penalty_scaling_power=1.0, penalty_scaling_reference=10.0,
+        penalty_scaling_allocation=True, **base
+    )
+    assert consistent["penalty_scaling_allocation"] is True
+    assert all(np.all(np.isfinite(B)) for B in consistent["B_list"])
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, penalty_scaling_layers="bogus", **base)
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, penalty_scaling_power=-1.0, **base)
+
+
+def test_fit_passes_slab_and_penalty_scaling_controls():
+    X = _simulate_two_layer(31, N=150)
+    result = fit(
+        X, method="DDE", family="Normal", D=2, dimension_method="csp",
+        t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=2,
+        random_state=5, verbose=False,
+        csp_slab_shape=5.0, csp_slab_rate=1.0,
+        csp_penalty_scaling_power=0.5, csp_penalty_scaling_reference=500.0,
+        csp_penalty_scaling_layers="deep", csp_penalty_scaling_allocation=True,
+    )
+    d = result.diagnostics
+    assert d["slab_shape"] == 5.0 and d["slab_rate"] == 1.0
+    assert d["penalty_scaling_power"] == 0.5
+    assert d["penalty_scaling_layers"] == "deep"
+    assert d["penalty_scaling_allocation"] is True
+    assert d["penalty_factor"] == (1.0, (150 / 500.0) ** 0.5)

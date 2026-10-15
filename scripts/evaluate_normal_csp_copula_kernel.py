@@ -64,6 +64,16 @@ def _parse_args():
     )
     parser.add_argument("--fista-maxiter", type=int, default=None,
                         help="copula backend: FISTA budget (default: package default, 300)")
+    parser.add_argument("--slab-shape", type=float, default=1.0,
+                        help="copula backend: Gamma shape of the slab-rate hyperprior (CopDDE 1)")
+    parser.add_argument("--slab-rate", type=float, default=5.0,
+                        help="copula backend: Gamma rate of the slab-rate hyperprior (CopDDE 5)")
+    parser.add_argument("--penalty-power", type=float, default=0.0,
+                        help="copula backend: penalty multiplier (N / reference) ** power")
+    parser.add_argument("--penalty-reference", type=float, default=500.0)
+    parser.add_argument("--penalty-layers", default="all", choices=["all", "deep"])
+    parser.add_argument("--penalty-allocation", action="store_true",
+                        help="copula backend: CUSP allocation sees the scaled coefficients")
     parser.add_argument(
         "--mstep-latent", default="draw", choices=["draw", "mean_field"],
         help="copula backend: M-step design from Bernoulli draws or mean-field probabilities",
@@ -145,6 +155,12 @@ def _run_one(task):
         kwargs["csp_mstep_latent"] = settings.get("mstep_latent", "draw")
         kwargs["csp_observed_noise_scale"] = settings.get("observed_noise_scale", 0.0)
         kwargs["csp_fista_maxiter"] = settings.get("fista_maxiter")
+        kwargs["csp_slab_shape"] = settings.get("slab_shape", 1.0)
+        kwargs["csp_slab_rate"] = settings.get("slab_rate", 5.0)
+        kwargs["csp_penalty_scaling_power"] = settings.get("penalty_power", 0.0)
+        kwargs["csp_penalty_scaling_reference"] = settings.get("penalty_reference", 500.0)
+        kwargs["csp_penalty_scaling_layers"] = settings.get("penalty_layers", "all")
+        kwargs["csp_penalty_scaling_allocation"] = settings.get("penalty_allocation", False)
 
     started = time.perf_counter()
     error = ""
@@ -325,6 +341,12 @@ def main():
         "mstep_solver": args.mstep_solver,
         "mstep_latent": args.mstep_latent,
         "fista_maxiter": args.fista_maxiter,
+        "slab_shape": args.slab_shape,
+        "slab_rate": args.slab_rate,
+        "penalty_power": args.penalty_power,
+        "penalty_reference": args.penalty_reference,
+        "penalty_layers": args.penalty_layers,
+        "penalty_allocation": args.penalty_allocation,
         "observed_noise_scale": args.observed_noise_scale,
         "tau_fixed": args.tau_fixed,
         "t_spike_multipliers": args.t_spike_multipliers,
