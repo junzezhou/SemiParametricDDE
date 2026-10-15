@@ -14,7 +14,7 @@ pip install -e .
 Then import from any script or notebook:
 
 ```python
-from dde import fit
+from dde import fit, select_hyperparameters
 ```
 
 A fixed-width Normal DDE supplies its latent widths and layer penalties.  A
@@ -34,11 +34,27 @@ result = fit(
     tau=0.3,
     C=1,
     tol=0.005,
-    max_it=50,
-    csp_backend="mcem",
+    max_iter=50,
     random_state=123,
 )
 ```
+
+Normal CSP uses the CopDDE D-layer CSP algorithm (`csp_backend="copula"`,
+the default): the MATLAB `get_SAEM_RL_CSP_D` kernel with its rank-likelihood
+resampling removed, because the Normal DDE observes its Gaussian layer.  The
+fit runs on column-standardized observations, the unit-variance scale of the
+CopDDE latent layer on which the CopDDE `t_spike` and `tau` values are
+calibrated, initializes with the CopDDE `Normal_init_D` rules, and uses the
+CopDDE L-BFGS-B M-step budget (`optimizer_maxiter=15`).  Observed-layer
+coefficients and variances are returned on the original scale; the hard
+threshold `tau` acts on standardized loadings.  `tol` is the rolling
+standard deviation of the relative coefficient change (window 7) that stops
+the kernel.  `standardize=False`, `csp_initializer="family"`,
+`csp_mstep_solver="fista"`, and `csp_threshold_rule` expose the individual
+adaptations.  The previous simultaneous MCEM kernel remains available as
+`csp_backend="mcem"`.  Run `scripts/evaluate_normal_csp_copula_kernel.py` to
+compare the backends' mean fitted widths against the true widths on the
+CopDDE paper designs.
 
 SemiDDE supports the same maximum-width CSP initialization while retaining
 its semiparametric pseudo-observation update.  `D` fixes the hierarchy depth;
@@ -55,7 +71,7 @@ result = fit(
     tau=0.3,
     C=1,
     tol=0.005,
-    max_it=50,
+    max_iter=50,
     random_state=123,
 )
 ```
@@ -65,12 +81,13 @@ experiments under nonlinear continuous margins. Its primary summary columns
 are the exact dimension-shrinkage recovery rate and the mean L1 distance
 between fitted and true width vectors.
 
-Parametric CSP provides three MCEM backends.  ``"mcem"`` retains the original
-simultaneous MCEM updates, ``"mcem_reinitialize"`` activates CSP layer by
-layer and rebuilds each waiting parent, and ``"mcem_cap_only"`` uses the same
-staged schedule while preserving eligible parent states and only enforcing the
-child-implied structural cap. Bernoulli CSP selects ``"mcem"`` by default when
-``csp_backend`` is omitted; the staged backends remain explicit options.
+Parametric CSP provides the copula backend above (Normal only) and three MCEM
+backends.  ``"mcem"`` retains the original simultaneous MCEM updates,
+``"mcem_reinitialize"`` activates CSP layer by layer and rebuilds each waiting
+parent, and ``"mcem_cap_only"`` uses the same staged schedule while preserving
+eligible parent states and only enforcing the child-implied structural cap.
+Bernoulli and Poisson CSP select ``"mcem"`` by default when ``csp_backend``
+is omitted; the staged backends remain explicit options.
 
 Bernoulli DDE uses the same fixed and CSP interfaces, requires a binary 0/1
 matrix, and has no `gamma` dispersion parameter. For fixed-width parametric
@@ -107,9 +124,9 @@ defaults delay irreversible CSP shrinkage for 10 iterations when at least 20
 outer iterations are requested, and scale the CSP penalty by
 `max(1, (N / 1000) ** (2 / 3))`.  Supplying
 `mcem_shrinkage_burn` or `mcem_penalty_strength` overrides the corresponding
-automatic value.  Two-layer Bernoulli CSP and Normal CSP retain their
-established settings; Normal also retains its synchronous approximate-MCEM
-transition for numerical backward compatibility.
+automatic value.  Two-layer Bernoulli CSP retains its established settings,
+and the explicit Normal ``"mcem"`` backend keeps its synchronous
+approximate-MCEM transition for numerical backward compatibility.
 
 Poisson DDE uses a canonical log link, requires finite nonnegative integer
 counts, and has no `gamma` dispersion parameter. Fixed-width estimation
@@ -153,3 +170,42 @@ result = fit(
 Run `scripts/evaluate_poisson_csp_recovery.py` for checkpointed dimension
 recovery experiments. Its primary summary columns are the exact shrinkage
 recovery rate and the mean L1 distance between fitted and true width vectors.
+
+## Hyperparameter selection
+
+`select_hyperparameters` accepts the same `method`, `family`, `D`, and
+`dimension_method` path choices as `fit`. Use `criterion="ebic"` for a
+full-data information criterion or `"bic"`/`"loglik"` for K-fold scores.
+CopDDE also supports `"pmse"`, which compares simulated and observed data
+with a cross-validated random forest. Fixed DDE and SemiDDE use `pen_list`;
+CSP paths use `t_spike` and `temp`. DDE and SemiDDE CSP derive maximal widths
+from `D`, while CopDDE can derive them or accept `K_list`.
+
+Supply explicit candidate rows or a mapping of axes. `per_layer` crosses each
+layer's values independently, including all interactions with `tau` and
+`temp`:
+
+```python
+selected = select_hyperparameters(
+    Y_binary, method="DDE", family="Bernoulli", D=2,
+    dimension_method="fixed", criterion="ebic",
+    fixed_hp={"K_list": [6, 2]},
+    candidates={
+        "pen_list": {"per_layer": [[0.1, 0.2], [0.2, 0.4]]},
+        "tau": [0.2, 0.3],
+    },
+    base_fit_kwargs={"max_iter": 50, "C": 1},
+    random_state=123,
+)
+table = selected.diagnostics["cv_table"]  # eight fitted candidates
+best = selected.diagnostics["hyperparameter_selection"].best_candidate
+```
+
+When `candidates` is omitted, `auto_grid` crosses layer-specific penalty
+exponents and thresholds; CSP defaults cross all layer-specific spike choices.
+`auto_grid_copula_csp` also accepts `temp_values` and `tau_values` to build
+the complete grid used in a specific analysis. Every evaluated row records its
+score and elapsed fit/score times. The selected model is fitted on all data
+when `refit=True` (the default). For larger CopDDE grids, set `n_jobs` to
+parallelize the independent pMSE repeats; `n_repeats` and
+`pmse_n_estimators` control the accuracy and cost of that score.

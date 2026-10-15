@@ -147,6 +147,36 @@ def test_fit_rejects_conflicting_method_and_model():
         fit(X, method="DDE", model="SemiDDE")
 
 
+def test_fit_common_max_iter_alias_and_conflict():
+    X, K_list, _, _ = _normal_parameters()
+    args = dict(
+        method="DDE", D=2, family="Normal", dimension_method="fixed",
+        K_list=K_list, pen_list=[0.0, 0.0], tau=0.3, C=1,
+        max_iter=1, verbose=False,
+    )
+    np.random.seed(99)
+    result = fit(X, **args)
+    legacy_args = {key: value for key, value in args.items() if key != "max_iter"}
+    np.random.seed(99)
+    legacy = fit(X, **legacy_args, max_it=1)
+    assert result.diagnostics["iterations"] == legacy.diagnostics["iterations"]
+    for actual, expected in zip(result.B_list, legacy.B_list):
+        np.testing.assert_allclose(actual, expected)
+    with pytest.raises(ValueError, match="max_iter conflicts with max_it"):
+        fit(X, **args, max_it=2)
+
+
+def test_fit_copula_csp_derives_widths_from_D():
+    X, _, _, _ = _normal_parameters()
+    result = fit(
+        X, method="CopDDE", D=2, dimension_method="csp",
+        t_spike=[0.03, 0.05], temp=0.7, tau=0.3, C=1,
+        max_iter=1, optimizer_maxiter=1, random_state=4, verbose=False,
+    )
+    assert result.diagnostics["original_K_list"] == (6, 2)
+    assert result.diagnostics["dimension_method"] == "csp"
+
+
 def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
     X, _, _, _ = _normal_parameters()
     args = dict(
@@ -302,10 +332,9 @@ def test_cap_only_backend_rejects_spectral_transition_option():
         )
 
 
-def test_fit_dde_normal_csp_keeps_mcem_as_public_default():
+def test_fit_dde_normal_csp_uses_copula_backend_by_default():
     X, _, _, _ = _normal_parameters()
-    result = fit(
-        X,
+    args = dict(
         method="DDE",
         D=2,
         family="Normal",
@@ -320,9 +349,20 @@ def test_fit_dde_normal_csp_keeps_mcem_as_public_default():
         random_state=733,
         verbose=False,
     )
+    result = fit(X, **args)
 
-    assert result.diagnostics["backend"] == "mcem"
-    assert result.diagnostics["kernel"] == "approximate_mcem_csp"
+    assert result.diagnostics["backend"] == "copula"
+    assert result.diagnostics["kernel"] == "copdde_csp_mean_field_mcem"
+    assert result.diagnostics["standardized"] is True
+    assert result.diagnostics["initialization"] == "data"
+    assert result.diagnostics["initializer"] == "family"
+    assert result.diagnostics["mstep_solver"] == "hybrid"
+    assert result.diagnostics["fista_maxiter"] == 300
+
+    legacy = fit(X, csp_backend="mcem", **args)
+    assert legacy.diagnostics["backend"] == "mcem"
+    assert legacy.diagnostics["kernel"] == "approximate_mcem_csp"
+    assert legacy.diagnostics["standardized"] is False
 
 
 @pytest.mark.parametrize(

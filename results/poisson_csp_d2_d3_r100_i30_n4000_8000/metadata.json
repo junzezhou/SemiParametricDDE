@@ -1,0 +1,53 @@
+{
+  "created_utc": "2026-09-17T08:24:27.574366+00:00",
+  "command": [
+    "scripts/evaluate_poisson_csp_recovery.py",
+    "--scenarios",
+    "d2",
+    "d3",
+    "--sample-sizes",
+    "4000",
+    "8000",
+    "--replicates",
+    "100",
+    "--workers",
+    "6",
+    "--max-iter",
+    "30",
+    "--optimizer-maxiter",
+    "100",
+    "--output-dir",
+    "results/poisson_csp_d2_d3_r100_i30_n4000_8000"
+  ],
+  "python": "3.12.9",
+  "numpy": "1.26.4",
+  "scipy": "1.13.1",
+  "sample_sizes": [
+    4000,
+    8000
+  ],
+  "replicates": 100,
+  "workers": 6,
+  "settings": {
+    "backend": "mcem",
+    "C": 1,
+    "max_iter": 30,
+    "optimizer_maxiter": 100,
+    "optimizer_tol": 1e-06,
+    "tol": 0.005,
+    "convergence_window": 7,
+    "convergence_mean_tol": 0.01,
+    "burn": 5,
+    "tau": 0.3,
+    "penalty_strength": 1.0,
+    "shrinkage_burn": 0,
+    "t_spike_multiplier": 1.0,
+    "initialization": "data",
+    "base_seed": 20260916,
+    "settings_id": "37f97fe97f52e510"
+  },
+  "completed_rows": 400,
+  "successful_rows": 400,
+  "failed_rows": 0,
+  "wall_seconds_this_invocation": 1065.5858603750821
+}

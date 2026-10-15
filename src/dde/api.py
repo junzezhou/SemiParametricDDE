@@ -47,6 +47,7 @@ def fit(
     K_list=None,
     variable_types: Optional[Sequence[str]] = None,
     dimension_method: Optional[str] = None,
+    max_iter: Optional[int] = None,
     **kwargs: Any,
 ) -> DDEResult:
     """Fit a DDE-family model through a unified package interface.
@@ -63,21 +64,24 @@ def fit(
         Supplying conflicting values raises an error.
     D:
         Number of stochastic binary latent layers. Required for parametric DDE
-        fits and SemiDDE CSP fits; fixed-width SemiDDE can infer it from
-        ``K_list``.
+        fits and CSP fits that omit ``K_list``; fixed-width SemiDDE and
+        CopDDE can infer it from ``K_list``.
     family:
         Parametric observed-data family. Required when ``method="DDE"``.
     K_list:
         Layer widths ordered from the shallowest latent layer to the deepest.
         Required for fixed-width fits and omitted for parametric-DDE and
-        SemiDDE CSP fits, whose maximal widths are derived recursively from
-        the observed width.
+        SemiDDE CSP fits. CopDDE CSP may accept explicit maximal widths or
+        derive them recursively from the observed width and ``D``.
     variable_types:
         Optional variable type labels used when ``model="auto"``.
     dimension_method:
         ``"fixed"`` for supplied widths, or ``"csp"`` for CSP-based width
         selection. If omitted, SemiDDE uses ``"fixed"`` and CopDDE uses
         ``"csp"``.
+    max_iter:
+        Common inner-kernel iteration limit. Legacy ``max_it`` (DDE),
+        ``max_inner_iter`` (SemiDDE), and ``it`` (CopDDE) remain accepted.
     **kwargs:
         Algorithm-specific keyword arguments.
     """
@@ -93,6 +97,15 @@ def fit(
             raise ValueError("method and model specify different DDE formulations.")
     if chosen == "auto":
         chosen = _infer_model(Y, variable_types)
+
+    if max_iter is not None:
+        target = {"dde": "max_it", "semi": "max_inner_iter", "copula": "it"}[chosen]
+        limit = int(max_iter)
+        if limit < 1:
+            raise ValueError("max_iter must be positive.")
+        if target in kwargs and int(kwargs[target]) != limit:
+            raise ValueError(f"max_iter conflicts with {target}.")
+        kwargs[target] = limit
 
     if chosen == "dde":
         from .algorithms.dde import fit_parametric_dde
@@ -128,10 +141,17 @@ def fit(
 
     if chosen in {"copula", "copdde"}:
         from .algorithms.copula import fit_copula_dde
+        from .algorithms.csp import maximal_identifiable_widths
 
         method = "csp" if dimension_method is None else str(dimension_method).lower()
         if method not in {"fixed", "csp"}:
             raise ValueError("CopDDE dimension_method must be 'fixed' or 'csp'.")
+        if K_list is None and method == "csp":
+            if D is None:
+                raise ValueError("D is required for CopDDE CSP when K_list is omitted.")
+            K_list = maximal_identifiable_widths(Y.shape[1], int(D))
+        if D is not None and K_list is not None and len(K_list) != int(D):
+            raise ValueError("K_list length must equal D.")
         return fit_copula_dde(Y, K_list=K_list, dimension_method=method, **kwargs)
 
     raise RuntimeError(f"Unhandled DDE method: {chosen}.")

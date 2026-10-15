@@ -32,7 +32,13 @@ def _varimax(Phi, gamma=1.0, q=1000, tol=1e-6):
 
 def _rotate_varimax(loadings):
     if Rotator is not None:
-        return Rotator(method="varimax", max_iter=1000).fit_transform(loadings)
+        try:
+            return Rotator(method="varimax", max_iter=1000).fit_transform(loadings)
+        except ValueError as exc:
+            # Some factor-analyzer releases fail to unpack their own varimax
+            # result; the equivalent local implementation remains available.
+            if "too many values to unpack" not in str(exc):
+                raise
     return _varimax(loadings, q=1000)
 
 

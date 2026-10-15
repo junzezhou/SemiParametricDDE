@@ -6,7 +6,8 @@ from itertools import product
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
-from scipy.special import logsumexp
+from joblib import Parallel, delayed
+from scipy.special import gammaln, logsumexp
 from scipy.stats import rankdata
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
@@ -227,22 +228,51 @@ def copula_tau_default(N: int) -> float:
     return float(max(0.3, 3.0 * (int(N) ** -0.3)))
 
 
-def auto_grid_copula_fixed(N: int, D: int) -> List[Dict[str, Any]]:
-    """Return the compact CopDDE fixed-penalty grid."""
+def _layer_choices(values: Sequence[Any], D: int, name: str) -> List[List[float]]:
+    """Accept common choices or one independent candidate sequence per layer."""
+    raw = list(values)
+    if not raw:
+        raise ValueError(f"{name} must not be empty.")
+    if isinstance(raw[0], (list, tuple, np.ndarray)):
+        if len(raw) != D:
+            raise ValueError(f"{name} must contain one choice sequence per layer.")
+        out = [list(map(float, layer)) for layer in raw]
+    else:
+        out = [list(map(float, raw)) for _ in range(D)]
+    if any(not layer or not np.all(np.isfinite(layer)) for layer in out):
+        raise ValueError(f"{name} needs finite choices in every layer.")
+    return out
+
+
+def auto_grid_copula_fixed(
+    N: int,
+    D: int,
+    *,
+    lambda_exponents: Sequence[Any] = (1 / 8, 2 / 8, 3 / 8),
+    temp_values: Sequence[float] = (0.7, 0.9),
+    tau_values: Optional[Sequence[float]] = None,
+) -> List[Dict[str, Any]]:
+    """Cross the fixed-path penalty choices independently across layers."""
     D = int(D)
-    tau = copula_tau_default(N)
+    if D < 1:
+        raise ValueError("D must be positive.")
+    exponent_choices = _layer_choices(lambda_exponents, D, "lambda_exponents")
+    tau_choices = [copula_tau_default(N)] if tau_values is None else list(map(float, tau_values))
+    temp_choices = list(map(float, temp_values))
+    if not tau_choices or not temp_choices or any(x <= 0 or not np.isfinite(x) for x in [*tau_choices, *temp_choices]):
+        raise ValueError("tau_values and temp_values need positive finite choices.")
     candidates = []
-    for temp in (0.7, 0.9):
-        for lambda_exp in (1 / 8, 2 / 8, 3 / 8):
-            pen = float(int(N) ** float(lambda_exp))
-            candidates.append(
-                {
-                    "temp": float(temp),
-                    "pen_list": [pen] * D,
-                    "tau": tau,
-                    "lambda_exp": float(lambda_exp),
-                }
-            )
+    for temp in temp_choices:
+        for tau in tau_choices:
+            for lambda_exp in product(*exponent_choices):
+                candidates.append(
+                    {
+                        "temp": float(temp),
+                        "pen_list": [float(int(N) ** exponent) for exponent in lambda_exp],
+                        "tau": tau,
+                        "lambda_exp": list(lambda_exp),
+                    }
+                )
     return candidates
 
 
@@ -266,37 +296,32 @@ def auto_grid_copula_csp(
     N: int,
     D: int,
     *,
-    strategy: str = "coordinate",
+    strategy: str = "full",
     t_spike_values: Optional[Sequence[Sequence[float]]] = None,
     base_t_spike: Optional[Sequence[float]] = None,
-) -> Any:
-    """Return a CopDDE CSP full grid or sequential coordinate-search plan."""
+    temp_values: Optional[Sequence[float]] = None,
+    tau_values: Optional[Sequence[float]] = None,
+) -> List[Dict[str, Any]]:
+    """Return the complete Cartesian grid of layer-specific CSP rates."""
     D = int(D)
-    values = [list(map(float, vals)) for vals in (t_spike_values or _default_csp_t_spike_values(D))]
+    if D < 1:
+        raise ValueError("D must be positive.")
+    values = [list(map(float, vals)) for vals in (t_spike_values if t_spike_values is not None else _default_csp_t_spike_values(D))]
     if len(values) != D:
         raise ValueError("t_spike_values must contain one sequence per layer.")
-    tau = copula_tau_default(N)
-    temp = 0.7 if D <= 2 else 0.9
-    strategy = strategy.lower()
-    if strategy == "coordinate" and D >= 3:
-        base = list(map(float, base_t_spike or _default_csp_t_spike_base(D, values)))
-        if len(base) != D:
-            raise ValueError("base_t_spike must have length D.")
-        return {
-            "strategy": "coordinate",
-            "temp": temp,
-            "tau": tau,
-            "base_t_spike": base,
-            "t_spike_values": values,
-        }
-    if strategy not in {"coordinate", "full"}:
-        raise ValueError("strategy must be 'coordinate' or 'full'.")
+    if any(not layer or not np.all(np.isfinite(layer)) or any(x <= 0 for x in layer) for layer in values):
+        raise ValueError("Each t_spike layer needs positive finite candidates.")
+    tau_choices = [copula_tau_default(N)] if tau_values is None else list(map(float, tau_values))
+    temp_choices = [0.7 if D <= 2 else 0.9] if temp_values is None else list(map(float, temp_values))
+    if not tau_choices or not temp_choices or any(x <= 0 or not np.isfinite(x) for x in [*tau_choices, *temp_choices]):
+        raise ValueError("tau_values and temp_values need positive finite choices.")
+    if strategy.lower() != "full":
+        raise ValueError("Only strategy='full' is supported; all combinations are evaluated.")
+    if base_t_spike is not None:
+        raise ValueError("base_t_spike is incompatible with a full Cartesian grid.")
     return [
-        {
-            "temp": temp,
-            "tau": tau,
-            "t_spike": list(vals),
-        }
+        {"temp": temp, "tau": tau, "t_spike": list(vals)}
+        for temp, tau in product(temp_choices, tau_choices)
         for vals in product(*values)
     ]
 
@@ -306,11 +331,11 @@ def auto_grid(
     D: int,
     *,
     layer_scales: Optional[Sequence[float]] = None,
-    lambda_exponents: Sequence[float] = (2 / 8, 3 / 8),
+    lambda_exponents: Sequence[Any] = (2 / 8, 3 / 8),
     tau_exponents: Sequence[float] = (-2 / 8, -3 / 8),
     tau_values: Sequence[float] = (0.3,),
 ) -> List[Dict[str, Any]]:
-    """Return the DDE-style grid over ``pen_list`` and ``tau``."""
+    """Cross each layer's penalty choices with every threshold choice."""
     D = int(D)
     if D < 1:
         raise ValueError("D must be a positive integer.")
@@ -323,15 +348,15 @@ def auto_grid(
     candidates = []
     tau_grid = [(float(2.0 * (N ** float(tau_exp))), float(tau_exp)) for tau_exp in tau_exponents]
     tau_grid.extend((float(tau), None) for tau in tau_values)
-    for lambda_exp in lambda_exponents:
-        lam = float(N ** float(lambda_exp))
-        pen_list = (lam * layer_scales_arr).tolist()
+    exponent_choices = _layer_choices(lambda_exponents, D, "lambda_exponents")
+    for lambda_exp in product(*exponent_choices):
+        pen_list = [float(N ** float(exponent) * layer_scales_arr[d]) for d, exponent in enumerate(lambda_exp)]
         for tau, tau_exp in tau_grid:
             candidates.append(
                 {
                     "pen_list": pen_list,
                     "tau": tau,
-                    "lambda_exp": float(lambda_exp),
+                    "lambda_exp": list(map(float, lambda_exp)),
                     "tau_exp": tau_exp,
                 }
             )
@@ -350,57 +375,103 @@ def normal_mixture_loglik_score(
     result: DDEResult,
     *,
     model: Optional[str] = None,
-    max_enum_bits: int = 20,
-    mc_samples: int = 50_000,
-    pattern_chunk_size: int = 4096,
+    max_enum_bits: int = 12,
+    mc_samples: int = 4096,
+    pattern_chunk_size: int = 1024,
 ) -> float:
-    """Score observations by the fitted latent-normal mixture pseudo log-likelihood.
-
-    The score is an average holdout log-likelihood after deterministic normal-score
-    transformation of the observed columns.  It uses no simulation truth.
-    """
-    if result.prop is None or result.B_list is None or result.gamma is None:
-        raise ValueError("result must contain prop, B_list, and gamma to be scored.")
-
+    """Average latent-normal mixture log-likelihood on normal-score observations."""
     chosen = (model or result.model).lower()
+    observed_mask = np.isfinite(np.asarray(Y, dtype=float))
     X = _normal_score_matrix(np.asarray(Y), "copula" if chosen in {"copula", "copdde"} else "semi")
-    B_list = [np.asarray(B, dtype=float) for B in result.B_list]
-    gamma = np.maximum(np.asarray(result.gamma, dtype=float).reshape(-1), 1e-8)
-    K1 = B_list[0].shape[1] - 1
-    if K1 > max_enum_bits:
-        raise ValueError(
-            "normal_mixture_loglik_score currently requires K_1 <= max_enum_bits "
-            "for exact holdout scoring."
-        )
-
-    patterns = binary(np.arange(1 << K1, dtype=np.int64), K1)
-    pmf = np.asarray(
-        compute_marginal_pmf_A1(
-            result.prop,
-            B_list,
-            max_enum_bits=max_enum_bits,
-            mc_samples=mc_samples,
-        ),
-        dtype=float,
+    return parametric_mixture_loglik_score(
+        X, result, family="normal", max_enum_bits=max_enum_bits,
+        mc_samples=mc_samples, pattern_chunk_size=pattern_chunk_size,
+        observed_mask=observed_mask,
     )
-    pmf = np.clip(pmf, 1e-300, None)
-    pmf = pmf / pmf.sum()
+
+
+def parametric_mixture_loglik_score(
+    Y: np.ndarray,
+    result: DDEResult,
+    *,
+    family: str,
+    max_enum_bits: int = 12,
+    mc_samples: int = 4096,
+    pattern_chunk_size: int = 1024,
+    random_state: Optional[int] = 0,
+    observed_mask: Optional[np.ndarray] = None,
+) -> float:
+    """Observed-data mixture score for Normal, Bernoulli, or Poisson DDE.
+
+    Enumerate shallow binary states when feasible. Above ``max_enum_bits``,
+    sample latent states from the fitted hierarchy so scoring stays bounded.
+    """
+    if result.prop is None or result.B_list is None:
+        raise ValueError("result must contain prop and B_list to be scored.")
+    X = np.asarray(Y, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("Y must be a two-dimensional matrix.")
+    mask = np.isfinite(X) if observed_mask is None else np.asarray(observed_mask, dtype=bool)
+    if mask.shape != X.shape:
+        raise ValueError("observed_mask must have the same shape as Y.")
+    X = np.where(mask, X, 0.0)
+    fully_observed = bool(np.all(mask))
+    B_list = [np.asarray(B, dtype=float) for B in result.B_list]
+    K1 = B_list[0].shape[1] - 1
+    if K1 <= max_enum_bits:
+        patterns = binary(np.arange(1 << K1, dtype=np.int64), K1)
+        pmf = np.asarray(compute_marginal_pmf_A1(
+            result.prop, B_list, max_enum_bits=max_enum_bits,
+            mc_samples=mc_samples,
+        ), dtype=float)
+        pmf = np.clip(pmf, 1e-300, None)
+        pmf /= pmf.sum()
+    else:
+        if mc_samples < 1:
+            raise ValueError("mc_samples must be positive for sampled scoring.")
+        patterns = np.asarray(simulate_latent_layers_D(
+            int(mc_samples), result.prop, B_list, _as_rng(random_state)
+        )[0][0], dtype=float)
+        pmf = np.full(patterns.shape[0], 1.0 / patterns.shape[0])
     chunk_size = max(1, int(pattern_chunk_size))
     log_pmf = np.log(pmf)
-    logdet = float(np.sum(np.log(2.0 * np.pi * gamma)))
-    x_quad = np.sum((X * X) / gamma[None, :], axis=1)
-    x_scaled = X / gamma[None, :]
+    family = str(family).lower()
+    if family not in {"normal", "bernoulli", "poisson"}:
+        raise ValueError("family must be 'normal', 'bernoulli', or 'poisson'.")
+    if X.shape[1] != B_list[0].shape[0]:
+        raise ValueError("Y and fitted observed-layer widths differ.")
+    if family == "normal":
+        if result.gamma is None:
+            raise ValueError("A Normal fit needs gamma for likelihood scoring.")
+        gamma = np.maximum(np.asarray(result.gamma, dtype=float).reshape(-1), 1e-8)
+        weights = mask / gamma[None, :]
+        logdet = mask @ np.log(2.0 * np.pi * gamma)
+        x_quad = np.sum((X * X) * weights, axis=1)
+        x_scaled = X * weights
+    elif family == "poisson":
+        log_factorial = np.sum(gammaln(X + 1.0) * mask, axis=1)
     obs_loglik = np.full(X.shape[0], -np.inf, dtype=float)
-
     for start in range(0, patterns.shape[0], chunk_size):
         end = min(start + chunk_size, patterns.shape[0])
-        means = np.column_stack([np.ones(end - start), patterns[start:end]]) @ B_list[0].T
-        means_quad = np.sum((means * means) / gamma[None, :], axis=1)
-        cross = x_scaled @ means.T
-        log_norm = -0.5 * (x_quad[:, None] + means_quad[None, :] - 2.0 * cross + logdet)
-        chunk_loglik = logsumexp(log_pmf[start:end][None, :] + log_norm, axis=1)
+        eta = np.column_stack([np.ones(end - start), patterns[start:end]]) @ B_list[0].T
+        if family == "normal":
+            means_quad = (
+                np.sum((eta * eta) / gamma[None, :], axis=1)[None, :]
+                if fully_observed else weights @ (eta * eta).T
+            )
+            component_ll = -0.5 * (
+                x_quad[:, None] + means_quad - 2.0 * (x_scaled @ eta.T) + logdet[:, None]
+            )
+        elif family == "bernoulli":
+            softplus = np.logaddexp(0.0, eta)
+            penalty = np.sum(softplus, axis=1)[None, :] if fully_observed else mask @ softplus.T
+            component_ll = X @ eta.T - penalty
+        else:
+            rate = np.exp(np.clip(eta, -700, 700))
+            penalty = np.sum(rate, axis=1)[None, :] if fully_observed else mask @ rate.T
+            component_ll = X @ eta.T - penalty - log_factorial[:, None]
+        chunk_loglik = logsumexp(log_pmf[start:end][None, :] + component_ll, axis=1)
         obs_loglik = np.logaddexp(obs_loglik, chunk_loglik)
-
     return float(np.mean(obs_loglik))
 
 
@@ -461,6 +532,21 @@ def _rf_ready_matrix(X: np.ndarray) -> np.ndarray:
     return X
 
 
+def _copula_pmse_repeat(Y: np.ndarray, synth: np.ndarray, seed: int, n_estimators: int, n_splits: int) -> float:
+    X_rf = _rf_ready_matrix(np.vstack([Y, synth]))
+    label = np.concatenate([np.ones(Y.shape[0], dtype=int), np.zeros(synth.shape[0], dtype=int)])
+    splits = min(int(n_splits), int(np.sum(label == 0)), int(np.sum(label == 1)))
+    if splits < 2:
+        raise ValueError("pMSE evaluation needs at least two observations in each class.")
+    cv = StratifiedKFold(n_splits=splits, shuffle=True, random_state=seed)
+    clf = RandomForestClassifier(
+        n_estimators=int(n_estimators), random_state=seed, n_jobs=1,
+        class_weight=None,
+    )
+    p_hat = cross_val_predict(clf, X_rf, label, cv=cv, method="predict_proba")[:, 1]
+    return float(np.mean((p_hat - 0.5) ** 2))
+
+
 def copula_predictive_pmse_score(
     Y: np.ndarray,
     result: DDEResult,
@@ -469,30 +555,27 @@ def copula_predictive_pmse_score(
     random_state: Optional[int] = None,
     n_estimators: int = 100,
     n_splits: int = 5,
+    n_jobs: int = 1,
 ) -> tuple[float, List[float]]:
-    """Compute the CopDDE predictive-evaluation pMSE score."""
+    """Compute pMSE, optionally distributing independent repeats across jobs."""
     if n_repeats < 1:
         raise ValueError("n_repeats must be at least 1.")
+    if int(n_jobs) < 1:
+        raise ValueError("n_jobs must be at least 1.")
     Y = np.asarray(Y, dtype=float)
     rng = _as_rng(random_state)
-    pmse_values: List[float] = []
-    for _ in range(int(n_repeats)):
-        seed = int(rng.integers(0, np.iinfo(np.int32).max))
-        synth = simulate_copula_predictive(Y, result, n_samples=Y.shape[0], random_state=seed)
-        X_rf = _rf_ready_matrix(np.vstack([Y, synth]))
-        label = np.concatenate([np.ones(Y.shape[0], dtype=int), np.zeros(synth.shape[0], dtype=int)])
-        splits = min(int(n_splits), int(np.sum(label == 0)), int(np.sum(label == 1)))
-        if splits < 2:
-            raise ValueError("pMSE evaluation needs at least two observations in each class.")
-        cv = StratifiedKFold(n_splits=splits, shuffle=True, random_state=seed)
-        clf = RandomForestClassifier(
-            n_estimators=int(n_estimators),
-            random_state=seed,
-            n_jobs=1,
-            class_weight=None,
+    seeds = [int(rng.integers(0, np.iinfo(np.int32).max)) for _ in range(int(n_repeats))]
+    synths = [simulate_copula_predictive(Y, result, n_samples=Y.shape[0], random_state=seed) for seed in seeds]
+    if int(n_jobs) == 1:
+        pmse_values = [
+            _copula_pmse_repeat(Y, synth, seed, n_estimators, n_splits)
+            for synth, seed in zip(synths, seeds)
+        ]
+    else:
+        pmse_values = Parallel(n_jobs=int(n_jobs), backend="loky")(
+            delayed(_copula_pmse_repeat)(Y, synth, seed, n_estimators, n_splits)
+            for synth, seed in zip(synths, seeds)
         )
-        p_hat = cross_val_predict(clf, X_rf, label, cv=cv, method="predict_proba")[:, 1]
-        pmse_values.append(float(np.mean((p_hat - 0.5) ** 2)))
     return float(np.mean(pmse_values)), pmse_values
 
 
@@ -505,5 +588,6 @@ __all__ = [
     "estimate_K_list_copula",
     "estimate_K_list_semidde",
     "normal_mixture_loglik_score",
+    "parametric_mixture_loglik_score",
     "simulate_copula_predictive",
 ]

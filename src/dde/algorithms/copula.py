@@ -217,6 +217,8 @@ def fit_copula_dde(
     else:
         raise ValueError("dimension_method must be 'fixed' or 'csp'.")
 
+    diagnostics["dimension_method"] = method
+    diagnostics["D"] = len(shape.K_list)
     return DDEResult(
         model="copula",
         K_list=list(diagnostics["K_list"]),

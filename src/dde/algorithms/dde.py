@@ -13,6 +13,8 @@ from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
 from .normal_csp import fit_parametric_csp_mcem
+from .normal_csp_copula import fit_normal_csp_copula
+from .normal_init_cop import Normal_init_cop
 from .parametric_families import (
     BERNOULLI_FAMILY,
     NORMAL_FAMILY,
@@ -79,6 +81,26 @@ def _resolve_mcem_shrinkage_defaults(
     )
 
 
+def _standardize_observed_layer(B1, gamma, column_mean, column_sd):
+    """Map observed-layer parameters from the original to the z-score scale."""
+    B1 = np.asarray(B1, dtype=float).copy()
+    gamma = np.asarray(gamma, dtype=float).copy()
+    B1[:, 0] = (B1[:, 0] - column_mean) / column_sd
+    B1[:, 1:] /= column_sd[:, None]
+    gamma /= column_sd**2
+    return B1, gamma
+
+
+def _destandardize_observed_layer(B1, gamma, column_mean, column_sd):
+    """Map observed-layer parameters from the z-score to the original scale."""
+    B1 = np.asarray(B1, dtype=float).copy()
+    gamma = np.asarray(gamma, dtype=float).copy()
+    B1[:, 1:] *= column_sd[:, None]
+    B1[:, 0] = B1[:, 0] * column_sd + column_mean
+    gamma *= column_sd**2
+    return B1, gamma
+
+
 def _validate_pen_list(pen_list: Sequence[float], D: int) -> list[float]:
     if isinstance(pen_list, (str, bytes)):
         raise ValueError("pen_list must be a length-D sequence.")
@@ -120,7 +142,7 @@ def fit_parametric_dde(
     G_list_true=None,
     bound_val: float = 10.0,
     random_state=None,
-    optimizer_maxiter: int = 100,
+    optimizer_maxiter=None,
     optimizer_tol: float = 1e-6,
     convergence_window: int = 7,
     convergence_mean_tol: float = 0.01,
@@ -131,7 +153,15 @@ def fit_parametric_dde(
     mcem_shrinkage_burn=None,
     mcem_reorder_after_shrinkage_burn: bool = True,
     mcem_stage_spectral_gap_threshold=None,
-    csp_backend: str = "mcem",
+    csp_backend=None,
+    csp_initializer=None,
+    csp_threshold_rule: str = "first_two",
+    csp_mstep_solver: str = "hybrid",
+    csp_mstep_latent: str = "draw",
+    csp_observed_noise_scale: float = 0.0,
+    csp_fista_maxiter=None,
+    n_jobs: int = 1,
+    standardize=None,
     burn: int = 5,
     estep_row_chunk_size: int = 2048,
     estep_coordinate_chunk_size: int = 1,
@@ -154,10 +184,31 @@ def fit_parametric_dde(
     For fixed-width fits, ``tol`` is the postprocessed parameter-update RMSE.
     Its default is ``0.005`` for a dimension-independent convergence scale.
 
-    Parametric CSP defaults to the simultaneous ``csp_backend="mcem"`` path.
+    Normal CSP defaults to ``csp_backend="copula"``: the CopDDE D-layer CSP
+    algorithm with the rank-likelihood resampling removed because the Normal
+    DDE observes its Gaussian layer.  It initializes with the Normal family's
+    own data initializer (``csp_initializer="family"``; the CopDDE
+    ``Normal_init_D`` rules remain available as ``csp_initializer="copula"``
+    but leave more spurious deep columns active) and uses the CopDDE
+    L-BFGS-B budget ``optimizer_maxiter=15`` for the logistic layers unless
+    overridden.  The observed Gaussian layer is solved exactly by the
+    Normal family's proximal weighted-lasso solver
+    (``csp_mstep_solver="hybrid"``, ``csp_fista_maxiter=300``), which removes
+    the duplicate latent columns that the inexact L-BFGS-B step leaves
+    active; ``csp_mstep_solver="lbfgsb"`` restores the CopDDE M-step in
+    every layer.
+    Bernoulli and Poisson CSP default to the simultaneous ``"mcem"`` path.
     The explicit ``"mcem_reinitialize"`` backend performs staged parent
     rebuilding, while ``"mcem_cap_only"`` applies staged child-implied caps
-    and preserves eligible parent state.
+    and preserves eligible parent state.  ``mcem_*`` controls are ignored by
+    the copula backend.
+
+    ``standardize`` (default ``True`` for the copula backend, ``False``
+    otherwise) runs a Normal CSP fit on column-standardized observations, the
+    scale on which the CopDDE latent Gaussian layer lives and on which the
+    CopDDE ``t_spike`` and ``tau`` values were calibrated.  The returned
+    observed-layer coefficients and variances are mapped back to the original
+    scale; the hard threshold therefore acts on standardized loadings.
     """
     family_adapter = resolve_parametric_family(family)
     if kwargs:
@@ -228,6 +279,46 @@ def fit_parametric_dde(
     if max_it < 1:
         raise ValueError("max_it must be a positive integer.")
 
+    if csp_backend is None:
+        backend = (
+            "copula"
+            if method == "csp" and family_adapter.key == "normal"
+            else "mcem"
+        )
+    else:
+        backend = str(csp_backend).strip().lower()
+    if method == "csp" and backend == "copula" and family_adapter.key != "normal":
+        raise NotImplementedError(
+            "csp_backend='copula' is implemented for the Normal family only."
+        )
+    if csp_initializer is None:
+        csp_initializer = "family"
+    csp_initializer = str(csp_initializer).strip().lower()
+    if csp_initializer not in {"copula", "family"}:
+        raise ValueError("csp_initializer must be 'copula' or 'family'.")
+    if csp_initializer == "copula" and family_adapter.key != "normal":
+        raise ValueError(
+            "csp_initializer='copula' is available for the Normal family only."
+        )
+    if optimizer_maxiter is None:
+        optimizer_maxiter = 15 if backend == "copula" else 100
+    optimizer_maxiter = int(optimizer_maxiter)
+    if optimizer_maxiter < 1:
+        raise ValueError("optimizer_maxiter must be a positive integer.")
+    if standardize is None:
+        standardize = method == "csp" and backend == "copula"
+    standardize = bool(standardize)
+    if standardize and (method != "csp" or family_adapter.key != "normal"):
+        raise ValueError("standardize is only supported by Normal CSP fits.")
+    X_raw = X
+    column_mean = None
+    column_sd = None
+    if standardize:
+        column_mean = np.mean(X_raw, axis=0)
+        column_sd = np.std(X_raw, axis=0)
+        column_sd = np.where(column_sd > 0, column_sd, 1.0)
+        X = (X_raw - column_mean[None, :]) / column_sd[None, :]
+
     supplied_names = ["prop_in", "B_list_in"]
     supplied = [prop_in, B_list_in]
     if family_adapter.has_dispersion:
@@ -267,6 +358,10 @@ def fit_parametric_dde(
             else None
         )
         A_list = [np.asarray(A, dtype=float) for A in A_list_in]
+        if standardize:
+            B_list[0], gamma = _standardize_observed_layer(
+                B_list[0], gamma, column_mean, column_sd
+            )
     else:
         initialization = str(initialize).lower()
         if initialization == "data":
@@ -274,13 +369,19 @@ def fit_parametric_dde(
                 raise ValueError(
                     "B_list_true and G_list_true are only used with initialize='oracle'."
                 )
-            prop, B_list, gamma, A_list, _ = family_adapter.initialize(
-                X,
-                K_tuple,
-                epsilon=epsilon,
-                mode="data",
-                random_state=random_state if method == "csp" else None,
-            )
+            if method == "csp" and csp_initializer == "copula":
+                prop, B_list, gamma, A_list = Normal_init_cop(
+                    X, K_tuple, epsilon=epsilon
+                )
+                initialization = "data_copula"
+            else:
+                prop, B_list, gamma, A_list, _ = family_adapter.initialize(
+                    X,
+                    K_tuple,
+                    epsilon=epsilon,
+                    mode="data",
+                    random_state=random_state if method == "csp" else None,
+                )
         elif initialization == "oracle":
             if B_list_true is None or G_list_true is None:
                 raise ValueError(
@@ -349,7 +450,96 @@ def fit_parametric_dde(
             raw=(X_result, prop, B_list, gamma, A_list, iterations),
         )
 
-    backend = str(csp_backend).strip().lower()
+    if backend == "copula":
+        raw = fit_normal_csp_copula(
+            X,
+            prop,
+            gamma,
+            B_list,
+            A_list,
+            C=C,
+            it=max_it,
+            t_spike=t_spike,
+            temp=temp,
+            tau=tau,
+            optimizer_maxiter=optimizer_maxiter,
+            optimizer_tol=optimizer_tol,
+            bound_val=bound_val,
+            n_jobs=n_jobs,
+            convergence_window=convergence_window,
+            convergence_std=tol,
+            burn=burn,
+            threshold_rule=csp_threshold_rule,
+            mstep_solver=csp_mstep_solver,
+            mstep_latent=csp_mstep_latent,
+            observed_noise_scale=csp_observed_noise_scale,
+            fista_maxiter=csp_fista_maxiter,
+            random_state=random_state,
+            keep_trace=keep_trace,
+            verbose=bool(verbose),
+        )
+        X_result = X_raw.copy()
+        if standardize:
+            raw["B_list"][0], raw["gamma"] = _destandardize_observed_layer(
+                raw["B_list"][0], raw["gamma"], column_mean, column_sd
+            )
+        diagnostics = {
+            "iterations": raw["iterations"],
+            "D": D,
+            "K_list": tuple(raw["num_active"].tolist()),
+            "K_max_list": K_tuple,
+            "original_K_list": K_tuple,
+            "family": family_adapter.name,
+            "dimension_method": "csp",
+            "initialization": initialization,
+            "initializer": csp_initializer,
+            "standardized": standardize,
+            "column_mean": None if column_mean is None else column_mean.copy(),
+            "column_sd": None if column_sd is None else column_sd.copy(),
+            "backend": "copula",
+            "kernel": "copdde_csp_mean_field_mcem",
+            "latent_transition": raw["latent_transition"],
+            "mc_state_update": raw["mc_state_update"],
+            "threshold_rule": raw["threshold_rule"],
+            "mstep_solver": raw["mstep_solver"],
+            "mstep_latent": raw["mstep_latent"],
+            "observed_noise_scale": raw["observed_noise_scale"],
+            "optimizer_maxiter": raw["optimizer_maxiter"],
+            "fista_maxiter": raw["fista_maxiter"],
+            "convergence_metric": "rolling_relative_frobenius_std",
+            "convergence_tol": tol,
+            "convergence_window": int(convergence_window),
+            "num_active": raw["num_active"].copy(),
+            "allocation": [value.copy() for value in raw["allocation"]],
+            "omega": [value.copy() for value in raw["omega"]],
+            "slab_scale": [value.copy() for value in raw["slab_scale"]],
+            "relative_history": raw["relative_history"],
+            "temperature": raw["temperature"],
+            "stopped_by_convergence": raw["stopped_by_convergence"],
+        }
+        if keep_trace:
+            diagnostics["trace"] = raw["trace"]
+        compressed = compress_csp_result_components(
+            prop=raw["prop"],
+            B_list=raw["B_list"],
+            A_list=raw["A_list"],
+            diagnostics=diagnostics,
+            raw=raw,
+            active_masks=raw["active_masks"],
+            min_active=False,
+        )
+        return DDEResult(
+            model="DDE",
+            K_list=list(compressed["diagnostics"]["K_list"]),
+            prop=compressed["prop"],
+            B_list=compressed["B_list"],
+            gamma=raw["gamma"],
+            A_list=compressed["A_list"],
+            transformed=X_result,
+            diagnostics=compressed["diagnostics"],
+            raw=compressed["raw"],
+        )
+
     backend_configuration = {
         "mcem": (False, "none"),
         "mcem_reinitialize": (True, "reinitialize"),
@@ -357,7 +547,8 @@ def fit_parametric_dde(
     }
     if backend not in backend_configuration:
         raise ValueError(
-            "csp_backend must be 'mcem', 'mcem_reinitialize', or " "'mcem_cap_only'."
+            "csp_backend must be 'copula', 'mcem', 'mcem_reinitialize', or "
+            "'mcem_cap_only'."
         )
     stagewise, stage_transition_mode = backend_configuration[backend]
     if backend != "mcem_reinitialize" and mcem_stage_spectral_gap_threshold is not None:
@@ -415,7 +606,11 @@ def fit_parametric_dde(
         family=family_adapter,
     )
 
-    X_result = X.copy()
+    X_result = X_raw.copy()
+    if standardize:
+        raw["B_list"][0], raw["gamma"] = _destandardize_observed_layer(
+            raw["B_list"][0], raw["gamma"], column_mean, column_sd
+        )
     latent_transition = raw["latent_transition"]
     diagnostics = {
         "iterations": raw["iterations"],
@@ -426,6 +621,9 @@ def fit_parametric_dde(
         "family": family_adapter.name,
         "dimension_method": "csp",
         "initialization": initialization,
+        "standardized": standardize,
+        "column_mean": None if column_mean is None else column_mean.copy(),
+        "column_sd": None if column_sd is None else column_sd.copy(),
         "backend": backend,
         "kernel": (
             "systematic_gibbs_mcem_csp"
