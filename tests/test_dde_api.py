@@ -356,7 +356,7 @@ def test_fit_dde_normal_csp_uses_copula_backend_by_default():
     assert result.diagnostics["standardized"] is True
     assert result.diagnostics["initialization"] == "data"
     assert result.diagnostics["initializer"] == "family"
-    assert result.diagnostics["mstep_solver"] == "hybrid"
+    assert result.diagnostics["mstep_solver"] == "fista_lower"
     assert result.diagnostics["fista_maxiter"] == 300
 
     legacy = fit(X, csp_backend="mcem", **args)

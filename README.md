@@ -44,17 +44,26 @@ the default): the MATLAB `get_SAEM_RL_CSP_D` kernel with its rank-likelihood
 resampling removed, because the Normal DDE observes its Gaussian layer.  The
 fit runs on column-standardized observations, the unit-variance scale of the
 CopDDE latent layer on which the CopDDE `t_spike` and `tau` values are
-calibrated, initializes with the CopDDE `Normal_init_D` rules, and uses the
-CopDDE L-BFGS-B M-step budget (`optimizer_maxiter=15`).  Observed-layer
-coefficients and variances are returned on the original scale; the hard
-threshold `tau` acts on standardized loadings.  `tol` is the rolling
-standard deviation of the relative coefficient change (window 7) that stops
-the kernel.  `standardize=False`, `csp_initializer="family"`,
-`csp_mstep_solver="fista"`, and `csp_threshold_rule` expose the individual
+calibrated, and initializes with the Normal family's data initializer
+(`csp_initializer="family"`; the CopDDE `Normal_init_D` rules remain
+available as `csp_initializer="copula"`).  Layers 1 to D-1 are solved with
+an exact proximal weighted-lasso step (`csp_mstep_solver="fista_lower"`,
+`csp_fista_maxiter=300`) under a penalty proportional to N
+(`csp_penalty_scaling_power=1`, `csp_penalty_scaling_layers="lower"`,
+`csp_penalty_scaling_reference=500`); the deepest layer keeps the CopDDE
+inexact L-BFGS-B step (`optimizer_maxiter=15`) with the unscaled penalty.
+Observed-layer coefficients and variances are returned on the original
+scale; the hard threshold `tau` acts on standardized loadings.  `tol` is the
+rolling standard deviation of the relative coefficient change (window 7)
+that stops the kernel.  `csp_mstep_solver="lbfgsb"` together with
+`csp_penalty_scaling_power=0` restores the CopDDE M-step in every layer;
+`csp_slab_shape` and `csp_slab_rate` set the CUSP slab hyperprior (CopDDE
+1 and 5); `standardize=False` and `csp_threshold_rule` expose the remaining
 adaptations.  The previous simultaneous MCEM kernel remains available as
 `csp_backend="mcem"`.  Run `scripts/evaluate_normal_csp_copula_kernel.py` to
-compare the backends' mean fitted widths against the true widths on the
-CopDDE paper designs.
+compare configurations' mean fitted widths against the true widths on the
+CopDDE paper designs; `Results/normal_dde_csp_copula_kernel/` holds the
+studies behind these defaults.
 
 SemiDDE supports the same maximum-width CSP initialization while retaining
 its semiparametric pseudo-observation update.  `D` fixes the hierarchy depth;

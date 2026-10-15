@@ -70,6 +70,7 @@ def test_kernel_equals_copdde_kernel_without_rank_resampling(monkeypatch):
         temp=0.9,
         optimizer_maxiter=15,
         mstep_solver="lbfgsb",
+        penalty_scaling_power=0.0,
         random_state=None,
         verbose=False,
         **common,
@@ -124,7 +125,7 @@ def test_fista_solver_and_threshold_rules_run():
 
 def _run_kernel(inputs, **overrides):
     kwargs = dict(C=1, it=1, t_spike=[0.02, 0.03], temp=0.9, tau=0.3,
-                  verbose=False, random_state=4)
+                  verbose=False, random_state=4, penalty_scaling_power=0.0)
     kwargs.update(overrides)
     return fit_normal_csp_copula(
         inputs["X"], inputs["prop"], inputs["gamma"],
@@ -143,7 +144,8 @@ def test_hybrid_solver_uses_fista_observed_layer_and_lbfgsb_logistic_layers():
     assert hybrid["mstep_solver"] == "hybrid"
     assert hybrid["fista_maxiter"] == 60
     assert lbfgsb["fista_maxiter"] == 300
-    assert _run_kernel(inputs)["mstep_solver"] == "hybrid"
+    assert _run_kernel(inputs)["mstep_solver"] == "fista_lower"
+    assert _run_kernel(inputs)["layer_solvers"] == ("fista", "lbfgsb")
     np.testing.assert_array_equal(hybrid["B_list"][0], fista["B_list"][0])
     np.testing.assert_array_equal(hybrid["B_list"][1], lbfgsb["B_list"][1])
     assert not np.array_equal(hybrid["B_list"][0], lbfgsb["B_list"][0])
@@ -264,7 +266,7 @@ def test_copula_backend_is_default_for_normal_and_shrinks_overspecified_widths()
     assert result.diagnostics["initialization"] == "data"
     assert result.diagnostics["initializer"] == "family"
     assert result.diagnostics["optimizer_maxiter"] == 15
-    assert result.diagnostics["mstep_solver"] == "hybrid"
+    assert result.diagnostics["mstep_solver"] == "fista_lower"
     assert result.diagnostics["fista_maxiter"] == 300
     assert tuple(result.diagnostics["K_max_list"]) == (12, 4)
     K1, K2 = result.K_list
@@ -378,9 +380,13 @@ def test_penalty_scaling_multiplies_mstep_weights_and_is_recorded():
             _copy(inputs["B_list"]), _copy(inputs["A_list"]))
     base = dict(C=1, it=2, t_spike=0.02, temp=0.9, tau=0.3, verbose=False,
                 random_state=3)
-    unscaled = fit_normal_csp_copula(*args, **base)
+    unscaled = fit_normal_csp_copula(*args, penalty_scaling_power=0.0, **base)
+    default = fit_normal_csp_copula(*args, **base)
+    assert default["penalty_scaling_layers"] == "lower"
+    assert default["penalty_factor"] == (inputs["X"].shape[0] / 500.0, 1.0)
     scaled = fit_normal_csp_copula(
-        *args, penalty_scaling_power=1.0, penalty_scaling_reference=10.0, **base
+        *args, penalty_scaling_power=1.0, penalty_scaling_reference=10.0,
+        penalty_scaling_layers="all", **base
     )
     N = inputs["X"].shape[0]
     assert scaled["penalty_factor"] == (N / 10.0, N / 10.0)
@@ -392,7 +398,7 @@ def test_penalty_scaling_multiplies_mstep_weights_and_is_recorded():
     assert deep["penalty_factor"] == (1.0, (N / 10.0) ** 0.5)
     per_layer = fit_normal_csp_copula(
         *args, penalty_scaling_power=[1.0, 0.5], penalty_scaling_reference=10.0,
-        **base
+        penalty_scaling_layers="all", **base
     )
     assert per_layer["penalty_factor"] == (N / 10.0, (N / 10.0) ** 0.5)
     assert per_layer["penalty_scaling_power"] == (1.0, 0.5)

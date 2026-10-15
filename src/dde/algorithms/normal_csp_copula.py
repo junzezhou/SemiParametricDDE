@@ -133,15 +133,15 @@ def fit_normal_csp_copula(
     convergence_std: float = 0.005,
     burn: int = 5,
     threshold_rule: str = "first_two",
-    mstep_solver: str = "hybrid",
+    mstep_solver: str = "fista_lower",
     mstep_latent: str = "draw",
     observed_noise_scale: float = 0.0,
     fista_maxiter=None,
     slab_shape: float = 1.0,
     slab_rate: float = 5.0,
-    penalty_scaling_power: float = 0.0,
+    penalty_scaling_power: float = 1.0,
     penalty_scaling_reference: float = 500.0,
-    penalty_scaling_layers: str = "all",
+    penalty_scaling_layers: str = "lower",
     penalty_scaling_allocation: bool = False,
     random_state=None,
     keep_trace: bool = False,
@@ -163,13 +163,13 @@ def fit_normal_csp_copula(
         (``15`` reproduces the MATLAB ``fmincon`` budget).
     threshold_rule : ``"first_two"`` (package CopDDE rule), ``"all_but_last"``
         (MATLAB D-layer rule), or ``"none"``.
-    mstep_solver : ``"hybrid"`` (default: FISTA for the observed Gaussian
-        layer, L-BFGS-B for the logistic layers), ``"lbfgsb"`` (CopDDE:
-        L-BFGS-B in every layer), ``"fista"`` (exact weighted lasso via
-        the Normal family's proximal solver in every layer),
-        ``"fista_lower"`` (FISTA in layers 1..D-1 and L-BFGS-B in the deepest
-        layer), or a length-``D`` sequence of ``"fista"`` / ``"lbfgsb"``
-        giving the solver per layer.
+    mstep_solver : ``"fista_lower"`` (default: exact proximal FISTA
+        weighted-lasso solves in layers 1..D-1 and the CopDDE L-BFGS-B step
+        in the deepest layer), ``"hybrid"`` (FISTA for the observed Gaussian
+        layer only), ``"lbfgsb"`` (CopDDE: L-BFGS-B in every layer),
+        ``"fista"`` (FISTA in every layer; collapses the deepest layer at
+        large ``N``), or a length-``D`` sequence of ``"fista"`` /
+        ``"lbfgsb"`` giving the solver per layer.
     fista_maxiter : iteration budget of the FISTA solves; ``None`` selects
         ``300``.  Budgets below about 100 leave duplicate columns at large
         ``N`` because the per-iteration transfer of loading mass scales with
@@ -189,13 +189,15 @@ def fit_normal_csp_copula(
         penalty of every M-step is multiplied by
         ``c_N = (N / penalty_scaling_reference) ** penalty_scaling_power``
         (power 0, the CopDDE default, leaves the O(1) prior against the O(N)
-        likelihood; power 1 makes the penalty proportional to N, equivalent
-        to the CopDDE penalty on the average likelihood; power 0.5 is the
-        ``sqrt(N)`` rate).  ``penalty_scaling_power`` may be a length-``D``
-        sequence of per-layer powers.
-    penalty_scaling_layers : ``"all"``, ``"deep"`` (layers 2..D only), or
-        ``"lower"`` (layers 1..D-1, leaving the deepest layer unscaled); with
-        a per-layer power sequence the excluded layers' powers are zeroed.
+        likelihood; power 1, the default, makes the penalty proportional to
+        N, equivalent to the CopDDE penalty on the average likelihood; power
+        0.5 is the ``sqrt(N)`` rate).  ``penalty_scaling_power`` may be a
+        length-``D`` sequence of per-layer powers.  The scaled penalty needs
+        the proximal solver: the L-BFGS-B step stalls under large L1 weights.
+    penalty_scaling_layers : ``"lower"`` (default: layers 1..D-1, leaving
+        the deepest layer unscaled), ``"all"``, or ``"deep"`` (layers 2..D
+        only); with a per-layer power sequence the excluded layers' powers
+        are zeroed.
     penalty_scaling_allocation : when ``True`` the CUSP allocation evaluates
         the spike and slab densities on the scaled coefficients ``c_N * B``,
         which is the allocation implied by the scaled prior

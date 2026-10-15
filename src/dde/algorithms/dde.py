@@ -156,15 +156,15 @@ def fit_parametric_dde(
     csp_backend=None,
     csp_initializer=None,
     csp_threshold_rule: str = "first_two",
-    csp_mstep_solver: str = "hybrid",
+    csp_mstep_solver: str = "fista_lower",
     csp_mstep_latent: str = "draw",
     csp_observed_noise_scale: float = 0.0,
     csp_fista_maxiter=None,
     csp_slab_shape: float = 1.0,
     csp_slab_rate: float = 5.0,
-    csp_penalty_scaling_power: float = 0.0,
+    csp_penalty_scaling_power: float = 1.0,
     csp_penalty_scaling_reference: float = 500.0,
-    csp_penalty_scaling_layers: str = "all",
+    csp_penalty_scaling_layers: str = "lower",
     csp_penalty_scaling_allocation: bool = False,
     n_jobs: int = 1,
     standardize=None,
@@ -196,13 +196,19 @@ def fit_parametric_dde(
     own data initializer (``csp_initializer="family"``; the CopDDE
     ``Normal_init_D`` rules remain available as ``csp_initializer="copula"``
     but leave more spurious deep columns active) and uses the CopDDE
-    L-BFGS-B budget ``optimizer_maxiter=15`` for the logistic layers unless
-    overridden.  The observed Gaussian layer is solved exactly by the
-    Normal family's proximal weighted-lasso solver
-    (``csp_mstep_solver="hybrid"``, ``csp_fista_maxiter=300``), which removes
-    the duplicate latent columns that the inexact L-BFGS-B step leaves
-    active; ``csp_mstep_solver="lbfgsb"`` restores the CopDDE M-step in
-    every layer.
+    L-BFGS-B budget ``optimizer_maxiter=15`` for the deepest layer unless
+    overridden.  Layers 1..D-1 are solved exactly by the proximal
+    weighted-lasso solver (``csp_mstep_solver="fista_lower"``,
+    ``csp_fista_maxiter=300``) with a penalty proportional to ``N``
+    (``csp_penalty_scaling_power=1``, ``csp_penalty_scaling_layers="lower"``,
+    reference 500): the exact solve removes duplicate latent columns and the
+    scaled penalty removes weak deep columns that an O(1) prior cannot
+    remove against an O(N) likelihood.  The deepest layer keeps the CopDDE
+    inexact step and unscaled penalty, because an exact solve collapses it
+    at large ``N``.  ``csp_mstep_solver="lbfgsb"`` with
+    ``csp_penalty_scaling_power=0`` restores the CopDDE M-step in every
+    layer; ``csp_slab_shape`` and ``csp_slab_rate`` change the CUSP slab
+    hyperprior (CopDDE 1 and 5).
     Bernoulli and Poisson CSP default to the simultaneous ``"mcem"`` path.
     The explicit ``"mcem_reinitialize"`` backend performs staged parent
     rebuilding, while ``"mcem_cap_only"`` applies staged child-implied caps
