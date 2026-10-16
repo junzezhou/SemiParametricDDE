@@ -57,7 +57,10 @@ from .get_SAEM_RL_CSP_D import (
     _threshold,
     _update_bernoulli_probabilities_D,
 )
-from .parametric_csp_mcem import _solve_logistic_weighted_l1
+from .parametric_csp_mcem import (
+    _canonicalize_csp_layer_order,
+    _solve_logistic_weighted_l1,
+)
 from .normal_init_cop import _binary_init_matlab
 from .normal_init_semi import initialize_binary_parent
 from .parametric_families import (
@@ -244,6 +247,8 @@ def fit_parametric_csp_copula(
     merge_cosine: float = 0.0,
     merge_after: int = 10,
     merge_layers: str = "top",
+    shrinkage_burn: int = 0,
+    reorder_after_shrinkage_burn: bool = True,
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
@@ -350,6 +355,19 @@ def fit_parametric_csp_copula(
         is applied.
     merge_layers : ``"top"`` (deepest layer only) or ``"logistic"`` (every
         layer above the observed one).
+    shrinkage_burn : number of initial iterations during which every
+        column of every layer is held in the CUSP slab (allocation
+        ``K_d + 1``, M-step prior scale equal to the slab scale, no hard
+        thresholding, no gating, and no convergence check), so that the
+        latent states and coefficients can settle before any column can
+        fall into the spike; the CUSP updates start at iteration
+        ``shrinkage_burn + 1``.  Zero (the CopDDE behaviour) starts the
+        CUSP updates at iteration 1.  This is the slab-start warm-up of
+        the parametric MCEM kernel (``shrinkage_burn`` there).
+    reorder_after_shrinkage_burn : when ``shrinkage_burn`` is positive,
+        permute each layer's columns by decreasing coefficient L1 norm
+        once the burn-in ends (the model is permutation invariant, the
+        ordered CUSP prior is not), as the MCEM kernel does.
     random_state : ``None`` for the legacy global RNG, else a seed/Generator.
 
     Returns
@@ -519,6 +537,12 @@ def fit_parametric_csp_copula(
         raise ValueError("merge_layers must be one of " + ", ".join(_MERGE_LAYERS) + ".")
     if reinit_top_after and D < 2:
         raise ValueError("reinit_top_after requires at least two latent layers.")
+    shrinkage_burn = int(shrinkage_burn)
+    if shrinkage_burn < 0:
+        raise ValueError("shrinkage_burn must be a nonnegative integer.")
+    if shrinkage_burn >= it:
+        raise ValueError("shrinkage_burn must be smaller than it.")
+    reorder_after_shrinkage_burn = bool(reorder_after_shrinkage_burn)
 
     t_spike = np.asarray(t_spike, dtype=float).reshape(-1)
     if t_spike.size == 1:
@@ -580,10 +604,34 @@ def fit_parametric_csp_copula(
     x_sq_sum = np.sum(X**2, axis=0) if (observed_fista and is_normal) else None
     top_reinit = None
     merge_events = []
+    burn_permutations = None
 
     it_num = 0
     stopped_by_convergence = False
     while it_num < it:
+        shrinkage_active = it_num >= shrinkage_burn
+        # 0a) End of the slab-start burn-in: order the columns of every
+        #     layer by strength.  The CUSP state is column symmetric at
+        #     this point (all slab, unit slab scales), so only the model
+        #     parameters and latent states need permuting.
+        if (
+            shrinkage_burn
+            and shrinkage_active
+            and reorder_after_shrinkage_burn
+            and burn_permutations is None
+        ):
+            prop, B_list, A_list, burn_permutations = _canonicalize_csp_layer_order(
+                prop, B_list, A_list
+            )
+            for d, permutation in enumerate(burn_permutations):
+                theta_slab[d] = theta_slab[d][permutation]
+                theta[d] = theta[d][:, permutation]
+                theta_mstep[d] = theta_mstep[d][:, permutation]
+                z_cusp[d] = z_cusp[d][permutation]
+                if d >= 1 and burn_permutations[d - 1] is not None:
+                    theta[d] = theta[d][burn_permutations[d - 1], :]
+                    theta_mstep[d] = theta_mstep[d][burn_permutations[d - 1], :]
+
         # 0) Optional one-off re-initialization of the deepest layer from
         #    the current active children.
         if reinit_top_after and it_num == reinit_top_after and top_reinit is None:
@@ -661,6 +709,15 @@ def fit_parametric_csp_copula(
         #    M-step prior is Laplace(0, scale / c_N); the allocation either
         #    sees c_N * B (the matching densities) or the raw B (power prior).
         for d in range(D - 1, -1, -1):
+            if not shrinkage_active:
+                # Slab-start burn-in: every column in the slab at the
+                # current slab scale, as in the MCEM kernel's warm-up.
+                z_cusp[d] = np.full(K[d], K[d] + 1, dtype=int)
+                theta[d] = np.broadcast_to(
+                    theta_slab[d][None, :], theta[d].shape
+                ).copy()
+                theta_mstep[d] = theta[d] / penalty_factor[d]
+                continue
             num_rows = J if d == 0 else int(num_act[d - 1])
             B_alloc = (
                 B_list[d] * penalty_factor[d]
@@ -736,8 +793,9 @@ def fit_parametric_csp_copula(
             inactive = np.flatnonzero(~csp_active_mask(z_cusp[d]))
             ind_inact[d] = inactive
             num_act[d] = K[d] - inactive.size
-        for d in range(thresholded_layers):
-            B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
+        if shrinkage_active:
+            for d in range(thresholded_layers):
+                B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
         for d in range(D - 1):
             if ind_inact[d].size:
                 B_update[d + 1][ind_inact[d], :] = 0.0
@@ -746,8 +804,9 @@ def fit_parametric_csp_copula(
         if it_num > burn:
             temp = min(1.0, temp + 0.01 * ((it_num - burn) - 1))
 
-        # 9) Rolling relative-change stopping rule.
-        stop_now = True
+        # 9) Rolling relative-change stopping rule (never during the
+        #    slab-start burn-in).
+        stop_now = shrinkage_active
         current_rel = []
         for d in range(D):
             rel = np.linalg.norm(B_update[d][:, 1:] - B_list[d][:, 1:], ord="fro") / (
@@ -774,6 +833,7 @@ def fit_parametric_csp_copula(
                     ],
                     "relative_change": tuple(current_rel),
                     "temperature": float(temp),
+                    "shrinkage_active": bool(shrinkage_active),
                     "will_stop": bool(stop_now),
                 }
             )
@@ -851,6 +911,9 @@ def fit_parametric_csp_copula(
         "merge_after": merge_after,
         "merge_layers": merge_layers,
         "merge_events": merge_events,
+        "shrinkage_burn": shrinkage_burn,
+        "reorder_after_shrinkage_burn": reorder_after_shrinkage_burn,
+        "burn_permutations": burn_permutations,
         "relative_history": [tuple(values) for values in rel_hist],
         "trace": trace,
     }

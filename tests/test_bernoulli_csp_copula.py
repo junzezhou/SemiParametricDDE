@@ -104,7 +104,8 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
     assert d["initializer"] == "family"
     assert d["mstep_solver"] == "fista_lower"
     assert d["latent_transition"] == "systematic_coordinate_gibbs"
-    assert d["penalty_scaling_power"] == (0.0, 0.0)
+    assert d["penalty_scaling_power"] == (0.5, 0.5)
+    assert d["shrinkage_burn"] == 0  # D=2: no automatic burn-in
     assert result.gamma is None
     assert tuple(d["K_max_list"]) == (9, 3)
     K1, K2 = result.K_list
@@ -134,3 +135,112 @@ def test_bernoulli_copula_backend_rejects_standardize_and_poisson():
             t_spike=0.03, temp=0.9, tau=0.3, C=1, max_iter=1, verbose=False,
             csp_backend="copula",
         )
+
+
+def test_shrinkage_burn_holds_every_column_in_the_slab():
+    inputs = _inputs()
+    raw = fit_bernoulli_csp(
+        inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+        C=1, it=4, t_spike=[0.03, 0.05], temp=0.9, tau=0.3, verbose=False,
+        latent_transition="systematic_coordinate_gibbs", shrinkage_burn=2,
+        keep_trace=True, random_state=4,
+    )
+    assert raw["shrinkage_burn"] == 2
+    assert raw["iterations"] == 4
+    trace = raw["trace"]
+    for entry in trace[:2]:
+        assert entry["shrinkage_active"] is False
+        assert entry["will_stop"] is False
+        assert tuple(entry["num_active"]) == (6, 2)
+        assert np.array_equal(entry["allocation"][0], np.full(6, 7))
+        assert np.array_equal(entry["allocation"][1], np.full(2, 3))
+        # slab scales are untouched (unit) while the CUSP update is off
+        assert np.allclose(entry["slab_scale"][0], 1.0)
+    assert trace[2]["shrinkage_active"] is True
+    # the strength ordering ran once at the end of the burn-in
+    assert raw["reorder_after_shrinkage_burn"] is True
+    assert len(raw["burn_permutations"]) == 2
+    for permutation, K in zip(raw["burn_permutations"], (6, 2)):
+        assert sorted(permutation.tolist()) == list(range(K))
+    assert all(np.all(np.isfinite(B)) for B in raw["B_list"])
+
+
+def test_shrinkage_burn_without_reordering_and_validation():
+    inputs = _inputs()
+    base = dict(C=1, t_spike=0.03, temp=0.9, tau=0.3, verbose=False, random_state=4)
+    raw = fit_bernoulli_csp(
+        inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+        it=3, shrinkage_burn=1, reorder_after_shrinkage_burn=False, **base,
+    )
+    assert raw["burn_permutations"] is None
+    assert raw["reorder_after_shrinkage_burn"] is False
+    unchanged = fit_bernoulli_csp(
+        inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+        it=3, **base,
+    )
+    assert unchanged["shrinkage_burn"] == 0
+    assert unchanged["burn_permutations"] is None
+    with pytest.raises(ValueError, match="nonnegative"):
+        fit_bernoulli_csp(
+            inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+            it=3, shrinkage_burn=-1, **base,
+        )
+    with pytest.raises(ValueError, match="smaller than it"):
+        fit_bernoulli_csp(
+            inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+            it=3, shrinkage_burn=3, **base,
+        )
+
+
+def test_shrinkage_burn_reordering_sorts_columns_by_strength():
+    inputs = _inputs()
+    raw = fit_bernoulli_csp(
+        inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+        C=1, it=2, t_spike=0.03, temp=0.9, tau=0.3, verbose=False, random_state=4,
+        latent_transition="systematic_coordinate_gibbs", shrinkage_burn=1,
+        keep_trace=True,
+    )
+    # The reordering runs at the start of iteration 2 on the coefficients
+    # produced by the burn-in iteration, whose column L1 norms the trace
+    # records.
+    for d, K in enumerate((6, 2)):
+        strength = raw["trace"][0]["updated_column_l1"][d]
+        expected = np.argsort(-strength, kind="stable")
+        assert np.array_equal(raw["burn_permutations"][d], expected)
+    assert not np.array_equal(raw["burn_permutations"][0], np.arange(6))
+
+
+def test_fit_passes_shrinkage_burn_to_copula_backend():
+    X, _ = _simulate(5, N=200)
+    result = fit(
+        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=6,
+        random_state=7, verbose=False, csp_backend="copula",
+        csp_shrinkage_burn=3, keep_trace=True,
+    )
+    d = result.diagnostics
+    assert d["shrinkage_burn"] == 3
+    assert d["reorder_after_shrinkage_burn"] is True
+    assert len(d["burn_permutations"]) == 2
+    assert all(tuple(e["num_active"]) == (9, 3) for e in d["trace"][:3])
+    assert d["iterations"] == 6
+
+
+def test_bernoulli_copula_defaults_burn_in_for_three_layers():
+    rng = np.random.default_rng(3)
+    X = rng.integers(0, 2, size=(120, 27)).astype(float)
+    common = dict(
+        method="DDE", family="Bernoulli", D=3, dimension_method="csp",
+        t_spike=[0.01, 0.03, 0.005], temp=0.9, tau=0.3, C=1, random_state=1,
+        verbose=False, csp_backend="copula", keep_trace=True,
+    )
+    auto = fit(X, max_iter=20, **common)
+    assert auto.diagnostics["shrinkage_burn"] == 10
+    assert auto.diagnostics["penalty_scaling_power"] == (0.5, 0.5, 0.5)
+    assert all(
+        tuple(e["num_active"]) == (9, 3, 1) for e in auto.diagnostics["trace"][:10]
+    )
+    short = fit(X, max_iter=12, **common)
+    assert short.diagnostics["shrinkage_burn"] == 0
+    explicit = fit(X, max_iter=12, csp_shrinkage_burn=4, **common)
+    assert explicit.diagnostics["shrinkage_burn"] == 4

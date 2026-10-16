@@ -50,6 +50,10 @@ def _parse_args():
     parser.add_argument("--slab-rate", type=float, default=5.0)
     parser.add_argument("--latent-transition", default="systematic_coordinate_gibbs")
     parser.add_argument("--merge-cosine", type=float, default=0.0)
+    parser.add_argument("--shrinkage-burn", type=int, default=0,
+                        help="copula backend: slab-start burn-in iterations (default 0 here; the package default is 10 for D>=3)")
+    parser.add_argument("--no-reorder-after-burn", action="store_true",
+                        help="copula backend: skip the strength ordering at the end of the burn-in")
     parser.add_argument("--seed-base", type=int, default=20260902)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--out-dir", type=Path, required=True)
@@ -82,6 +86,8 @@ def _run_one(task):
             csp_slab_rate=settings["slab_rate"],
             csp_latent_transition=settings["latent_transition"],
             csp_merge_cosine=settings["merge_cosine"],
+            csp_shrinkage_burn=settings["shrinkage_burn"],
+            csp_reorder_after_shrinkage_burn=not settings["no_reorder_after_burn"],
         )
     else:
         kwargs.update(optimizer_maxiter=100)
@@ -160,7 +166,8 @@ def main():
         "max_iter", "mc_samples", "tau", "t_spike_multiplier", "optimizer_maxiter",
         "mstep_solver", "fista_maxiter", "penalty_power", "penalty_reference",
         "penalty_layers", "slab_shape", "slab_rate", "latent_transition",
-        "merge_cosine", "seed_base", "keep_trace")}
+        "merge_cosine", "shrinkage_burn", "no_reorder_after_burn", "seed_base",
+        "keep_trace")}
     (out_dir / "metadata.json").write_text(json.dumps({"settings": settings, "args": vars(args)}, indent=2, default=str))
     checkpoint = out_dir / "fits.jsonl"
     done = {}

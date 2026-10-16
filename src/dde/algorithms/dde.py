@@ -174,6 +174,8 @@ def fit_parametric_dde(
     csp_merge_cosine: float = 0.0,
     csp_merge_after: int = 10,
     csp_merge_layers: str = "top",
+    csp_shrinkage_burn=None,
+    csp_reorder_after_shrinkage_burn: bool = True,
     n_jobs: int = 1,
     standardize=None,
     burn: int = 5,
@@ -225,10 +227,21 @@ def fit_parametric_dde(
     backends only.  ``csp_backend="copula"`` is also available for
     ``family="Bernoulli"`` (logistic observed layer); there it defaults to
     the persistent coordinate-Gibbs transition
-    (``csp_latent_transition="systematic_coordinate_gibbs"``) and an
-    unscaled penalty (``csp_penalty_scaling_power=0``), because a single
-    mean-field draw attenuates the deep layers of binary data to the spike
-    and an N-scaled penalty under-selects true columns.
+    (``csp_latent_transition="systematic_coordinate_gibbs"``), because a
+    single mean-field draw attenuates the deep layers of binary data to the
+    spike, and to a ``sqrt(N)`` penalty (``csp_penalty_scaling_power=0.5``)
+    with a slab-start burn-in for ``D >= 3``: binary data under-select true
+    columns at small ``N``, and the N-proportional Normal penalty makes
+    that worse.
+    ``csp_shrinkage_burn`` holds every column in the CUSP slab (no
+    allocation, thresholding or convergence check) for that many initial
+    iterations before the CUSP updates start, the slab-start warm-up of
+    the MCEM backend; ``csp_reorder_after_shrinkage_burn`` then orders the
+    columns by strength once.  ``None`` selects the Bernoulli copula
+    defaults of ``Results/bernoulli_dde_csp_copula_kernel/REPORT.md``: a
+    burn-in of 10 iterations when ``D >= 3`` and ``max_it >= 20`` together
+    with ``csp_penalty_scaling_power=0.5``, and no burn-in otherwise (the
+    Normal family never burns in).
 
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
@@ -503,7 +516,15 @@ def fit_parametric_dde(
                 else "systematic_coordinate_gibbs"
             )
         if csp_penalty_scaling_power is None:
-            csp_penalty_scaling_power = 1.0 if family_adapter.key == "normal" else 0.0
+            csp_penalty_scaling_power = 1.0 if family_adapter.key == "normal" else 0.5
+        if csp_shrinkage_burn is None:
+            csp_shrinkage_burn = (
+                _BERNOULLI_CSP_SHRINKAGE_BURN
+                if family_adapter.key == "bernoulli"
+                and D >= 3
+                and max_it >= 2 * _BERNOULLI_CSP_SHRINKAGE_BURN
+                else 0
+            )
         raw = fit_parametric_csp_copula(
             X,
             prop,
@@ -543,6 +564,8 @@ def fit_parametric_dde(
             merge_cosine=csp_merge_cosine,
             merge_after=csp_merge_after,
             merge_layers=csp_merge_layers,
+            shrinkage_burn=csp_shrinkage_burn,
+            reorder_after_shrinkage_burn=csp_reorder_after_shrinkage_burn,
             random_state=random_state,
             keep_trace=keep_trace,
             verbose=bool(verbose),
@@ -590,6 +613,9 @@ def fit_parametric_dde(
             "merge_layers": raw["merge_layers"],
             "merge_events": raw["merge_events"],
             "top_reinit": raw["top_reinit"],
+            "shrinkage_burn": raw["shrinkage_burn"],
+            "reorder_after_shrinkage_burn": raw["reorder_after_shrinkage_burn"],
+            "burn_permutations": raw["burn_permutations"],
             "convergence_metric": "rolling_relative_frobenius_std",
             "convergence_tol": tol,
             "convergence_window": int(convergence_window),
