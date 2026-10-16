@@ -1785,6 +1785,66 @@ def compute_marginal_pmf_A1(prop, B_list, query_patterns=None,
                                    mc_samples=mc_samples)
 
 
+def _forward_sample_A1(prop, B_list, n_samples):
+    """Draw ``n_samples`` first-layer states by sampling the hierarchy top-down."""
+    prop = np.clip(np.asarray(prop, dtype=float), 1e-12, 1.0 - 1e-12)
+    S = int(n_samples)
+    A = (np.random.rand(S, prop.shape[0]) < prop[None, :]).astype(float)
+    for B in reversed(B_list[1:]):
+        logits = B[:, 0][None, :] + A @ B[:, 1:].T
+        A = (np.random.rand(*logits.shape) < logistic(logits)).astype(float)
+    return A
+
+
+def _parent_set_g_estimate(
+    Y, prop, B_list, A1, *, delta, mc_samples=50000, max_parents=20
+):
+    """Transformation estimate conditioning each variable on its own parents.
+
+    Under the DDE, ``Y_j`` depends on the first latent layer only through the
+    coordinates with nonzero loadings in row ``j`` of ``B_1``, so
+    ``F_{Y_j | A_1 = a}`` equals ``F_{Y_j | A_1[pa(j)] = a[pa(j)]}`` and the
+    mixture ``g_j(y) = sum_a pi(a) Phi^{-1}(F_{Y_j|a}(y))`` collapses to a sum
+    over the parent sub-patterns.  Each class then pools every observation that
+    shares the parent sub-pattern, which keeps the conditional CDFs estimable
+    when ``K_1`` is far larger than ``log2 N`` (D=5 has ``K_1 = 162``), and
+    the class weights ``P(A_1[pa(j)] = s)`` are estimated from forward
+    samples of the fitted hierarchy.  Memory is O(N J) and time is
+    O(J N log N) per call; no latent pattern is enumerated.
+    """
+    Y = np.asarray(Y, dtype=float)
+    A1 = np.asarray(A1).astype(np.uint8)
+    N, J = Y.shape
+    B1 = np.asarray(B_list[0], dtype=float)
+    samples = _forward_sample_A1(prop, B_list, mc_samples).astype(np.uint8)
+    g_est = np.empty((N, J), dtype=float)
+    for j in range(J):
+        parents = np.flatnonzero(B1[j, 1:] != 0.0)
+        if parents.size > max_parents:
+            parents = parents[np.argsort(-np.abs(B1[j, 1 + parents]))[:max_parents]]
+        if parents.size == 0:
+            labels = np.zeros(N, dtype=int)
+            weights = np.ones(1)
+        else:
+            classes, labels = np.unique(A1[:, parents], axis=0, return_inverse=True)
+            labels = np.asarray(labels).reshape(-1)
+            bits = 1 << np.arange(parents.size - 1, -1, -1, dtype=np.int64)
+            codes_obs = classes.astype(np.int64) @ bits
+            codes_smp = samples[:, parents].astype(np.int64) @ bits
+            present = np.isin(codes_smp, codes_obs)
+            counts = np.bincount(
+                np.searchsorted(codes_obs, codes_smp[present]), minlength=codes_obs.size
+            )
+            weights = counts.astype(float)
+            if weights.sum() <= 0.0:
+                weights = np.bincount(labels, minlength=classes.shape[0]).astype(float)
+            weights = weights / weights.sum()
+        g_est[:, j] = g_est_rversion(
+            Y[:, j : j + 1], labels, N, 1, weights.shape[0], weights, delta
+        )[:, 0]
+    return g_est
+
+
 def _semiparametric_g_step(
     Y,
     X,
@@ -1796,6 +1856,7 @@ def _semiparametric_g_step(
     max_enum_bits=20,
     mc_samples=50000,
     g_update_rho=1.0,
+    g_mode="auto",
 ):
     """Update the SemiDDE pseudo-observations for one outer iteration.
 
@@ -1803,6 +1864,14 @@ def _semiparametric_g_step(
     SAEM and CSP-MCEM paths use exactly the same semiparametric observation
     update.  ``B_list`` and ``A1`` may already be compressed to the currently
     active CSP coordinates.
+
+    ``g_mode`` selects the transformation estimator: ``"pattern"`` conditions
+    on the full first-layer pattern (dense enumeration when
+    ``K_1 <= max_enum_bits``, otherwise unique observed patterns with
+    marginal probabilities from :func:`compute_marginal_pmf_A1`);
+    ``"parents"`` conditions each variable on its own parent coordinates
+    (:func:`_parent_set_g_estimate`); ``"auto"`` uses ``"pattern"`` while
+    ``K_1 <= max_enum_bits`` and ``"parents"`` beyond that.
     """
     Y = np.asarray(Y, dtype=float)
     X = np.asarray(X, dtype=float)
@@ -1810,19 +1879,47 @@ def _semiparametric_g_step(
     N, J = Y.shape
     K1 = int(A1.shape[1])
     sparse_mode = K1 > int(max_enum_bits)
+    g_mode = str(g_mode).strip().lower()
+    if g_mode not in {"auto", "pattern", "parents"}:
+        raise ValueError("g_mode must be 'auto', 'pattern', or 'parents'.")
+    if g_mode == "auto":
+        g_mode = "parents" if sparse_mode else "pattern"
+
+    if g_mode == "parents":
+        g_new = _parent_set_g_estimate(
+            Y, prop, B_list, A1, delta=delta, mc_samples=mc_samples
+        )
+        X_next = (1.0 - g_update_rho) * X + g_update_rho * g_new
+        diff = np.mean(np.abs(X_next - X)) / (np.mean(np.abs(X)) + 1e-8)
+        return X_next, g_new, float(diff)
 
     if sparse_mode:
-        dec_full = patterns_to_int(A1)
-        unique_vals, dec = np.unique(dec_full, return_inverse=True)
-        unique_patterns = binary(unique_vals, K1)
+        # Row-wise unique patterns: an integer encoding overflows int64 once
+        # K_1 exceeds 62 (D=5 has K_1=162), so classes are formed directly
+        # from the binary rows.
+        unique_patterns, dec = np.unique(
+            A1.astype(np.uint8), axis=0, return_inverse=True
+        )
+        dec = np.asarray(dec).reshape(-1)
         pi_alpha = compute_marginal_pmf_A1(
             prop,
             B_list,
-            query_patterns=unique_patterns,
+            query_patterns=unique_patterns.astype(float),
             max_enum_bits=max_enum_bits,
             mc_samples=mc_samples,
         )
-        n_classes = unique_vals.shape[0]
+        # The marginal mass of the observed patterns is far below one when
+        # K_1 is large (each pattern has probability about 2**-K_1), and the
+        # transformation estimator standardizes each column with an absolute
+        # floor on the spread.  Renormalizing over the observed classes keeps
+        # the class weights on the O(1) scale of the dense mode, where the
+        # full PMF sums to one.
+        total_mass = float(np.sum(pi_alpha))
+        if total_mass > 0.0:
+            pi_alpha = pi_alpha / total_mass
+        else:
+            pi_alpha = np.full(pi_alpha.shape[0], 1.0 / pi_alpha.shape[0])
+        n_classes = unique_patterns.shape[0]
     else:
         weights = np.int64(1) << np.arange(
             K1 - 1, -1, -1, dtype=np.int64
@@ -1862,6 +1959,8 @@ def get_SAEM_semiparametricv1(
     max_enum_bits=20,
     mc_samples=50000,
     g_update_rho=1.0,
+    g_mode="auto",
+    g_tol=1e-2,
     final_refit=False,
     final_refit_B_list_true=None,
     final_refit_G_list_true=None,
@@ -1933,6 +2032,7 @@ def get_SAEM_semiparametricv1(
             max_enum_bits=max_enum_bits,
             mc_samples=mc_samples,
             g_update_rho=g_update_rho,
+            g_mode=g_mode,
         )
  
         if X_true is not None and verbose:
@@ -1952,7 +2052,7 @@ def get_SAEM_semiparametricv1(
         # X = g_new.copy()
         if verbose:
             print(f"diff g = {diff:.3e}")
-        if diff < 1e-2:
+        if diff < g_tol:
             if verbose:
                 print("Converged on g.")
             X = X_next.copy()

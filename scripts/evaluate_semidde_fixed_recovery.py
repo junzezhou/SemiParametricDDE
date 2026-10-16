@@ -37,7 +37,7 @@ from dde.simulation import generate_X_normal
 from dde.utils import thres
 
 
-SAMPLE_SIZES = (500, 1000, 2000, 4000, 8000)
+SAMPLE_SIZES = (500, 1000, 2000, 4000, 8000, 16000)
 SCENARIOS = {
     "d2": {"label": "D2_fixed_lognormal", "D": 2, "K_list": (6, 2), "J": 18},
     "d3": {
@@ -45,6 +45,18 @@ SCENARIOS = {
         "D": 3,
         "K_list": (18, 6, 2),
         "J": 54,
+    },
+    "d4": {
+        "label": "D4_fixed_lognormal",
+        "D": 4,
+        "K_list": (54, 18, 6, 2),
+        "J": 162,
+    },
+    "d5": {
+        "label": "D5_fixed_lognormal",
+        "D": 5,
+        "K_list": (162, 54, 18, 6, 2),
+        "J": 486,
     },
 }
 
@@ -160,7 +172,9 @@ def _fit_one(task: tuple) -> dict:
         "seed": seed,
     }
     started = time.perf_counter()
-    if N >= 8000:
+    if N >= 16000:
+        max_outer_iter = int(args_dict["n16000_max_outer_iter"])
+    elif N >= 8000:
         max_outer_iter = int(args_dict["n8000_max_outer_iter"])
     elif N >= 4000:
         max_outer_iter = int(args_dict["n4000_max_outer_iter"])
@@ -191,6 +205,7 @@ def _fit_one(task: tuple) -> dict:
                 epsilon=args_dict["epsilon"],
                 max_outer_iter=max_outer_iter,
                 max_inner_iter=args_dict["max_inner_iter"],
+                g_tol=args_dict["g_tol"],
                 verbose=False,
             )
         metrics = _calculate_metrics(
@@ -315,6 +330,9 @@ def parse_args():
     parser.add_argument("--max-outer-iter", type=int, default=200)
     parser.add_argument("--n4000-max-outer-iter", type=int, default=100)
     parser.add_argument("--n8000-max-outer-iter", type=int, default=50)
+    parser.add_argument("--n16000-max-outer-iter", type=int, default=50)
+    parser.add_argument("--g-tol", type=float, default=1e-2,
+                        help="outer-loop stopping threshold on the relative change of g")
     parser.add_argument("--max-inner-iter", type=int, default=50)
     parser.add_argument(
         "--output-dir",
@@ -361,7 +379,9 @@ def main():
         "max_outer_iter": args.max_outer_iter,
         "n4000_max_outer_iter": args.n4000_max_outer_iter,
         "n8000_max_outer_iter": args.n8000_max_outer_iter,
+        "n16000_max_outer_iter": args.n16000_max_outer_iter,
         "max_inner_iter": args.max_inner_iter,
+        "g_tol": args.g_tol,
     }
     tasks = []
     for key in args.scenarios:
@@ -394,9 +414,11 @@ def main():
         "max_outer_iter_schedule": {
             "N<=2000": args.max_outer_iter,
             "N=4000": args.n4000_max_outer_iter,
-            "N>=8000": args.n8000_max_outer_iter,
+            "N=8000": args.n8000_max_outer_iter,
+            "N>=16000": args.n16000_max_outer_iter,
         },
         "max_inner_iter": args.max_inner_iter,
+        "g_tol": args.g_tol,
         "initialization": (
             "oracle-labelled spectral initialization, matching the notebook's "
             "Normal_init(X, K1, K_list, B_true, G_true, epsilon) call"
