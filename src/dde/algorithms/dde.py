@@ -12,7 +12,7 @@ from dde.utils import validate_K_list_identifiability, validate_dde_lists
 from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
-from .normal_csp import fit_normal_csp
+from .normal_csp import fit_parametric_csp_copula
 from .parametric_csp_mcem import fit_parametric_csp_mcem
 from .normal_init_cop import Normal_init_cop
 from .parametric_families import (
@@ -308,9 +308,13 @@ def fit_parametric_dde(
         )
     else:
         backend = str(csp_backend).strip().lower()
-    if method == "csp" and backend == "copula" and family_adapter.key != "normal":
+    if method == "csp" and backend == "copula" and family_adapter.key not in (
+        "normal",
+        "bernoulli",
+    ):
         raise NotImplementedError(
-            "csp_backend='copula' is implemented for the Normal family only."
+            "csp_backend='copula' is implemented for the Normal and Bernoulli "
+            "families only."
         )
     if method == "csp" and family_adapter.key == "normal" and backend != "copula":
         raise ValueError(
@@ -333,7 +337,9 @@ def fit_parametric_dde(
     if optimizer_maxiter < 1:
         raise ValueError("optimizer_maxiter must be a positive integer.")
     if standardize is None:
-        standardize = method == "csp" and backend == "copula"
+        standardize = (
+            method == "csp" and backend == "copula" and family_adapter.key == "normal"
+        )
     standardize = bool(standardize)
     if standardize and (method != "csp" or family_adapter.key != "normal"):
         raise ValueError("standardize is only supported by Normal CSP fits.")
@@ -478,12 +484,13 @@ def fit_parametric_dde(
         )
 
     if backend == "copula":
-        raw = fit_normal_csp(
+        raw = fit_parametric_csp_copula(
             X,
             prop,
             gamma,
             B_list,
             A_list,
+            family=family_adapter,
             C=C,
             it=max_it,
             t_spike=t_spike,

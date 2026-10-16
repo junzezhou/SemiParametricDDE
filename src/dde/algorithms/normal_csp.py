@@ -60,8 +60,15 @@ from .get_SAEM_RL_CSP_D import (
 from .parametric_csp_mcem import _solve_logistic_weighted_l1
 from .normal_init_cop import _binary_init_matlab
 from .normal_init_semi import initialize_binary_parent
-from .parametric_families import NORMAL_FAMILY, _solve_gaussian_weighted_l1
-from .semi_saem import _sample_latent_layers_parametric
+from .parametric_families import (
+    NORMAL_FAMILY,
+    _solve_gaussian_weighted_l1,
+    resolve_parametric_family,
+)
+from .semi_saem import (
+    _compute_bernoulli_probabilities_parametric,
+    _sample_latent_layers_parametric,
+)
 
 
 _THRESHOLD_RULES = ("first_two", "all_but_last", "none")
@@ -189,7 +196,7 @@ def _validate(X, prop, gamma, B_list, A_list):
             )
     if prop.shape != (K[-1],):
         raise ValueError("prop length must match the deepest latent width.")
-    if gamma.shape != (J,):
+    if gamma is not None and gamma.shape != (J,):
         raise ValueError("gamma length must match the observed dimension J.")
     for d, A in enumerate(A_list):
         if A.shape != (N, K[d]):
@@ -197,13 +204,14 @@ def _validate(X, prop, gamma, B_list, A_list):
     return D, N, J, K
 
 
-def fit_normal_csp(
+def fit_parametric_csp_copula(
     X,
     prop_in,
     gamma_in,
     B_list_in,
     A_list_in,
     *,
+    family="normal",
     C: int,
     it: int,
     t_spike,
@@ -240,11 +248,17 @@ def fit_normal_csp(
     keep_trace: bool = False,
     verbose: bool = True,
 ):
-    """Fit a maximal-width Normal DDE with the CopDDE CSP algorithm.
+    """Fit a maximal-width parametric DDE with the CopDDE CSP algorithm.
+
+    ``family`` selects the observed layer: ``"normal"`` (the CopDDE Gaussian
+    layer, with ``gamma_in`` the conditional variances) or ``"bernoulli"``
+    (a logistic observed layer identical in form to the latent layers;
+    ``gamma_in`` must be ``None``).  Everything below the observed layer is
+    family independent.
 
     Parameters
     ----------
-    X : (N, J) observed Gaussian matrix (plays the role of ``Z``).
+    X : (N, J) observed matrix (Gaussian ``Z`` for Normal, 0/1 for Bernoulli).
     prop_in, gamma_in, B_list_in, A_list_in : initial parameters and latent
         point estimates at the maximal widths.
     C : Monte Carlo draws per iteration.
@@ -344,11 +358,22 @@ def fit_normal_csp(
     state (``allocation``, ``omega``, ``slab_scale``, ``penalty_scale``),
     ``active_masks``, ``num_active``, ``iterations`` and diagnostics.
     """
-    X = np.asarray(X, dtype=float)
+    family = resolve_parametric_family(family)
+    if family.key not in ("normal", "bernoulli"):
+        raise NotImplementedError(
+            "The copula CSP kernel supports the Normal and Bernoulli families."
+        )
+    is_normal = family.key == "normal"
+    X = family.validate_y(X)
     if X.ndim != 2:
         raise ValueError("X must be a two-dimensional matrix.")
     prop = np.asarray(prop_in, dtype=float).reshape(-1).copy()
-    gamma = np.asarray(gamma_in, dtype=float).reshape(-1).copy()
+    if is_normal:
+        gamma = np.asarray(gamma_in, dtype=float).reshape(-1).copy()
+    elif gamma_in is not None:
+        raise ValueError(f"{family.name} has no dispersion; gamma_in must be None.")
+    else:
+        gamma = None
     B_list = [np.asarray(B, dtype=float).copy() for B in B_list_in]
     A_list = [np.asarray(A, dtype=float).copy() for A in A_list_in]
     D, N, J, K = _validate(X, prop, gamma, B_list, A_list)
@@ -420,6 +445,8 @@ def fit_normal_csp(
     observed_noise_scale = float(observed_noise_scale)
     if not np.isfinite(observed_noise_scale) or observed_noise_scale < 0:
         raise ValueError("observed_noise_scale must be finite and nonnegative.")
+    if observed_noise_scale > 0 and not is_normal:
+        raise ValueError("observed_noise_scale applies to the Normal family only.")
     fista_maxiter = _DEFAULT_FISTA_MAXITER if fista_maxiter is None else int(fista_maxiter)
     if fista_maxiter < 1:
         raise ValueError("fista_maxiter must be a positive integer.")
@@ -502,7 +529,27 @@ def fit_normal_csp(
         raise ValueError("t_spike entries must be finite and positive.")
 
     random = _resolve_random(random_state)
-    lb, ub = _make_bounds(K, D)
+    if is_normal:
+        lb, ub = _make_bounds(K, D)
+    else:
+        lb, ub = [], []
+        for d in range(D):
+            pairs = family.csp_coefficient_bounds(K[d] + 1, bound_val, observed=(d == 0))
+            lb.append(np.asarray([pair[0] for pair in pairs], dtype=float))
+            ub.append(np.asarray([pair[1] for pair in pairs], dtype=float))
+        # Bernoulli observed layer: the data are the "child sample" of the
+        # logistic M-step, with an intercept column and one copy per draw.
+        X_child = np.concatenate((np.ones((N, 1)), X), axis=1)[:, :, None]
+
+    def mean_field_probabilities(A_state, B_state, gamma_state, prop_state, temperature):
+        if is_normal:
+            return _update_bernoulli_probabilities_D(
+                X, A_state, B_state, gamma_state, prop_state, temperature
+            )
+        return _compute_bernoulli_probabilities_parametric(
+            X, prop_state, B_state, gamma_state, A_state, family=family,
+            row_chunk_size=estep_row_chunk_size, temperature=temperature,
+        )
     if threshold_rule == "first_two":
         thresholded_layers = min(2, D)
     elif threshold_rule == "all_but_last":
@@ -530,7 +577,7 @@ def fit_normal_csp(
     theta_mstep = [value.copy() for value in theta]
     rel_hist = [[] for _ in range(D)]
     trace = [] if keep_trace else None
-    x_sq_sum = np.sum(X**2, axis=0) if observed_fista else None
+    x_sq_sum = np.sum(X**2, axis=0) if (observed_fista and is_normal) else None
     top_reinit = None
     merge_events = []
 
@@ -541,9 +588,7 @@ def fit_normal_csp(
         #    the current active children.
         if reinit_top_after and it_num == reinit_top_after and top_reinit is None:
             if reinit_top_source == "probability":
-                children = _update_bernoulli_probabilities_D(
-                    X, A_list, B_list, gamma, prop, temp
-                )[D - 2]
+                children = mean_field_probabilities(A_list, B_list, gamma, prop, temp)[D - 2]
             else:
                 children = A_list[D - 2]
             top_reinit = _reinitialize_top_layer(
@@ -585,12 +630,12 @@ def fit_normal_csp(
             samples, ber_top = _sample_latent_layers_parametric(
                 X, prop, B_list, gamma,
                 [A.astype(np.uint8) for A in A_list], C,
-                family=NORMAL_FAMILY, row_chunk_size=estep_row_chunk_size,
-                rng=random, sparse_bernoulli=False, temperature=temp,
+                family=family, row_chunk_size=estep_row_chunk_size,
+                rng=random, sparse_bernoulli=not is_normal, temperature=temp,
             )
             A_sample_long = [sample.astype(float) for sample in samples]
         else:
-            ber = _update_bernoulli_probabilities_D(X, A_list, B_list, gamma, prop, temp)
+            ber = mean_field_probabilities(A_list, B_list, gamma, prop, temp)
             ber_top = ber[-1]
             A_sample_long = _sample_latent_layers(ber, C, random)
         if mstep_latent == "mean_field":
@@ -634,9 +679,24 @@ def fit_normal_csp(
         # 4) Top-layer Bernoulli MAP.
         prop_update = np.mean(ber_top, axis=0)
 
-        # 5) Observed Gaussian layer and conditional variances.
+        # 5) Observed layer: Gaussian (with conditional variances) or logistic.
         B_update = [None] * D
-        if not observed_fista:
+        gamma_update = None
+        if not is_normal:
+            if not observed_fista:
+                C_mstep = A_mstep[0].shape[2]
+                B_update[0] = _optimize_logistic_layer(
+                    np.repeat(X_child, C_mstep, axis=2), A_mstep[0], B_list[0],
+                    theta_mstep[0], temp, lb[0], ub[0], optimizer_maxiter,
+                    n_jobs, "weighted_l1", tau,
+                )
+            else:
+                B_update[0] = _solve_logistic_weighted_l1(
+                    X, A_mstep[0], B_list[0], theta_mstep[0], temp,
+                    max_iter=fista_maxiter, tol=optimizer_tol,
+                    bound=bound_val, bounds=list(zip(lb[0], ub[0])),
+                )
+        elif not observed_fista:
             B_update[0], gamma_update = _optimize_gaussian_layer(
                 X_mstep, A_mstep[0], B_list[0], gamma, theta_mstep[0], temp,
                 lb[0], ub[0], optimizer_maxiter, n_jobs, "weighted_l1", tau,
@@ -647,7 +707,7 @@ def fit_normal_csp(
                 x_sq_sum=None if X_mstep is not X else x_sq_sum,
                 max_iter=fista_maxiter, tol=optimizer_tol, bound=bound_val,
             )
-        if X_mstep is not X:
+        if is_normal and X_mstep is not X:
             # Conditional variances from the clean observations.
             eta = np.tensordot(A_mstep[0], B_update[0], axes=([1], [1]))
             C_mstep = A_mstep[0].shape[2]
@@ -728,12 +788,12 @@ def fit_normal_csp(
                 for d in range(D)
             ]
         B_list = [B.copy() for B in B_update]
-        gamma = gamma_update.copy()
+        gamma = None if gamma_update is None else gamma_update.copy()
         prop = prop_update.copy()
 
         if verbose:
             print(
-                f"Normal CSP (copula kernel) iteration {it_num}, "
+                f"{family.name} CSP (copula kernel) iteration {it_num}, "
                 f"active={num_act.tolist()}, max relative change="
                 f"{max(current_rel):.4g}"
             )
@@ -753,6 +813,7 @@ def fit_normal_csp(
             B_list[d][:, inactive + 1] = 0.0
 
     return {
+        "family": family.name,
         "prop": prop,
         "B_list": B_list,
         "gamma": gamma,
@@ -795,7 +856,26 @@ def fit_normal_csp(
     }
 
 
+def fit_normal_csp(X, prop_in, gamma_in, B_list_in, A_list_in, **kwargs):
+    """Normal DDE CSP: the CopDDE kernel on an observed Gaussian layer."""
+    return fit_parametric_csp_copula(
+        X, prop_in, gamma_in, B_list_in, A_list_in, family="normal", **kwargs
+    )
+
+
+def fit_bernoulli_csp(X, prop_in, B_list_in, A_list_in, **kwargs):
+    """Bernoulli DDE CSP: the CopDDE kernel with a logistic observed layer."""
+    return fit_parametric_csp_copula(
+        X, prop_in, None, B_list_in, A_list_in, family="bernoulli", **kwargs
+    )
+
+
 # Compatibility alias for the name used while the kernel was being developed.
 fit_normal_csp_copula = fit_normal_csp
 
-__all__ = ["fit_normal_csp", "fit_normal_csp_copula"]
+__all__ = [
+    "fit_bernoulli_csp",
+    "fit_normal_csp",
+    "fit_normal_csp_copula",
+    "fit_parametric_csp_copula",
+]

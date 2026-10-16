@@ -294,12 +294,12 @@ def test_mcem_backend_is_rejected_and_copula_initializer_still_available():
     assert result.diagnostics["initialization"] == "data_copula"
 
 
-def test_copula_backend_rejects_discrete_families():
+def test_copula_backend_rejects_poisson_family():
     rng = np.random.default_rng(0)
-    Y = rng.integers(0, 2, size=(60, 18)).astype(float)
+    Y = rng.poisson(2.0, size=(60, 18)).astype(float)
     with pytest.raises(NotImplementedError):
         fit(
-            Y, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+            Y, method="DDE", family="Poisson", D=2, dimension_method="csp",
             t_spike=0.02, temp=0.9, tau=0.3, C=1, max_iter=1,
             csp_backend="copula", verbose=False,
         )
