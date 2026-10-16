@@ -59,7 +59,8 @@ def run_one(task):
         with threadpool_limits(limits=1):
             result = fit(X, method="DDE", D=D, family="Normal", dimension_method="fixed",
                          K_list=list(spec["K_list"]), pen_list=[float(N) ** (2 / 8)] * D,
-                         tau=settings["tau"], C=1, tol=spec["K_list"][-1] / 2,
+                         tau=settings["tau"], C=1,
+                         tol=spec["K_list"][-1] / 2 if settings["tol"] is None else settings["tol"],
                          max_it=settings["max_it"], initialize="oracle",
                          B_list_true=B_t, G_list_true=G_t, verbose=False)
         layer_acc, layer_rmse, correct, edges, sq = [], [], 0, 0, []
@@ -117,11 +118,14 @@ def main():
     p.add_argument("--base-seed", type=int, default=20260827)
     p.add_argument("--tau", type=float, default=0.3)
     p.add_argument("--max-it", type=int, default=10)
+    p.add_argument("--tol", type=float, default=None,
+                   help="postprocessed parameter-update RMSE tolerance; default K_D/2 (the notebook's MATLAB-style value, "
+                        "which stops the RMSE-based kernel after 2 sweeps); the manuscript uses 0.01 with max_it 50")
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    settings = {"base_seed": args.base_seed, "tau": args.tau, "max_it": args.max_it}
-    (args.output_dir / "metadata.json").write_text(json.dumps({"args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}, "design": "build_true_params(K_list, J=3K1, 4.0); pen N^(2/8); tau 0.3; tol K_D/2; oracle init; seeds 20260827+100000D+1000N+rep"}, indent=2))
+    settings = {"base_seed": args.base_seed, "tau": args.tau, "max_it": args.max_it, "tol": args.tol}
+    (args.output_dir / "metadata.json").write_text(json.dumps({"args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}, "design": f"build_true_params(K_list, J=3K1, 4.0); pen N^(2/8); tau {args.tau}; tol {'K_D/2' if args.tol is None else args.tol}; max_it {args.max_it}; oracle init; seeds 20260827+100000D+1000N+rep"}, indent=2))
     checkpoint = args.output_dir / "replicates.jsonl"
     rows = [json.loads(l) for l in checkpoint.read_text().splitlines() if l.strip()] if checkpoint.exists() else []
     done = {(r["scenario"], int(r["N"]), int(r["replicate"])) for r in rows if r["status"] == "ok"}
