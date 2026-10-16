@@ -646,9 +646,13 @@ def select_hyperparameters(
         elif method == "fixed":
             candidates = auto_grid_copula_fixed(Y.shape[0], D)
         else:
+            # DDE and SemiDDE CSP: the family designs use temperatures between
+            # 0.7 and 0.9, so the annealing temperature is a grid axis rather
+            # than the CopDDE constant (0.7 for D<=2, 0.9 for D>=3).
             candidates = auto_grid_copula_csp(
                 Y.shape[0], D,
                 tau_values=None if chosen == "copula" else [0.3],
+                temp_values=None if chosen == "copula" else [0.7, 0.9],
             )
         candidate_list = _as_candidate_list(candidates)
     if chosen == "copula":
@@ -847,6 +851,9 @@ def select_hyperparameters(
             "mean_score": float(np.mean(scores)),
             "std_score": float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0,
         }
+        if full_result is not None and full_result.K_list is not None:
+            # Fitted widths of the full-data candidate fit (CSP diagnostics).
+            row["fitted_K"] = [int(value) for value in full_result.K_list]
         if not np.isfinite(row["mean_score"]):
             raise ValueError(f"Candidate {c_idx} produced a non-finite {criterion} score.")
         candidate_timings = [r for r in timing_rows if r["candidate_index"] == c_idx]

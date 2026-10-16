@@ -188,7 +188,12 @@ def _aligned_mse(result, truth: dict, tau: float, *, copula: bool) -> tuple[floa
 def _fit_kwargs(kernel: str, args) -> dict:
     common = {"C": 1, "verbose": False}
     if kernel.startswith("dde_"):
-        common.update(max_iter=args.dde_iterations, optimizer_maxiter=args.optimizer_iterations)
+        common.update(max_iter=args.dde_iterations)
+        if kernel != "dde_normal_csp":
+            # Normal CSP resolves its own validated optimizer budget (15
+            # L-BFGS-B steps on the deepest layer); the MCEM kernels and the
+            # fixed paths take the explicit budget.
+            common["optimizer_maxiter"] = args.optimizer_iterations
     elif kernel.startswith("semidde"):
         common.update(max_iter=args.semi_inner_iterations,
                       max_outer_iter=args.semi_outer_iterations,
@@ -197,7 +202,7 @@ def _fit_kwargs(kernel: str, args) -> dict:
             common["optimizer_maxiter"] = args.optimizer_iterations
     else:
         common.update(max_iter=args.copula_iterations,
-                      optimizer_maxiter=args.optimizer_iterations)
+                      optimizer_maxiter=args.copula_optimizer_iterations)
         if kernel.endswith("fixed"):
             common["tol"] = 0.005
     return common
@@ -244,7 +249,7 @@ def run_cell(task, args):
         selection = result.diagnostics["hyperparameter_selection"]
         table = result.diagnostics["cv_table"]
         expected = 18 * 3**(depth - 2) if method == "CopDDE" and dimension == "fixed" else (
-            3**depth if dimension == "csp" else 3 * 2**depth)
+            (3**depth if method == "CopDDE" else 2 * 3**depth) if dimension == "csp" else 3 * 2**depth)
         if len(table) != expected or len({r["candidate_index"] for r in table}) != expected:
             raise AssertionError(f"Incomplete Cartesian grid: {len(table)} vs {expected}")
         chosen = table[selection.best_index]
@@ -329,6 +334,7 @@ def main():
     parser.add_argument("--semi-inner-iterations", type=int, default=20)
     parser.add_argument("--copula-iterations", type=int, default=10)
     parser.add_argument("--optimizer-iterations", type=int, default=30)
+    parser.add_argument("--copula-optimizer-iterations", type=int, default=30)
     parser.add_argument("--score-mc-samples", type=int, default=4096)
     parser.add_argument("--pmse-repeats", type=int, default=2)
     parser.add_argument("--pmse-folds", type=int, default=3)

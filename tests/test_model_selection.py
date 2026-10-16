@@ -409,9 +409,14 @@ def test_three_layer_default_csp_search_evaluates_all_spike_combinations(method)
         random_state=11, refit=False,
     )
     rows = result.diagnostics["cv_table"]
-    assert len(rows) == 27
+    # DDE and SemiDDE also tune the annealing temperature over {0.7, 0.9}.
+    expected = 27 if method == "CopDDE" else 54
+    assert len(rows) == expected
     assert len({tuple(row["t_spike"]) for row in rows}) == 27
+    assert {row["temp"] for row in rows} == ({0.9} if method == "CopDDE" else {0.7, 0.9})
     assert all(np.isfinite(row["mean_score"]) for row in rows)
+    if method != "CopDDE":
+        assert all(len(row["fitted_K"]) == 3 for row in rows)
 
 
 def test_estimate_K_list_copula_uses_identifiable_maximal_widths():
