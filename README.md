@@ -142,6 +142,27 @@ outer iterations are requested, and scale the CSP penalty by
 `mcem_shrinkage_burn` or `mcem_penalty_strength` overrides the corresponding
 automatic value.  Two-layer Bernoulli CSP retains its established settings.
 
+## Visualization
+
+Two interfaces summarize a fitted model (`fit` or `select_hyperparameters`
+result).  `plot_weights` draws the estimated weight matrices from the observed
+layer upward (one heatmap per layer, or a chosen `layer`); for CSP fits the
+columns are labelled by their original latent indices.  `get_anchors` returns
+the observed variables that anchor each shallow-layer latent feature, ranked
+by the relative-loading score `r_jk = max(min_{l != k}(b_jk - b_jl), 0)`:
+
+```python
+from dde.visualization import plot_weights, get_anchors
+
+figures = plot_weights(result, variable_names=Y.columns, output_dir="plots")
+anchors = get_anchors(result, n_anchors=3, variable_names=Y.columns)
+anchors[anchors["latent_feature"] == 1]
+```
+
+The earlier multi-panel report bundle (`visualization_report` and the
+model-summary, latent-profile and theme-table plots) remains available from
+`dde.visualization.legacy`.
+
 Poisson DDE uses a canonical log link, requires finite nonnegative integer
 counts, and has no `gamma` dispersion parameter. Fixed-width estimation
 supports any positive number of latent layers:
