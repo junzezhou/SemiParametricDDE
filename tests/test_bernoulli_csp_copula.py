@@ -103,6 +103,8 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
     assert d["standardized"] is False
     assert d["initializer"] == "family"
     assert d["mstep_solver"] == "fista_lower"
+    assert d["latent_transition"] == "systematic_coordinate_gibbs"
+    assert d["penalty_scaling_power"] == (0.0, 0.0)
     assert result.gamma is None
     assert tuple(d["K_max_list"]) == (9, 3)
     K1, K2 = result.K_list

@@ -162,11 +162,11 @@ def fit_parametric_dde(
     csp_fista_maxiter=None,
     csp_slab_shape: float = 1.0,
     csp_slab_rate: float = 5.0,
-    csp_penalty_scaling_power: float = 1.0,
+    csp_penalty_scaling_power=None,
     csp_penalty_scaling_reference: float = 500.0,
     csp_penalty_scaling_layers: str = "lower",
     csp_penalty_scaling_allocation: bool = False,
-    csp_latent_transition: str = "synchronous_mean_field",
+    csp_latent_transition=None,
     csp_mc_state_update=None,
     csp_reinit_top_after: int = 0,
     csp_reinit_top_rule: str = "family",
@@ -222,7 +222,13 @@ def fit_parametric_dde(
     The explicit ``"mcem_reinitialize"`` backend performs staged parent
     rebuilding, while ``"mcem_cap_only"`` applies staged child-implied caps
     and preserves eligible parent state.  ``mcem_*`` controls apply to those
-    backends only.
+    backends only.  ``csp_backend="copula"`` is also available for
+    ``family="Bernoulli"`` (logistic observed layer); there it defaults to
+    the persistent coordinate-Gibbs transition
+    (``csp_latent_transition="systematic_coordinate_gibbs"``) and an
+    unscaled penalty (``csp_penalty_scaling_power=0``), because a single
+    mean-field draw attenuates the deep layers of binary data to the spike
+    and an N-scaled penalty under-selects true columns.
 
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
@@ -484,6 +490,20 @@ def fit_parametric_dde(
         )
 
     if backend == "copula":
+        # Family defaults for the copula kernel: the Gaussian observed layer
+        # identifies the latent states well enough for the CopDDE single
+        # mean-field draw and benefits from the N-scaled lower-layer penalty;
+        # the Bernoulli observed layer needs the persistent coordinate-Gibbs
+        # transition (a mean-field draw attenuates the deep layers to the
+        # spike) and under-selects when the penalty grows with N.
+        if csp_latent_transition is None:
+            csp_latent_transition = (
+                "synchronous_mean_field"
+                if family_adapter.key == "normal"
+                else "systematic_coordinate_gibbs"
+            )
+        if csp_penalty_scaling_power is None:
+            csp_penalty_scaling_power = 1.0 if family_adapter.key == "normal" else 0.0
         raw = fit_parametric_csp_copula(
             X,
             prop,

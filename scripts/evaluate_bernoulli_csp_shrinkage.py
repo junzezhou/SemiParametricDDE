@@ -43,12 +43,12 @@ def _parse_args():
                         help="copula backend only (default 15); mcem keeps 100")
     parser.add_argument("--mstep-solver", default="fista_lower")
     parser.add_argument("--fista-maxiter", type=int, default=None)
-    parser.add_argument("--penalty-power", type=float, nargs="+", default=[1.0])
+    parser.add_argument("--penalty-power", type=float, nargs="+", default=[0.0])
     parser.add_argument("--penalty-reference", type=float, default=500.0)
     parser.add_argument("--penalty-layers", default="lower", choices=["all", "deep", "lower"])
     parser.add_argument("--slab-shape", type=float, default=1.0)
     parser.add_argument("--slab-rate", type=float, default=5.0)
-    parser.add_argument("--latent-transition", default="synchronous_mean_field")
+    parser.add_argument("--latent-transition", default="systematic_coordinate_gibbs")
     parser.add_argument("--merge-cosine", type=float, default=0.0)
     parser.add_argument("--seed-base", type=int, default=20260902)
     parser.add_argument("--workers", type=int, default=1)
@@ -141,9 +141,13 @@ def _summarize(records, out_dir):
             row[f"{key_name}_mean"] = float(np.mean([r[key_name] for r in ok])) if ok else np.nan
         rows.append(row)
     if rows:
-        fields = list(rows[0].keys())
+        fields = []
+        for row in rows:
+            for key in row:
+                if key not in fields:
+                    fields.append(key)
         with (out_dir / "summary.csv").open("w", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer = csv.DictWriter(stream, fieldnames=fields, restval="")
             writer.writeheader(); writer.writerows(rows)
     return rows
 
