@@ -17,6 +17,14 @@ Then import from any script or notebook:
 from dde import fit, select_hyperparameters
 ```
 
+A runnable walkthrough (kernel catalogue, a simulated Normal DDE, `fit()` on
+the fixed and CSP paths, and `select_hyperparameters` on explicit and
+automatic grids) is in the executed notebook `examples/package_demo.ipynb` (about two minutes to rerun):
+
+```bash
+jupyter nbconvert --to notebook --execute --inplace examples/package_demo.ipynb
+```
+
 A fixed-width Normal DDE supplies its latent widths and layer penalties.  A
 CSP fit omits `K_list`; the package initializes the recursive maximal widths
 `floor(J / 3), floor(floor(J / 3) / 3), ...` and returns the CSP-active widths
