@@ -439,3 +439,195 @@ def test_fit_passes_slab_and_penalty_scaling_controls():
     assert d["penalty_scaling_layers"] == "deep"
     assert d["penalty_scaling_allocation"] is True
     assert d["penalty_factor"] == (1.0, (150 / 500.0) ** 0.5)
+
+
+def test_gibbs_transition_matches_mean_field_conditional_at_common_state():
+    """The Gibbs full conditional of the first coordinate of every layer is
+    the mean-field probability of that coordinate at the same state."""
+    from dde.algorithms.get_SAEM_RL_CSP_D import _update_bernoulli_probabilities_D
+    from dde.algorithms.parametric_families import NORMAL_FAMILY
+    from dde.algorithms.semi_saem import _latent_coordinate_probability_parametric
+
+    inputs = _inputs()
+    temp = 0.8
+    ber = _update_bernoulli_probabilities_D(
+        inputs["X"], inputs["A_list"], inputs["B_list"], inputs["gamma"],
+        inputs["prop"], temp,
+    )
+    for layer in range(2):
+        probability, _ = _latent_coordinate_probability_parametric(
+            inputs["X"], inputs["prop"], inputs["B_list"], inputs["gamma"],
+            [A.astype(np.uint8) for A in inputs["A_list"]], layer, 0,
+            family=NORMAL_FAMILY, sparse_bernoulli=False, temperature=temp,
+        )
+        np.testing.assert_allclose(probability, ber[layer][:, 0], atol=1e-12)
+
+
+def test_gibbs_transition_and_state_update_controls():
+    inputs = _inputs()
+    args = (inputs["X"], inputs["prop"], inputs["gamma"],
+            _copy(inputs["B_list"]), _copy(inputs["A_list"]))
+    base = dict(C=3, it=3, t_spike=0.02, temp=0.9, tau=0.3, verbose=False,
+                random_state=11)
+    mean_field = fit_normal_csp_copula(*args, **base)
+    assert mean_field["latent_transition"] == "synchronous_mean_field"
+    assert mean_field["mc_state_update"] == "draw_majority"
+    gibbs = fit_normal_csp_copula(
+        *args, latent_transition="systematic_coordinate_gibbs", **base
+    )
+    assert gibbs["latent_transition"] == "systematic_coordinate_gibbs"
+    assert gibbs["mc_state_update"] == "last_draw"
+    assert gibbs["iterations"] == 3
+    for A in gibbs["A_list"]:
+        assert set(np.unique(A)).issubset({0, 1})
+    assert all(np.all(np.isfinite(B)) for B in gibbs["B_list"])
+    again = fit_normal_csp_copula(
+        *args, latent_transition="systematic_coordinate_gibbs", **base
+    )
+    for B_1, B_2 in zip(gibbs["B_list"], again["B_list"]):
+        np.testing.assert_array_equal(B_1, B_2)
+    majority = fit_normal_csp_copula(
+        *args, latent_transition="systematic_coordinate_gibbs",
+        mc_state_update="draw_majority", **base
+    )
+    assert majority["mc_state_update"] == "draw_majority"
+    last = fit_normal_csp_copula(*args, mc_state_update="last_draw", **base)
+    assert last["mc_state_update"] == "last_draw"
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, latent_transition="bogus", **base)
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, mc_state_update="bogus", **base)
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(
+            *args, latent_transition="systematic_coordinate_gibbs",
+            mstep_latent="mean_field", **base
+        )
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, estep_row_chunk_size=0, **base)
+
+
+def test_top_layer_reinitialization_replaces_deepest_layer():
+    inputs = _inputs(N=80, J=24, widths=(8, 3))
+    args = (inputs["X"], inputs["prop"], inputs["gamma"],
+            _copy(inputs["B_list"]), _copy(inputs["A_list"]))
+    base = dict(C=1, it=4, t_spike=0.02, temp=0.9, tau=0.3, verbose=False,
+                random_state=5)
+    plain = fit_normal_csp_copula(*args, **base)
+    assert plain["top_reinit"] is None and plain["reinit_top_after"] == 0
+    for rule in ("family", "copula"):
+        result = fit_normal_csp_copula(
+            *args, reinit_top_after=2, reinit_top_rule=rule, **base
+        )
+        info = result["top_reinit"]
+        assert result["reinit_top_rule"] == rule
+        assert info is not None and info["iteration"] == 2 and info["rule"] == rule
+        assert info["A_top"].shape == (80, 3)
+        assert info["B_top"].shape == (8, 4)
+        assert 1 <= info["num_parents"] <= 3
+        assert set(np.unique(info["A_top"])).issubset({0, 1})
+        # Rows of inactive children stay zero in the re-initialized block.
+        inactive = np.setdiff1d(np.arange(8), info["active_children"])
+        assert np.all(info["B_top"][inactive] == 0.0)
+        assert result["iterations"] == 4
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, reinit_top_after=-1, **base)
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, reinit_top_after=1, reinit_top_rule="bogus", **base)
+    one_layer = fit_normal_csp_copula(
+        inputs["X"], np.full(8, 0.5), inputs["gamma"],
+        [inputs["B_list"][0].copy()], [inputs["A_list"][0].copy()], **base
+    )
+    assert one_layer["top_reinit"] is None
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(
+            inputs["X"], np.full(8, 0.5), inputs["gamma"],
+            [inputs["B_list"][0].copy()], [inputs["A_list"][0].copy()],
+            reinit_top_after=1, **base
+        )
+
+
+def test_fit_passes_latent_transition_and_reinit_controls():
+    X = _simulate_two_layer(17, N=150)
+    common = dict(
+        method="DDE", family="Normal", D=2, dimension_method="csp",
+        t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=2, max_iter=3,
+        random_state=5, verbose=False,
+    )
+    result = fit(
+        X, csp_latent_transition="systematic_coordinate_gibbs",
+        csp_reinit_top_after=2, csp_reinit_top_rule="copula", **common
+    )
+    d = result.diagnostics
+    assert d["latent_transition"] == "systematic_coordinate_gibbs"
+    assert d["mc_state_update"] == "last_draw"
+    assert d["reinit_top_after"] == 2 and d["reinit_top_rule"] == "copula"
+    assert d["top_reinit"] is not None and d["top_reinit"]["iteration"] == 2
+    default = fit(X, **common)
+    assert default.diagnostics["latent_transition"] == "synchronous_mean_field"
+    assert default.diagnostics["mc_state_update"] == "draw_majority"
+    assert default.diagnostics["top_reinit"] is None
+
+
+def test_parallel_column_groups_and_merge_option():
+    from dde.algorithms.normal_csp_copula import _parallel_column_groups
+
+    B = np.zeros((5, 5))
+    B[:, 0] = -1.0
+    B[:, 1] = [3.0, 2.0, 0.0, 2.5, 0.0]
+    B[:, 2] = [0.0, 0.0, 4.0, 0.0, 3.0]
+    B[:, 3] = [2.0, 0.0, 0.5, 2.0, 0.5]   # cosine about 0.86 with column 1
+    B[:, 4] = [0.0, 0.0, 0.0, 0.0, 0.0]   # zero column: never grouped
+    allocation = np.array([4, 4, 4, 4])   # all active
+    assert _parallel_column_groups(B, allocation, 0.7) == [[0, 2]]
+    assert _parallel_column_groups(B, allocation, 0.9) == []
+    # An inactive column does not take part.
+    assert _parallel_column_groups(B, np.array([4, 4, 0, 4]), 0.7) == []
+
+    inputs = _inputs(N=80, J=24, widths=(8, 3))
+    args = (inputs["X"], inputs["prop"], inputs["gamma"],
+            _copy(inputs["B_list"]), _copy(inputs["A_list"]))
+    base = dict(C=1, it=4, t_spike=0.02, temp=0.9, tau=0.3, verbose=False,
+                random_state=5)
+    plain = fit_normal_csp_copula(*args, **base)
+    assert plain["merge_cosine"] == 0.0 and plain["merge_events"] == []
+    merged = fit_normal_csp_copula(
+        *args, merge_cosine=0.3, merge_after=1, merge_layers="logistic", **base
+    )
+    assert merged["merge_layers"] == "logistic"
+    for iteration, layer, group in merged["merge_events"]:
+        assert 1 <= iteration < 4 and layer == 1 and len(group) >= 2
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, merge_cosine=1.0, **base)
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, merge_cosine=0.5, merge_layers="bogus", **base)
+    with pytest.raises(ValueError):
+        fit_normal_csp_copula(*args, merge_cosine=0.5, merge_after=-1, **base)
+
+
+def test_merge_removes_split_top_columns():
+    """A top layer carrying one factor split over two columns is merged into
+    one column whose coefficients are the sum, and the other column dies."""
+    rng = np.random.default_rng(21)
+    N, J = 400, 24
+    A2 = rng.binomial(1, 0.5, (N, 1))
+    B2 = np.zeros((6, 1)); B2[:, 0] = 4.0
+    A1 = rng.binomial(1, expit(-2.0 + A2 @ B2.T))
+    B1 = np.zeros((J, 6))
+    for k in range(6):
+        B1[4 * k:4 * (k + 1), k] = 6.0
+    X = A1 @ B1.T + rng.normal(size=(N, J))
+    # Split state: two independent top columns sharing the loadings.
+    A3_split = rng.binomial(1, 0.5, (N, 2)).astype(float)
+    B3_split = np.column_stack([np.full(6, -2.0), np.full(6, 2.0), np.full(6, 2.0)])
+    prop = np.full(2, 0.5)
+    B_list = [np.column_stack([np.zeros(J), B1]), B3_split]
+    A_list = [A1.astype(float), A3_split]
+    merged = fit_normal_csp_copula(
+        X, prop, np.ones(J), _copy(B_list), _copy(A_list), C=1, it=3,
+        t_spike=[0.02, 0.03], temp=0.9, tau=0.3, verbose=False, random_state=2,
+        latent_transition="systematic_coordinate_gibbs", merge_cosine=0.7,
+        merge_after=1,
+    )
+    assert merged["merge_events"] and merged["merge_events"][0][1:] == (1, (0, 1))
+    assert merged["num_active"][1] == 1
+    assert np.all(merged["B_list"][1][:, 2] == 0.0)

@@ -30,6 +30,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import evaluate_normal_csp_recovery as base  # noqa: E402
 
 from dde import fit  # noqa: E402
+from dde.algorithms.dde import _destandardize_observed_layer  # noqa: E402
+from dde.algorithms.normal_init_cop import Normal_init_cop  # noqa: E402
+from dde.algorithms.normal_init_semi import Normal_init_semi  # noqa: E402
 
 
 SCENARIOS = {
@@ -59,9 +62,9 @@ def _parse_args():
         choices=["first_two", "all_but_last", "none"],
     )
     parser.add_argument(
-        "--mstep-solver", default="hybrid",
-        help="copula backend M-step: lbfgsb, fista, hybrid, or a comma-separated "
-             "per-layer list such as fista,fista,lbfgsb",
+        "--mstep-solver", default="fista_lower",
+        help="copula backend M-step: lbfgsb, fista, hybrid, fista_lower (package "
+             "default), or a comma-separated per-layer list such as fista,fista,lbfgsb",
     )
     parser.add_argument("--fista-maxiter", type=int, default=None,
                         help="copula backend: FISTA budget (default: package default, 300)")
@@ -69,11 +72,12 @@ def _parse_args():
                         help="copula backend: Gamma shape of the slab-rate hyperprior (CopDDE 1)")
     parser.add_argument("--slab-rate", type=float, default=5.0,
                         help="copula backend: Gamma rate of the slab-rate hyperprior (CopDDE 5)")
-    parser.add_argument("--penalty-power", type=float, nargs="+", default=[0.0],
+    parser.add_argument("--penalty-power", type=float, nargs="+", default=[1.0],
                         help="copula backend: penalty multiplier (N / reference) ** power; "
-                             "one value or one per layer")
+                             "one value or one per layer (package default 1)")
     parser.add_argument("--penalty-reference", type=float, default=500.0)
-    parser.add_argument("--penalty-layers", default="all", choices=["all", "deep", "lower"])
+    parser.add_argument("--penalty-layers", default="lower", choices=["all", "deep", "lower"],
+                        help="copula backend: layers whose penalty is scaled (package default lower)")
     parser.add_argument("--penalty-allocation", action="store_true",
                         help="copula backend: CUSP allocation sees the scaled coefficients")
     parser.add_argument(
@@ -92,6 +96,35 @@ def _parse_args():
         "--t-spike-multipliers", default=None,
         help="comma-separated per-layer multipliers applied to the scenario t_spike",
     )
+    parser.add_argument(
+        "--init-mode", default="data", choices=["data", "truth", "truth_top"],
+        help="data: the package initializer; truth: every layer at the padded "
+             "truth; truth_top: package initializer with the deepest latent "
+             "layer replaced by the padded truth (its coefficient block refit)",
+    )
+    parser.add_argument(
+        "--latent-transition", default="synchronous_mean_field",
+        choices=["synchronous_mean_field", "systematic_coordinate_gibbs"],
+        help="copula backend E-step: CopDDE synchronous mean-field draws or "
+             "persistent systematic coordinate-Gibbs sweeps",
+    )
+    parser.add_argument(
+        "--mc-state-update", default=None, choices=["draw_majority", "last_draw"],
+        help="copula backend: committed latent state (default: majority for "
+             "mean-field, last draw for Gibbs)",
+    )
+    parser.add_argument("--reinit-top-after", type=int, default=0,
+                        help="copula backend: re-initialize the deepest layer from the "
+                             "active children after this many iterations (0: never)")
+    parser.add_argument("--reinit-top-rule", default="family", choices=["family", "copula"])
+    parser.add_argument("--reinit-top-source", default="state", choices=["state", "probability"],
+                        help="copula backend: re-initialize from the binary child state or "
+                             "from the mean-field child probabilities")
+    parser.add_argument("--merge-cosine", type=float, default=0.0,
+                        help="copula backend: merge active logistic-layer columns whose "
+                             "coefficient columns have cosine above this (0: never)")
+    parser.add_argument("--merge-after", type=int, default=10)
+    parser.add_argument("--merge-layers", default="top", choices=["top", "logistic"])
     parser.add_argument("--standardize", default="auto", choices=["auto", "true", "false"])
     parser.add_argument("--seed-base", type=int, default=20261015)
     parser.add_argument("--workers", type=int, default=1)
@@ -121,12 +154,96 @@ def _t_spike_for(scenario, settings):
     return t_spike
 
 
+def _truth_corr(A_fit, A_true):
+    """Mean over true columns of the largest |corr| with any fitted column."""
+    A_fit = np.asarray(A_fit, dtype=float)
+    A_true = np.asarray(A_true, dtype=float)
+    if A_fit.shape[1] == 0:
+        return 0.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cross = np.nan_to_num(
+            np.corrcoef(A_fit.T, A_true.T)[: A_fit.shape[1], A_fit.shape[1]:]
+        )
+    return float(np.mean(np.max(np.abs(cross), axis=0)))
+
+
+def _layer_diagnostics(record, A_list, A_true, tag):
+    for d, (A_fit, A_tr) in enumerate(zip(A_list, A_true)):
+        dup, matched, weak = _column_diagnostics(A_fit, A_tr)
+        record[f"A{d + 1}_{tag}_matched_truth"] = matched
+        record[f"A{d + 1}_{tag}_weak_columns"] = weak
+        record[f"A{d + 1}_{tag}_truth_corr"] = _truth_corr(A_fit, A_tr)
+        record[f"A{d + 1}_{tag}_accuracy"] = base._matched_binary_accuracy(A_fit, A_tr)
+
+
+def _refit_logistic_block(children, parents, ridge=1e-2, iterations=30, bound=10.0):
+    """Ridge-logistic regression of every child column on [1, parents]."""
+    children = np.asarray(children, dtype=float)
+    design = np.column_stack([np.ones(parents.shape[0]), np.asarray(parents, float)])
+    out = np.zeros((children.shape[1], design.shape[1]))
+    for k in range(children.shape[1]):
+        y = children[:, k]
+        beta = np.zeros(design.shape[1])
+        for _ in range(iterations):
+            mu = 1.0 / (1.0 + np.exp(-(design @ beta)))
+            grad = design.T @ (mu - y) + ridge * beta
+            hess = (design * (mu * (1 - mu))[:, None]).T @ design + ridge * np.eye(design.shape[1])
+            step = np.linalg.solve(hess, grad)
+            beta = np.clip(beta - step, -bound, bound)
+            if np.max(np.abs(step)) < 1e-8:
+                break
+        out[k] = beta
+    return out
+
+
+def _package_initialization(X, scenario, settings, fit_seed):
+    """Reproduce the fit's data initialization on the (standardized) X."""
+    standardize = settings["standardize"] != "false"
+    if standardize:
+        mean = np.mean(X, axis=0)
+        sd = np.std(X, axis=0)
+        sd = np.where(sd > 0, sd, 1.0)
+        X_work = (X - mean) / sd
+    else:
+        X_work = X
+    K_max = tuple(int(k) for k in scenario["K_max"])
+    np.random.seed(fit_seed)
+    if settings["initializer"] == "copula":
+        prop, B_list, gamma, A_list = Normal_init_cop(X_work, K_max)
+    else:
+        prop, B_list, gamma, A_list, _ = Normal_init_semi(
+            X_work, K_max[0], K_max, mode="data"
+        )
+    B_list = [np.asarray(B, dtype=float) for B in B_list]
+    A_list = [np.asarray(A, dtype=np.uint8) for A in A_list]
+    if standardize:
+        B_list[0], gamma = _destandardize_observed_layer(B_list[0], gamma, mean, sd)
+    return np.asarray(prop, float), B_list, np.asarray(gamma, float), A_list
+
+
+def _initialization_for(mode, scenario, X, A_true, settings, fit_seed):
+    """Return (prop, B_list, gamma, A_list) for the requested init mode."""
+    if mode == "truth":
+        return base._padded_truth(scenario, A_true, fit_seed)
+    prop, B_list, gamma, A_list = _package_initialization(X, scenario, settings, fit_seed)
+    if mode == "truth_top":
+        _, _, _, A_truth = base._padded_truth(scenario, A_true, fit_seed)
+        D = scenario["D"]
+        A_top = np.asarray(A_truth[-1], dtype=np.uint8)
+        B_list[D - 1] = _refit_logistic_block(A_list[D - 2], A_top)
+        A_list[D - 1] = A_top
+        prop = np.clip(np.mean(A_top, axis=0), 1e-8, 1 - 1e-8)
+    return prop, B_list, gamma, A_list
+
+
 def _run_one(task):
     scenario_name, N, replicate, backend, settings = task
     scenario = SCENARIOS[scenario_name]()
     data_seed = settings["seed_base"] + 100_000 * scenario["D"] + 1_000 * N + replicate
     fit_seed = data_seed + 202
     X, A_true = base._simulate(scenario, N, data_seed)
+    init_mode = settings.get("init_mode", "data")
+    init = _initialization_for(init_mode, scenario, X, A_true, settings, fit_seed)
     kwargs = dict(
         method="DDE",
         family="Normal",
@@ -167,6 +284,21 @@ def _run_one(task):
         kwargs["csp_penalty_scaling_reference"] = settings.get("penalty_reference", 500.0)
         kwargs["csp_penalty_scaling_layers"] = settings.get("penalty_layers", "all")
         kwargs["csp_penalty_scaling_allocation"] = settings.get("penalty_allocation", False)
+        kwargs["csp_latent_transition"] = settings.get(
+            "latent_transition", "synchronous_mean_field"
+        )
+        kwargs["csp_mc_state_update"] = settings.get("mc_state_update")
+        kwargs["csp_reinit_top_after"] = settings.get("reinit_top_after", 0)
+        kwargs["csp_reinit_top_rule"] = settings.get("reinit_top_rule", "family")
+        kwargs["csp_reinit_top_source"] = settings.get("reinit_top_source", "state")
+        kwargs["csp_merge_cosine"] = settings.get("merge_cosine", 0.0)
+        kwargs["csp_merge_after"] = settings.get("merge_after", 10)
+        kwargs["csp_merge_layers"] = settings.get("merge_layers", "top")
+    if init_mode != "data":
+        prop_in, B_list_in, gamma_in, A_list_in = init
+        kwargs.update(
+            prop_in=prop_in, B_list_in=B_list_in, gamma_in=gamma_in, A_list_in=A_list_in
+        )
 
     started = time.perf_counter()
     error = ""
@@ -191,6 +323,15 @@ def _run_one(task):
         "tau": float(_tau_for(N, settings)),
         "t_spike": json.dumps(_t_spike_for(scenario, settings).tolist()),
         "mstep_latent": settings.get("mstep_latent", "draw"),
+        "init_mode": init_mode,
+        "latent_transition": settings.get("latent_transition", "synchronous_mean_field"),
+        "mc_state_update": settings.get("mc_state_update"),
+        "reinit_top_after": int(settings.get("reinit_top_after", 0)),
+        "reinit_top_rule": settings.get("reinit_top_rule", "family"),
+        "reinit_top_source": settings.get("reinit_top_source", "state"),
+        "merge_cosine": float(settings.get("merge_cosine", 0.0)),
+        "merge_after": int(settings.get("merge_after", 10)),
+        "merge_layers": settings.get("merge_layers", "top"),
         "fista_maxiter": settings.get("fista_maxiter"),
         "observed_noise_scale": float(settings.get("observed_noise_scale", 0.0)),
         "temp": float(scenario["base_temp"]),
@@ -199,6 +340,7 @@ def _run_one(task):
         "fit_seconds": float(elapsed),
         "error": error,
     }
+    _layer_diagnostics(record, init[3], A_true, "init")
     if result is None:
         record.update(K_fit="", exact_width=np.nan, dimension_l1_error=np.nan,
                       iterations=np.nan, stopped_by_convergence=np.nan)
@@ -232,6 +374,19 @@ def _run_one(task):
         record[f"A{d + 1}_duplicate_pairs"] = dup
         record[f"A{d + 1}_matched_truth"] = matched
         record[f"A{d + 1}_weak_columns"] = weak
+        record[f"A{d + 1}_truth_corr"] = _truth_corr(result.A_list[d], A_true[d])
+    record["merge_count"] = len(result.diagnostics.get("merge_events") or [])
+    top_reinit = result.diagnostics.get("top_reinit")
+    if top_reinit is not None:
+        D = scenario["D"]
+        A_top = np.asarray(top_reinit["A_top"])[:, : int(top_reinit["num_parents"])]
+        record["reinit_iteration"] = int(top_reinit["iteration"])
+        record["reinit_num_parents"] = int(top_reinit["num_parents"])
+        _, matched, weak = _column_diagnostics(A_top, A_true[D - 1])
+        record[f"A{D}_reinit_matched_truth"] = matched
+        record[f"A{D}_reinit_weak_columns"] = weak
+        record[f"A{D}_reinit_truth_corr"] = _truth_corr(A_top, A_true[D - 1])
+        record[f"A{D}_reinit_accuracy"] = base._matched_binary_accuracy(A_top, A_true[D - 1])
     if settings["keep_trace"]:
         trace = result.diagnostics.get("trace", [])
         record["K_trace"] = json.dumps(
@@ -357,6 +512,15 @@ def main():
         "tau_fixed": args.tau_fixed,
         "t_spike_multipliers": args.t_spike_multipliers,
         "standardize": args.standardize,
+        "init_mode": args.init_mode,
+        "latent_transition": args.latent_transition,
+        "mc_state_update": args.mc_state_update,
+        "reinit_top_after": args.reinit_top_after,
+        "reinit_top_rule": args.reinit_top_rule,
+        "reinit_top_source": args.reinit_top_source,
+        "merge_cosine": args.merge_cosine,
+        "merge_after": args.merge_after,
+        "merge_layers": args.merge_layers,
         "keep_trace": args.keep_trace,
     }
     (out_dir / "metadata.json").write_text(

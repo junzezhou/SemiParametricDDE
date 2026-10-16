@@ -126,9 +126,14 @@ def _normal_residual_variance(X, A, B, row_chunk_size=2048):
     return residual_sum_squares / N
 
 
-def initialize_binary_parent(A_prev, K_parent, epsilon=1e-4):
-    """Spectrally initialize one binary parent from active child states."""
-    A_prev = np.asarray(A_prev, dtype=np.uint8)
+def initialize_binary_parent(A_prev, K_parent, epsilon=1e-4, *, binary=True):
+    """Spectrally initialize one binary parent from active child states.
+
+    With ``binary=False`` the children may be probabilities in ``[0, 1]``
+    (for example mean-field conditional probabilities) instead of a binary
+    state; the spectral steps are unchanged.
+    """
+    A_prev = np.asarray(A_prev, dtype=np.uint8 if binary else float)
     if A_prev.ndim != 2 or A_prev.shape[0] < 1 or A_prev.shape[1] < 1:
         raise ValueError("A_prev must be a nonempty binary matrix.")
     K_parent = int(K_parent)
