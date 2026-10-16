@@ -160,6 +160,7 @@ def get_SAEM_semiparametric_csp(
             max_enum_bits=max_enum_bits,
             mc_samples=mc_samples,
             g_update_rho=g_update_rho,
+            g_mode="pattern",
         )
         g_relative_history.append(g_relative)
 

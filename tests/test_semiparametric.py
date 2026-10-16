@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from scipy.stats import norm
 
 from dde.utils.semiparametric import g_est_rversion
@@ -88,3 +89,42 @@ def test_g_est_rversion_handles_large_unobserved_class_space():
     assert actual.shape == (n, p)
     assert np.isfinite(actual).all()
     np.testing.assert_allclose(actual.mean(axis=0), np.zeros(p), atol=1e-12)
+
+
+def test_parent_set_g_step_handles_wide_first_layer_and_matches_dense_scale():
+    """K_1 > 62 must not overflow, and the estimate must be O(1) per column."""
+    import numpy as np
+    from scipy.special import expit
+    from dde.algorithms.semi_saem import _semiparametric_g_step, _parent_set_g_estimate
+
+    rng = np.random.default_rng(3)
+    N, K1, J = 300, 70, 30
+    prop = np.full(2, 0.5)
+    B2 = np.column_stack([np.full(K1, -1.0), rng.normal(size=(K1, 2))])
+    B1 = np.zeros((J, K1 + 1))
+    for j in range(J):
+        B1[j, 1 + (j % K1)] = 3.0
+    A2 = rng.binomial(1, prop, (N, 2)).astype(float)
+    A1 = rng.binomial(1, expit(B2[:, 0] + A2 @ B2[:, 1:].T)).astype(float)
+    X = B1[:, 0] + A1 @ B1[:, 1:].T + rng.normal(size=(N, J))
+    Y = np.exp(X / 3.0)
+    np.random.seed(1)
+    X_next, g_new, diff = _semiparametric_g_step(
+        Y, X, prop, [B1, B2], A1, delta=1e-6, max_enum_bits=20, mc_samples=2000
+    )
+    assert g_new.shape == (N, J)
+    assert np.all(np.isfinite(g_new))
+    # Standardized columns with real spread (the degenerate sparse-pattern
+    # estimate collapsed to zeros for wide layers).
+    assert np.all(np.std(g_new, axis=0) > 0.5)
+    # Monotone in Y within each parent class.
+    for j in range(3):
+        labels = A1[:, j % K1]
+        for value in (0.0, 1.0):
+            mask = labels == value
+            order = np.argsort(Y[mask, j])
+            assert np.all(np.diff(g_new[mask, j][order]) >= -1e-12)
+    with pytest.raises(ValueError):
+        _semiparametric_g_step(Y, X, prop, [B1, B2], A1, delta=1e-6, g_mode="bogus")
+    explicit = _parent_set_g_estimate(Y, prop, [B1, B2], A1, delta=1e-6, mc_samples=2000)
+    assert explicit.shape == (N, J)
