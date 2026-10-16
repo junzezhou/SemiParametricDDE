@@ -13,7 +13,7 @@ import numpy as np
 from dde import fit
 from dde.algorithms.normal_init_semi import Normal_init_semi
 
-from evaluate_normal_csp_recovery import (
+from normal_csp_scenarios import (
     _matched_binary_accuracy,
     _max_abs_column_correlation,
     _read_csv,

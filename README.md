@@ -59,8 +59,7 @@ that stops the kernel.  `csp_mstep_solver="lbfgsb"` together with
 `csp_penalty_scaling_power=0` restores the CopDDE M-step in every layer;
 `csp_slab_shape` and `csp_slab_rate` set the CUSP slab hyperprior (CopDDE
 1 and 5); `standardize=False` and `csp_threshold_rule` expose the remaining
-adaptations.  The previous simultaneous MCEM kernel remains available as
-`csp_backend="mcem"`.  Run `scripts/evaluate_normal_csp_copula_kernel.py` to
+adaptations.  Run `scripts/evaluate_normal_csp_copula_kernel.py` to
 compare configurations' mean fitted widths against the true widths on the
 CopDDE paper designs; `Results/normal_dde_csp_copula_kernel/` holds the
 studies behind these defaults.
@@ -90,8 +89,8 @@ experiments under nonlinear continuous margins. Its primary summary columns
 are the exact dimension-shrinkage recovery rate and the mean L1 distance
 between fitted and true width vectors.
 
-Parametric CSP provides the copula backend above (Normal only) and three MCEM
-backends.  ``"mcem"`` retains the original simultaneous MCEM updates,
+Normal CSP has the copula kernel only.  Bernoulli and Poisson CSP provide
+three MCEM backends.  ``"mcem"`` retains the original simultaneous MCEM updates,
 ``"mcem_reinitialize"`` activates CSP layer by layer and rebuilds each waiting
 parent, and ``"mcem_cap_only"`` uses the same staged schedule while preserving
 eligible parent states and only enforcing the child-implied structural cap.
@@ -133,9 +132,7 @@ defaults delay irreversible CSP shrinkage for 10 iterations when at least 20
 outer iterations are requested, and scale the CSP penalty by
 `max(1, (N / 1000) ** (2 / 3))`.  Supplying
 `mcem_shrinkage_burn` or `mcem_penalty_strength` overrides the corresponding
-automatic value.  Two-layer Bernoulli CSP retains its established settings,
-and the explicit Normal ``"mcem"`` backend keeps its synchronous
-approximate-MCEM transition for numerical backward compatibility.
+automatic value.  Two-layer Bernoulli CSP retains its established settings.
 
 Poisson DDE uses a canonical log link, requires finite nonnegative integer
 counts, and has no `gamma` dispersion parameter. Fixed-width estimation

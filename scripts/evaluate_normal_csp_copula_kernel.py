@@ -1,7 +1,7 @@
 """Dimension-shrinkage simulation for the Normal DDE CSP backends.
 
-The scenarios are the CopDDE paper designs reused by
-``evaluate_normal_csp_recovery.py``: D=2 with J=50 and true widths (10, 3)
+The scenarios are the CopDDE paper designs in
+``normal_csp_scenarios.py``: D=2 with J=50 and true widths (10, 3)
 fitted from the maximal widths (16, 5), and D=3 with J=108 and true widths
 (18, 6, 2) fitted from (36, 12, 4).  Observations are Gaussian, so the data
 are the latent ``Z`` of the copula design without any marginal transform.
@@ -27,7 +27,7 @@ import numpy as np
 from threadpoolctl import threadpool_limits
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import evaluate_normal_csp_recovery as base  # noqa: E402
+import normal_csp_scenarios as base  # noqa: E402
 
 from dde import fit  # noqa: E402
 from dde.algorithms.dde import _destandardize_observed_layer  # noqa: E402
@@ -39,7 +39,7 @@ SCENARIOS = {
     "d2_j50": base._scenario_d2,
     "d3_j108": base._scenario_d3,
 }
-BACKEND_DEFAULT_OPTIMIZER_MAXITER = {"copula": 15, "mcem": 100}
+BACKEND_DEFAULT_OPTIMIZER_MAXITER = {"copula": 15}
 
 
 def _parse_args():
@@ -50,7 +50,7 @@ def _parse_args():
     )
     parser.add_argument("--replicates", type=int, default=20)
     parser.add_argument("--replicate-start", type=int, default=0)
-    parser.add_argument("--backends", default="copula,mcem")
+    parser.add_argument("--backends", default="copula")
     parser.add_argument("--max-iter", type=int, default=50)
     parser.add_argument("--optimizer-maxiter", type=int, default=None)
     parser.add_argument("--mc-samples", type=int, default=1)

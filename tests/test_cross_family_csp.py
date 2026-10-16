@@ -113,7 +113,7 @@ def _assert_nested_arrays_equal(normal_history, copula_history):
 def _recording_layer_update(calls):
     """Return a deterministic CSP update used to inspect family call sites."""
 
-    def update(B_d, omega, spike_scale, slab_scale, num_rows, *, rng=None):
+    def update(B_d, omega, spike_scale, slab_scale, num_rows, *, rng=None, **kwargs):
         B_d = np.asarray(B_d, dtype=float)
         omega = np.asarray(omega, dtype=float)
         slab_scale = np.asarray(slab_scale, dtype=float)
@@ -189,18 +189,20 @@ def test_family_kernels_initialize_and_call_csp_controls_identically(monkeypatch
         copula_csp, "_update_csp_layer", _recording_layer_update(copula_calls)
     )
 
-    normal_raw = normal_csp.fit_normal_csp_mcem(
+    normal_raw = normal_csp.fit_normal_csp(
         inputs["X"],
         inputs["prop"],
-        _copy_arrays(inputs["B_list"]),
         inputs["gamma"],
+        _copy_arrays(inputs["B_list"]),
         _copy_arrays(inputs["A_list"]),
         C=1,
-        max_iter=1,
+        it=1,
         t_spike=[0.02, 0.03],
-        temperature=0.9,
-        threshold=0.3,
+        temp=0.9,
+        tau=0.3,
         optimizer_maxiter=1,
+        mstep_solver="lbfgsb",
+        penalty_scaling_power=0.0,
         random_state=1817,
         verbose=False,
     )

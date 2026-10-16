@@ -1,9 +1,8 @@
 import numpy as np
 
-import dde.algorithms.normal_csp as normal_csp_module
+import dde.algorithms.parametric_csp_mcem as normal_csp_module
 from dde.algorithms.dde import fit_dde_normal, fit_parametric_dde
-from dde.algorithms.normal_csp import (
-    fit_normal_csp_mcem,
+from dde.algorithms.parametric_csp_mcem import (
     fit_parametric_csp_mcem,
 )
 from dde.algorithms.parametric_families import (
@@ -107,36 +106,8 @@ def test_fixed_normal_compatibility_runner_is_bitwise_equivalent():
     _assert_nested_equal(actual, expected)
 
 
-def test_csp_normal_compatibility_runner_is_bitwise_equivalent():
-    X, prop, B_list, gamma, A_list = _normal_state()
-    common = dict(
-        X=X,
-        prop_in=prop,
-        B_list_in=B_list,
-        A_list_in=A_list,
-        C=2,
-        max_iter=2,
-        t_spike=[0.03, 0.05],
-        temperature=0.9,
-        threshold=0.04,
-        convergence_tol=0.0,
-        convergence_mean_tol=0.0,
-        optimizer_maxiter=5,
-        random_state=9917,
-        keep_trace=True,
-        verbose=False,
-    )
-
-    expected = fit_normal_csp_mcem(gamma_in=gamma, **common)
-    actual = fit_parametric_csp_mcem(
-        dispersion_in=gamma,
-        family=NORMAL_FAMILY,
-        **common,
-    )
-    _assert_nested_equal(actual, expected)
-
-
-def test_normal_csp_keeps_the_legacy_latent_transition(monkeypatch):
+def test_semidde_inner_mcem_kernel_keeps_the_legacy_latent_transition(monkeypatch):
+    """The MCEM kernel with the Normal family only serves the SemiDDE inner loop."""
     X, prop, B_list, gamma, A_list = _normal_state(20260903)
 
     def reject_systematic_sampler(*args, **kwargs):
@@ -149,12 +120,13 @@ def test_normal_csp_keeps_the_legacy_latent_transition(monkeypatch):
         "_sample_latent_layers_parametric",
         reject_systematic_sampler,
     )
-    raw = fit_normal_csp_mcem(
+    raw = fit_parametric_csp_mcem(
         X,
         prop,
         B_list,
         gamma,
         A_list,
+        family=NORMAL_FAMILY,
         C=2,
         max_iter=1,
         t_spike=[0.03, 0.05],

@@ -1,1216 +1,752 @@
-"""CSP-MAP MCEM kernels for parametric-observed DDEs.
+"""Normal DDE CSP kernel ported from the CopDDE D-layer CSP algorithm.
 
-The original simultaneous kernel follows the coordinate-ascent architecture
-used by the package's CopDDE CSP path.  Two staged variants share that kernel
-and differ only in whether a waiting parent is rebuilt or capped while its
-eligible state is preserved.  The latent control loop is family-independent;
-its adapter supplies the observed conditional likelihood and M-step.
+This module adapts ``DDE-Copula-m/Algorithms/get_SAEM_RL_CSP_D.m`` (and its
+package port :mod:`dde.algorithms.get_SAEM_RL_CSP_D`) to the parametric Normal
+DDE.  The copula model treats the latent Gaussian matrix ``Z`` as unobserved
+and resamples it from the rank likelihood at every iteration; the Normal DDE
+observes ``Z = X`` directly, so that step is the only part of the algorithm
+that is removed.  Every other component is reused unchanged:
+
+1. synchronous mean-field conditional probabilities for all latent layers,
+   computed from the previous latent point estimates;
+2. ``C`` Bernoulli draws per layer, with the majority vote as the next state;
+3. the cumulative-shrinkage-process (CUSP) MAP allocation, stick-breaking,
+   and slab-scale update from :func:`dde.algorithms.csp.update_csp_layer`,
+   swept from the deepest layer toward the data with ``num_rows`` equal to
+   the previous iteration's active child count;
+4. bounded L-BFGS-B weighted-L1 M-steps with a short iteration budget
+   (``optimizer_maxiter=15`` as in the MATLAB ``optimset('MaxIter', 15)``)
+   for the logistic layers; by default (``mstep_solver="hybrid"``) the
+   observed Gaussian layer is instead solved by the Normal family's exact
+   proximal (FISTA) weighted-lasso solver with ``fista_maxiter=300``
+   iterations.  The inexact L-BFGS-B step cannot move loading mass between
+   two identical latent columns (the likelihood is flat along that
+   direction), which leaves duplicate columns of true factors active; the
+   proximal solver resolves them.  ``mstep_solver="lbfgsb"`` restores the
+   CopDDE behaviour in every layer;
+5. the Gamma(1, 1) MAP update of the conditional variances;
+6. hard thresholding of the shallow layers, hierarchical row gating of
+   inactive children, the linear temperature schedule, and the rolling
+   relative-Frobenius-change stopping rule.
+
+Optional departures from the CopDDE kernel, all off by default
+(see ``Results/normal_dde_csp_copula_kernel/REPORT_top_layer.md``):
+``latent_transition="systematic_coordinate_gibbs"`` replaces the
+synchronous mean-field draws by persistent coordinate-Gibbs sweeps of the
+exact full conditionals (better deep-layer latent recovery, but split
+latent columns are then never removed); ``merge_cosine`` merges active
+logistic-layer columns with near-parallel coefficient columns (the split
+factors that a weighted-L1 penalty cannot remove); ``mc_state_update``
+selects the committed draw; ``reinit_top_after`` re-initializes the
+deepest layer from the active children after a number of iterations.
+
+The kernel keeps the ``K_list`` / ``B_list`` / ``A_list`` convention:
+``B_list[0]`` has shape ``(J, K_1 + 1)`` and ``B_list[d]`` for ``d >= 1`` has
+shape ``(K_d, K_{d+1} + 1)``.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from scipy.special import expit
 
 from .csp import csp_active_mask, update_csp_layer
+from .get_SAEM_RL_CSP_D import (
+    _make_bounds,
+    _optimize_gaussian_layer,
+    _optimize_logistic_layer,
+    _threshold,
+    _update_bernoulli_probabilities_D,
+)
+from .parametric_csp_mcem import _solve_logistic_weighted_l1
+from .normal_init_cop import _binary_init_matlab
 from .normal_init_semi import initialize_binary_parent
-from .parametric_families import (
-    BERNOULLI_FAMILY,
-    NORMAL_FAMILY,
-    _largest_eigenvalue_psd,
-    _poisson_optimization_exp_value,
-    _poisson_optimization_rate,
-    _soft_threshold,
-    _solve_gaussian_weighted_l1,
-    _solve_gaussian_weighted_l1_from_statistics,
-    resolve_parametric_family,
-)
-from .semi_saem import (
-    _compute_bernoulli_probabilities_parametric,
-    _sample_latent_layers_parametric,
-)
+from .parametric_families import NORMAL_FAMILY, _solve_gaussian_weighted_l1
+from .semi_saem import _sample_latent_layers_parametric
 
 
-_LEGACY_SYNCHRONOUS = "legacy_synchronous"
-_SYSTEMATIC_GIBBS = "systematic_coordinate_gibbs"
+_THRESHOLD_RULES = ("first_two", "all_but_last", "none")
+_MSTEP_SOLVERS = ("lbfgsb", "fista", "hybrid", "fista_lower")
+_MSTEP_LATENTS = ("draw", "mean_field")
+_PENALTY_SCALING_LAYERS = ("all", "deep", "lower")
+_LATENT_TRANSITIONS = ("synchronous_mean_field", "systematic_coordinate_gibbs")
+_MC_STATE_UPDATES = ("draw_majority", "last_draw")
+_REINIT_TOP_RULES = ("family", "copula")
+_REINIT_TOP_SOURCES = ("state", "probability")
+_MERGE_LAYERS = ("top", "logistic")
+_DEFAULT_OPTIMIZER_MAXITER = 15
+_DEFAULT_FISTA_MAXITER = 300
 
 
-def _as_rng(random_state=None):
+def _resolve_random(random_state):
+    """Return the random source used by the kernel.
+
+    ``None`` selects NumPy's legacy global RNG so that, after
+    ``np.random.seed(seed)``, the kernel consumes the same random stream as
+    the package CopDDE kernel.  Any other value is converted to a
+    :class:`numpy.random.Generator`.
+    """
+    if random_state is None:
+        return np.random
     if isinstance(random_state, np.random.Generator):
         return random_state
     return np.random.default_rng(random_state)
 
 
-def _validate_spike_scales(t_spike, D: int) -> np.ndarray:
-    scales = np.asarray(t_spike, dtype=float).reshape(-1)
-    if scales.size == 1:
-        scales = np.repeat(scales.item(), D)
-    if scales.size != D:
-        raise ValueError("t_spike must be a scalar or a length-D sequence.")
-    if not np.all(np.isfinite(scales)) or np.any(scales <= 0):
-        raise ValueError("t_spike entries must be finite and positive.")
-    return scales
-
-
-def _canonicalize_csp_layer_order(prop, B_list, A_list):
-    """Order latent coordinates by loading strength without changing the model.
-
-    The cumulative-shrinkage prior is ordered, whereas spectral/varimax
-    initialization is permutation invariant.  A simultaneous permutation of
-    a layer's incoming columns, persistent states, and outgoing rows preserves
-    every model probability while placing the strongest coordinates first.
-    """
-    prop = np.asarray(prop, dtype=float).copy()
-    B_list = [np.asarray(B, dtype=float).copy() for B in B_list]
-    A_list = [np.asarray(A).copy() for A in A_list]
-    permutations = []
-    D = len(B_list)
-    for d in range(D):
-        strength = np.sum(np.abs(B_list[d][:, 1:]), axis=0)
-        permutation = np.argsort(-strength, kind="stable")
-        permutations.append(permutation)
-        B_list[d][:, 1:] = B_list[d][:, permutation + 1]
-        A_list[d] = A_list[d][:, permutation]
-        if d + 1 < D:
-            B_list[d + 1] = B_list[d + 1][permutation, :]
-        else:
-            prop = prop[permutation]
-    return prop, B_list, A_list, permutations
-
-
-def _sample_latent_layers(ber, C: int, rng) -> list[np.ndarray]:
+def _sample_latent_layers(ber, C, random):
+    """Draw ``C`` Bernoulli samples per layer with a leading intercept column."""
+    N = ber[0].shape[0]
     samples = []
     for probs in ber:
-        N, Kd = probs.shape
-        augmented = np.empty((N, Kd + 1, C), dtype=np.uint8)
-        augmented[:, 0, :] = 1
-        augmented[:, 1:, :] = rng.random((N, Kd, C)) < probs[:, :, None]
-        samples.append(augmented)
+        Kd = probs.shape[1]
+        layer = np.zeros((N, Kd + 1, C), dtype=float)
+        layer[:, 0, :] = 1.0
+        for c in range(C):
+            layer[:, 1:, c] = (random.random((N, Kd)) < probs).astype(float)
+        samples.append(layer)
     return samples
 
 
-def _spectral_parent_width(A_prev, cap, minimum_gap):
-    """Select a parent start width only when a clear covariance gap exists."""
-    cap = int(cap)
-    centered = np.asarray(A_prev, dtype=float)
-    centered = centered - np.mean(centered, axis=0, keepdims=True)
-    singular_values = np.linalg.svd(centered, compute_uv=False)
-    normalized = singular_values / np.sqrt(centered.shape[0])
-    if minimum_gap is None or cap < 2 or normalized.size <= cap:
-        return cap, normalized[: cap + 1], None
+def _reinitialize_top_layer(children_all, B_list, z_cusp, K, rule, N):
+    """Spectrally re-initialize the deepest layer from the active children.
 
-    gaps = normalized[:cap] / np.maximum(normalized[1 : cap + 1], 1e-12)
-    gap_index = int(np.argmax(gaps))
-    largest_gap = float(gaps[gap_index])
-    selected = gap_index + 1 if largest_gap >= minimum_gap else cap
-    return selected, normalized[: cap + 1], largest_gap
-
-
-def _reinitialize_staged_parent(
-    layer,
-    prop,
-    B_list,
-    A_list,
-    active_masks,
-    allocation,
-    penalty_scale,
-    slab_scale,
-    omega,
-    stage_caps,
-    spike_scales,
-    spectral_gap_threshold,
-):
-    """Rebuild one waiting parent at its child-implied identifiable cap."""
-    child_indices = np.flatnonzero(active_masks[layer - 1])
-    cap = min(B_list[layer].shape[1] - 1, child_indices.size // 3)
-    if cap < 1:
-        raise ValueError(
-            "staged CSP selected too few child coordinates for another layer."
-        )
-    child_states = A_list[layer - 1][:, child_indices]
-    initial_width, singular_values, largest_gap = _spectral_parent_width(
-        child_states, cap, spectral_gap_threshold
-    )
-    B_small, A_parent = initialize_binary_parent(child_states, initial_width)
-
-    B_new = np.zeros_like(B_list[layer])
-    B_new[child_indices, 0] = B_small[:, 0]
-    B_new[np.ix_(child_indices, np.arange(1, initial_width + 1))] = B_small[
-        :, 1:
-    ]
-    B_list[layer] = B_new
-    A_new = np.zeros_like(A_list[layer])
-    A_new[:, :initial_width] = A_parent
-    A_list[layer] = A_new
-
-    stage_caps[layer] = cap
-    active_masks[layer] = np.arange(active_masks[layer].size) < initial_width
-    allocation[layer] = np.where(
-        active_masks[layer],
-        active_masks[layer].size + 1,
-        np.arange(1, active_masks[layer].size + 1),
-    )
-    slab_scale[layer] = np.ones_like(slab_scale[layer])
-    omega[layer] = np.ones_like(omega[layer]) / omega[layer].size
-    penalty_scale[layer] = np.broadcast_to(
-        np.where(active_masks[layer], 1.0, spike_scales[layer])[None, :],
-        penalty_scale[layer].shape,
-    ).copy()
-
-    if layer == len(B_list) - 1:
-        prop_new = np.full_like(prop, 0.5, dtype=float)
-        prop_new[:initial_width] = np.mean(A_parent, axis=0)
-        prop = prop_new
+    ``children_all`` is the ``N`` by ``K[D-2]`` child layer, binary or
+    probabilities.  Returns ``None`` when fewer than two children of the top
+    layer are active; otherwise a dict with the new top state ``A_top``
+    (``N`` by ``K[-1]``, trailing columns zero when fewer parents than
+    ``K[-1]`` can be initialized), the coefficient block ``B_top`` (inactive
+    children's rows zero), the active child indices and the number of
+    initialized parents.
+    """
+    D = len(B_list)
+    active = np.flatnonzero(csp_active_mask(z_cusp[D - 2]))
+    if active.size < 2:
+        return None
+    K_top = int(K[D - 1])
+    n_parent = min(K_top, int(active.size))
+    children = np.asarray(children_all, dtype=float)[:, active]
+    if rule == "copula":
+        A_new, B_new = _binary_init_matlab(N, active.size, n_parent, children)
     else:
-        B_list[layer + 1] = np.zeros_like(B_list[layer + 1])
-    return prop, {
-        "layer": layer + 1,
-        "mode": "reinitialize",
-        "child_active": int(child_indices.size),
-        "structural_cap": cap,
-        "initial_width": initial_width,
-        "singular_values": tuple(float(value) for value in singular_values),
-        "largest_gap": largest_gap,
+        B_new, A_new = initialize_binary_parent(children, n_parent, binary=False)
+    A_top = np.zeros((N, K_top), dtype=float)
+    A_top[:, :n_parent] = np.asarray(A_new, dtype=float)
+    B_top = np.zeros((int(K[D - 2]), K_top + 1), dtype=float)
+    B_top[active, : n_parent + 1] = np.asarray(B_new, dtype=float)
+    return {
+        "A_top": A_top.astype(np.uint8),
+        "B_top": B_top,
+        "active_children": active.copy(),
+        "num_parents": n_parent,
+        "rule": rule,
     }
 
 
-def _apply_staged_parent_cap_only(
-    layer,
-    prop,
-    B_list,
-    A_list,
-    active_masks,
-    allocation,
-    penalty_scale,
-    slab_scale,
-    omega,
-    stage_caps,
-    spike_scales,
-    spectral_gap_threshold,
-):
-    """Apply the child-implied cap without rebuilding the waiting parent."""
-    del slab_scale, omega, spectral_gap_threshold
-    child_indices = np.flatnonzero(active_masks[layer - 1])
-    cap = min(B_list[layer].shape[1] - 1, child_indices.size // 3)
-    if cap < 1:
-        raise ValueError(
-            "cap-only staged CSP selected too few child coordinates for "
-            "another layer."
-        )
+def _parallel_column_groups(B, allocation, cosine):
+    """Greedy groups of active coefficient columns with cosine above ``cosine``.
 
-    width = active_masks[layer].size
-    parent_mask = np.arange(width) < cap
-    active_masks[layer] = parent_mask
-    stage_caps[layer] = cap
-    allocation[layer] = np.where(
-        parent_mask,
-        width + 1,
-        np.arange(1, width + 1),
-    )
-    penalty_scale[layer][:, ~parent_mask] = spike_scales[layer]
-
-    inactive_children = np.flatnonzero(~active_masks[layer - 1])
-    if inactive_children.size:
-        B_list[layer][inactive_children, :] = 0.0
-    B_list[layer][:, cap + 1 :] = 0.0
-    A_list[layer][:, cap:] = 0
-
-    if layer == len(B_list) - 1:
-        prop = np.asarray(prop, dtype=float).copy()
-        prop[cap:] = 0.5
-    else:
-        B_list[layer + 1][cap:, :] = 0.0
-
-    return prop, {
-        "layer": layer + 1,
-        "mode": "cap_only",
-        "child_active": int(child_indices.size),
-        "structural_cap": int(cap),
-        "initial_width": int(cap),
-        "singular_values": (),
-        "largest_gap": None,
-    }
-
-
-def _logistic_mc_design_and_response_statistic(child_sample, parent_sample):
-    """Build the MC design and cache its Bernoulli response cross-product."""
-    child_sample = np.asarray(child_sample)
-    parent_sample = np.asarray(parent_sample)
-    if parent_sample.ndim != 3:
-        raise ValueError("Bernoulli parent samples must be a 3D MC array.")
-    N, parent_plus_intercept, C = parent_sample.shape
-    design = (
-        np.transpose(parent_sample, (0, 2, 1))
-        .reshape(N * C, parent_plus_intercept)
-        .astype(float, copy=False)
-    )
-    if child_sample.ndim == 2:
-        n_children = child_sample.shape[1]
-        if child_sample.shape[0] != N:
-            raise ValueError(
-                "Bernoulli children and parents must have the same row count."
-            )
-        response_statistic = np.asarray(child_sample, dtype=float).T @ np.sum(
-            parent_sample, axis=2, dtype=float
-        )
-    elif child_sample.ndim == 3:
-        n_children = child_sample.shape[1] - 1
-        if child_sample.shape[0] != N or child_sample.shape[2] != C:
-            raise ValueError(
-                "Bernoulli child and parent MC arrays must align in rows and draws."
-            )
-        response_statistic = np.einsum(
-            "njc,npc->jp",
-            child_sample[:, 1:, :],
-            parent_sample,
-            dtype=float,
-            optimize=True,
-        )
-    else:
-        raise ValueError(
-            "Bernoulli children must be a 2D matrix or 3D MC array."
-        )
-    return design, response_statistic, N, n_children, parent_plus_intercept, C
-
-
-def _logistic_mc_value_and_grad(
-    coefficients,
-    design,
-    response_statistic,
-    *,
-    temperature,
-    mc_samples,
-    row_chunk_size,
-    coordinate_chunk_size,
-    compute_value=True,
-):
-    """Evaluate a Bernoulli MC smooth objective in bounded-size batches."""
-    coefficients = np.asarray(coefficients, dtype=float)
-    design = np.asarray(design, dtype=float)
-    response_statistic = np.asarray(response_statistic, dtype=float)
-    if response_statistic.shape != coefficients.shape:
-        raise ValueError(
-            "Bernoulli response statistic and coefficients must have equal shapes."
-        )
-    if design.ndim != 2 or design.shape[1] != coefficients.shape[1]:
-        raise ValueError(
-            "Bernoulli design and coefficients have incompatible shapes."
-        )
-
-    row_chunk_size = max(1, int(row_chunk_size))
-    coordinate_chunk_size = max(1, int(coordinate_chunk_size))
-    scale = float(temperature) / int(mc_samples)
-    gradient = -response_statistic.copy()
-    value = (
-        -float(np.sum(response_statistic * coefficients))
-        if compute_value
-        else None
-    )
-
-    for row_start in range(0, design.shape[0], row_chunk_size):
-        row_stop = min(row_start + row_chunk_size, design.shape[0])
-        design_chunk = design[row_start:row_stop]
-        for coordinate_start in range(
-            0, coefficients.shape[0], coordinate_chunk_size
-        ):
-            coordinate_stop = min(
-                coordinate_start + coordinate_chunk_size,
-                coefficients.shape[0],
-            )
-            logits = (
-                design_chunk @ coefficients[coordinate_start:coordinate_stop].T
-            )
-            if compute_value:
-                value += float(np.sum(np.logaddexp(0.0, logits)))
-            expit(logits, out=logits)
-            gradient[coordinate_start:coordinate_stop] += (
-                logits.T @ design_chunk
-            )
-
-    return (
-        None if value is None else scale * value,
-        scale * gradient,
-    )
-
-
-def _solve_logistic_weighted_l1(
-    child_sample,
-    parent_sample,
-    B_start,
-    penalty_scale,
-    temperature,
-    *,
-    max_iter=100,
-    tol=1e-6,
-    bound=10.0,
-    bounds=None,
-    row_chunk_size=None,
-    coordinate_chunk_size=None,
-):
-    """Chunked batched FISTA update for one conditional Bernoulli layer.
-
-    The response-dependent linear statistic is computed once, so repeated
-    FISTA evaluations neither expand a fixed observed response over all Monte
-    Carlo draws nor recompute ``response.T @ design``.  Row and response
-    chunks bound the temporary logits while preserving the weighted-L1 target.
+    Columns are compared on their slopes (the intercept column of ``B`` is
+    ignored); only active, nonzero columns take part.  Each group is listed
+    in column order and has at least two members.
     """
-    B = np.asarray(B_start, dtype=float).copy()
-    penalty_scale = np.asarray(penalty_scale, dtype=float)
-    (
-        design,
-        response_statistic,
-        N,
-        n_children,
-        parent_plus_intercept,
-        C,
-    ) = _logistic_mc_design_and_response_statistic(child_sample, parent_sample)
-    expected_shape = (n_children, parent_plus_intercept)
-    if B.shape != expected_shape:
-        raise ValueError(
-            f"Bernoulli coefficients must have shape {expected_shape}; got {B.shape}."
-        )
-    if penalty_scale.shape != (n_children, parent_plus_intercept - 1):
-        raise ValueError(
-            "Bernoulli penalty_scale must have one value per response and slope."
-        )
+    slopes = np.asarray(B, dtype=float)[:, 1:]
+    active = np.flatnonzero(csp_active_mask(allocation))
+    norms = np.linalg.norm(slopes[:, active], axis=0)
+    active = active[norms > 0]
+    if active.size < 2:
+        return []
+    unit = slopes[:, active] / np.linalg.norm(slopes[:, active], axis=0)
+    similarity = unit.T @ unit
+    groups = []
+    used = set()
+    for i in range(active.size):
+        if i in used:
+            continue
+        members = [i] + [
+            j for j in range(i + 1, active.size)
+            if j not in used and similarity[i, j] > cosine
+        ]
+        used.update(members)
+        if len(members) > 1:
+            groups.append([int(active[m]) for m in members])
+    return groups
 
-    if row_chunk_size is None:
-        flat_row_chunk_size = N * C
-    else:
-        flat_row_chunk_size = max(1, int(row_chunk_size)) * C
-    if coordinate_chunk_size is None:
-        coordinate_chunk_size = n_children
-    coordinate_chunk_size = max(1, int(coordinate_chunk_size))
 
-    if bounds is None:
-        lower = np.full(parent_plus_intercept, -float(bound))
-        upper = np.full(parent_plus_intercept, float(bound))
-        lower[0] = -5.0
-    else:
-        bounds = list(bounds)
-        if len(bounds) != parent_plus_intercept:
+def _validate(X, prop, gamma, B_list, A_list):
+    D = len(B_list)
+    if len(A_list) != D or D < 1:
+        raise ValueError("B_list and A_list must be nonempty and of equal length.")
+    N, J = X.shape
+    K = [A.shape[1] for A in A_list]
+    if B_list[0].shape != (J, K[0] + 1):
+        raise ValueError(
+            f"B_list[0] shape {B_list[0].shape} must be {(J, K[0] + 1)}."
+        )
+    for d in range(1, D):
+        expected = (K[d - 1], K[d] + 1)
+        if B_list[d].shape != expected:
             raise ValueError(
-                "Bernoulli coefficient bounds have an incompatible width."
+                f"B_list[{d}] shape {B_list[d].shape} must be {expected}."
             )
-        lower = np.asarray([pair[0] for pair in bounds], dtype=float)
-        upper = np.asarray([pair[1] for pair in bounds], dtype=float)
-        if (
-            not np.all(np.isfinite(lower))
-            or not np.all(np.isfinite(upper))
-            or np.any(lower > upper)
-        ):
-            raise ValueError(
-                "Bernoulli coefficient bounds must be finite and ordered."
-            )
-
-    gram = design.T @ design
-    lipschitz = float(temperature) / C * 0.25 * _largest_eigenvalue_psd(gram)
-    if lipschitz <= 1e-14:
-        B[:, 0] = 0.0
-        B[:, 1:] = 0.0
-        return B
-
-    step = 1.0 / lipschitz
-    Y = B.copy()
-    momentum = 1.0
-    for _ in range(int(max_iter)):
-        _, gradient = _logistic_mc_value_and_grad(
-            Y,
-            design,
-            response_statistic,
-            temperature=temperature,
-            mc_samples=C,
-            row_chunk_size=flat_row_chunk_size,
-            coordinate_chunk_size=coordinate_chunk_size,
-            compute_value=False,
-        )
-        candidate = Y - step * gradient
-        candidate[:, 0] = np.clip(candidate[:, 0], lower[0], upper[0])
-        candidate[:, 1:] = _soft_threshold(
-            candidate[:, 1:], step / penalty_scale
-        )
-        candidate[:, 1:] = np.clip(
-            candidate[:, 1:], lower[None, 1:], upper[None, 1:]
-        )
-
-        relative = np.linalg.norm(candidate - B) / (np.linalg.norm(B) + 1e-12)
-        next_momentum = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * momentum**2))
-        Y = candidate + ((momentum - 1.0) / next_momentum) * (candidate - B)
-        B = candidate
-        momentum = next_momentum
-        if relative <= tol:
-            break
-    return B
+    if prop.shape != (K[-1],):
+        raise ValueError("prop length must match the deepest latent width.")
+    if gamma.shape != (J,):
+        raise ValueError("gamma length must match the observed dimension J.")
+    for d, A in enumerate(A_list):
+        if A.shape != (N, K[d]):
+            raise ValueError(f"A_list[{d}] shape {A.shape} must be {(N, K[d])}.")
+    return D, N, J, K
 
 
-def _poisson_mc_design_and_response_statistic(X, parent_sample):
-    """Build the repeated Poisson MC design and its linear statistic."""
-    X = np.asarray(X, dtype=float)
-    parent_sample = np.asarray(parent_sample)
-    if X.ndim != 2:
-        raise ValueError("Poisson responses must be a two-dimensional matrix.")
-    if parent_sample.ndim != 3:
-        raise ValueError("Poisson parent samples must be a 3D MC array.")
-    N, parent_plus_intercept, C = parent_sample.shape
-    if X.shape[0] != N:
-        raise ValueError(
-            "Poisson responses and parents must have the same row count."
-        )
-    design = (
-        np.transpose(parent_sample, (0, 2, 1))
-        .reshape(N * C, parent_plus_intercept)
-        .astype(float, copy=False)
-    )
-    response_statistic = X.T @ np.sum(parent_sample, axis=2, dtype=float)
-    return design, response_statistic, N, X.shape[1], parent_plus_intercept, C
-
-
-def _poisson_mc_value_and_grad(
-    coefficients,
-    design,
-    response_statistic,
-    *,
-    temperature,
-    mc_samples,
-    row_chunk_size,
-    coordinate_chunk_size,
-    compute_value=True,
-    compute_gradient=True,
-):
-    """Evaluate the tempered Poisson MC smooth objective in chunks."""
-    coefficients = np.asarray(coefficients, dtype=float)
-    design = np.asarray(design, dtype=float)
-    response_statistic = np.asarray(response_statistic, dtype=float)
-    if response_statistic.shape != coefficients.shape:
-        raise ValueError(
-            "Poisson response statistic and coefficients must have equal shapes."
-        )
-    if design.ndim != 2 or design.shape[1] != coefficients.shape[1]:
-        raise ValueError(
-            "Poisson design and coefficients have incompatible shapes."
-        )
-
-    row_chunk_size = max(1, int(row_chunk_size))
-    coordinate_chunk_size = max(1, int(coordinate_chunk_size))
-    scale = float(temperature) / int(mc_samples)
-    gradient = -response_statistic.copy() if compute_gradient else None
-    value = (
-        -float(np.sum(response_statistic * coefficients))
-        if compute_value
-        else None
-    )
-
-    for row_start in range(0, design.shape[0], row_chunk_size):
-        row_stop = min(row_start + row_chunk_size, design.shape[0])
-        design_chunk = design[row_start:row_stop]
-        for coordinate_start in range(
-            0, coefficients.shape[0], coordinate_chunk_size
-        ):
-            coordinate_stop = min(
-                coordinate_start + coordinate_chunk_size,
-                coefficients.shape[0],
-            )
-            eta = (
-                design_chunk @ coefficients[coordinate_start:coordinate_stop].T
-            )
-            if compute_value:
-                value += float(np.sum(_poisson_optimization_exp_value(eta)))
-            if compute_gradient:
-                rate = _poisson_optimization_rate(eta)
-                gradient[coordinate_start:coordinate_stop] += (
-                    rate.T @ design_chunk
-                )
-
-    return (
-        None if value is None else scale * value,
-        None if gradient is None else scale * gradient,
-    )
-
-
-def _solve_poisson_weighted_l1(
-    X,
-    parent_sample,
-    B_start,
-    penalty_scale,
-    temperature,
-    *,
-    max_iter=100,
-    tol=1e-6,
-    bound=10.0,
-    bounds=None,
-    row_chunk_size=None,
-    coordinate_chunk_size=None,
-):
-    """Fit the observed Poisson layer with bounded backtracking FISTA.
-
-    The optimized target is the tempered current-draw Monte Carlo negative
-    log-likelihood plus ``sum(abs(B[:, 1:]) / penalty_scale)``. A local
-    backtracking majorizer is required because, unlike the Bernoulli loss,
-    the Poisson log-partition has no finite global curvature bound.
-    """
-    B = np.asarray(B_start, dtype=float).copy()
-    penalty_scale = np.asarray(penalty_scale, dtype=float)
-    (
-        design,
-        response_statistic,
-        N,
-        n_responses,
-        parent_plus_intercept,
-        C,
-    ) = _poisson_mc_design_and_response_statistic(X, parent_sample)
-    expected_shape = (n_responses, parent_plus_intercept)
-    if B.shape != expected_shape:
-        raise ValueError(
-            f"Poisson coefficients must have shape {expected_shape}; got {B.shape}."
-        )
-    expected_penalty_shape = (n_responses, parent_plus_intercept - 1)
-    if penalty_scale.shape != expected_penalty_shape:
-        raise ValueError(
-            "Poisson penalty_scale must have one value per response and slope."
-        )
-    if not np.all(np.isfinite(penalty_scale)) or np.any(penalty_scale <= 0.0):
-        raise ValueError(
-            "Poisson penalty_scale entries must be finite and positive."
-        )
-
-    if row_chunk_size is None:
-        flat_row_chunk_size = N * C
-    else:
-        flat_row_chunk_size = max(1, int(row_chunk_size)) * C
-    if coordinate_chunk_size is None:
-        coordinate_chunk_size = n_responses
-    coordinate_chunk_size = max(1, int(coordinate_chunk_size))
-
-    if bounds is None:
-        upper_value = min(5.0, float(bound))
-        lower = np.full(parent_plus_intercept, -min(2.5, float(bound)))
-        upper = np.full(parent_plus_intercept, upper_value)
-        lower[0] = -upper_value
-    else:
-        bounds = list(bounds)
-        if len(bounds) != parent_plus_intercept:
-            raise ValueError(
-                "Poisson coefficient bounds have an incompatible width."
-            )
-        lower = np.asarray([pair[0] for pair in bounds], dtype=float)
-        upper = np.asarray([pair[1] for pair in bounds], dtype=float)
-    if (
-        not np.all(np.isfinite(lower))
-        or not np.all(np.isfinite(upper))
-        or np.any(lower > upper)
-        or lower[0] > 0.0
-        or upper[0] < 0.0
-        or np.any(lower[1:] > 0.0)
-        or np.any(upper[1:] < 0.0)
-    ):
-        raise ValueError(
-            "Poisson coefficient bounds must be finite, ordered, and contain zero."
-        )
-
-    B = np.clip(B, lower[None, :], upper[None, :])
-    gram_largest = _largest_eigenvalue_psd(design.T @ design)
-    if gram_largest <= 1e-14:
-        B[:, 0] = 0.0
-        B[:, 1:] = 0.0
-        return B
-
-    initial_rate_max = 1.0
-    for row_start in range(0, design.shape[0], flat_row_chunk_size):
-        row_stop = min(row_start + flat_row_chunk_size, design.shape[0])
-        design_chunk = design[row_start:row_stop]
-        for coordinate_start in range(0, n_responses, coordinate_chunk_size):
-            coordinate_stop = min(
-                coordinate_start + coordinate_chunk_size, n_responses
-            )
-            eta = design_chunk @ B[coordinate_start:coordinate_stop].T
-            initial_rate_max = max(
-                initial_rate_max,
-                float(np.max(_poisson_optimization_rate(eta))),
-            )
-    lipschitz = max(
-        float(temperature) / C * initial_rate_max * gram_largest,
-        1e-12,
-    )
-    Y = B.copy()
-    momentum = 1.0
-    for _ in range(int(max_iter)):
-        Y = np.clip(Y, lower[None, :], upper[None, :])
-        value_at_y, gradient = _poisson_mc_value_and_grad(
-            Y,
-            design,
-            response_statistic,
-            temperature=temperature,
-            mc_samples=C,
-            row_chunk_size=flat_row_chunk_size,
-            coordinate_chunk_size=coordinate_chunk_size,
-        )
-
-        trial_lipschitz = max(0.5 * lipschitz, 1e-12)
-        while True:
-            step = 1.0 / trial_lipschitz
-            candidate = Y - step * gradient
-            candidate[:, 0] = np.clip(candidate[:, 0], lower[0], upper[0])
-            candidate[:, 1:] = _soft_threshold(
-                candidate[:, 1:], step / penalty_scale
-            )
-            candidate[:, 1:] = np.clip(
-                candidate[:, 1:], lower[None, 1:], upper[None, 1:]
-            )
-            candidate_value, _ = _poisson_mc_value_and_grad(
-                candidate,
-                design,
-                response_statistic,
-                temperature=temperature,
-                mc_samples=C,
-                row_chunk_size=flat_row_chunk_size,
-                coordinate_chunk_size=coordinate_chunk_size,
-                compute_value=True,
-                compute_gradient=False,
-            )
-            difference = candidate - Y
-            quadratic_bound = (
-                value_at_y
-                + float(np.sum(gradient * difference))
-                + 0.5 * trial_lipschitz * float(np.sum(difference**2))
-            )
-            comparison_slack = 1e-12 * max(
-                1.0, abs(candidate_value), abs(quadratic_bound)
-            )
-            if candidate_value <= quadratic_bound + comparison_slack:
-                break
-            trial_lipschitz *= 2.0
-            if not np.isfinite(trial_lipschitz):
-                raise FloatingPointError(
-                    "Poisson CSP backtracking failed to find a finite step."
-                )
-
-        relative = np.linalg.norm(candidate - B) / (np.linalg.norm(B) + 1e-12)
-        next_momentum = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * momentum**2))
-        Y = candidate + ((momentum - 1.0) / next_momentum) * (candidate - B)
-        B = candidate
-        momentum = next_momentum
-        lipschitz = trial_lipschitz
-        if relative <= tol:
-            break
-    return B
-
-
-def fit_parametric_csp_mcem(
+def fit_normal_csp(
     X,
     prop_in,
+    gamma_in,
     B_list_in,
-    dispersion_in,
     A_list_in,
     *,
     C: int,
-    max_iter: int,
+    it: int,
     t_spike,
-    temperature: float,
-    threshold: float,
-    convergence_tol: float = 0.005,
-    convergence_mean_tol: float = 0.01,
-    convergence_window: int = 7,
-    stagewise: bool = False,
-    stage_min_iter: int = 20,
-    stage_width_window: int = 10,
-    stage_freeze_deeper: bool = True,
-    penalty_strength=1.0,
-    shrinkage_burn: int = 0,
-    reorder_after_shrinkage_burn: bool = True,
-    stage_transition_mode: str = "none",
-    stage_spectral_gap_threshold=None,
-    burn: int = 5,
-    optimizer_maxiter: int = 100,
+    temp: float,
+    tau: float,
+    optimizer_maxiter: int = _DEFAULT_OPTIMIZER_MAXITER,
     optimizer_tol: float = 1e-6,
     bound_val: float = 10.0,
+    n_jobs: int = 1,
+    convergence_window: int = 7,
+    convergence_std: float = 0.005,
+    burn: int = 5,
+    threshold_rule: str = "first_two",
+    mstep_solver: str = "fista_lower",
+    mstep_latent: str = "draw",
+    observed_noise_scale: float = 0.0,
+    fista_maxiter=None,
+    slab_shape: float = 1.0,
+    slab_rate: float = 5.0,
+    penalty_scaling_power: float = 1.0,
+    penalty_scaling_reference: float = 500.0,
+    penalty_scaling_layers: str = "lower",
+    penalty_scaling_allocation: bool = False,
+    latent_transition: str = "synchronous_mean_field",
+    mc_state_update=None,
     estep_row_chunk_size: int = 2048,
-    estep_coordinate_chunk_size: int = 1,
+    reinit_top_after: int = 0,
+    reinit_top_rule: str = "family",
+    reinit_top_source: str = "state",
+    merge_cosine: float = 0.0,
+    merge_after: int = 10,
+    merge_layers: str = "top",
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
-    latent_transition=None,
-    canonicalize_initial_order=None,
-    initial_csp_state=None,
-    family,
 ):
-    """Fit a maximal-width parametric DDE under layer-wise CSP priors.
+    """Fit a maximal-width Normal DDE with the CopDDE CSP algorithm.
 
-    ``stagewise`` activates CSP from the observed-side layer toward the
-    deepest layer and advances only after the current layer's width has been
-    stable for a full window.  ``stage_transition_mode`` selects whether a
-    waiting parent is rebuilt, only capped while preserving its state, or
-    left untouched. Discrete observed families default to persistent
-    systematic Gibbs; Normal keeps its established synchronous
-    approximate-MCEM transition.
+    Parameters
+    ----------
+    X : (N, J) observed Gaussian matrix (plays the role of ``Z``).
+    prop_in, gamma_in, B_list_in, A_list_in : initial parameters and latent
+        point estimates at the maximal widths.
+    C : Monte Carlo draws per iteration.
+    it : maximum number of outer iterations.
+    t_spike : scalar or length-``D`` Laplace spike scales.
+    temp : initial annealing temperature in ``(0, 1]``.
+    tau : hard-threshold level for the shallow coefficient layers.
+    optimizer_maxiter : L-BFGS-B iteration budget per coefficient row
+        (``15`` reproduces the MATLAB ``fmincon`` budget).
+    threshold_rule : ``"first_two"`` (package CopDDE rule), ``"all_but_last"``
+        (MATLAB D-layer rule), or ``"none"``.
+    mstep_solver : ``"fista_lower"`` (default: exact proximal FISTA
+        weighted-lasso solves in layers 1..D-1 and the CopDDE L-BFGS-B step
+        in the deepest layer), ``"hybrid"`` (FISTA for the observed Gaussian
+        layer only), ``"lbfgsb"`` (CopDDE: L-BFGS-B in every layer),
+        ``"fista"`` (FISTA in every layer; collapses the deepest layer at
+        large ``N``), or a length-``D`` sequence of ``"fista"`` /
+        ``"lbfgsb"`` giving the solver per layer.
+    fista_maxiter : iteration budget of the FISTA solves; ``None`` selects
+        ``300``.  Budgets below about 100 leave duplicate columns at large
+        ``N`` because the per-iteration transfer of loading mass scales with
+        ``gamma / N``.
+    mstep_latent : ``"draw"`` (CopDDE: the ``C`` Bernoulli draws form the
+        M-step design) or ``"mean_field"`` (the conditional probabilities
+        replace the draws in the M-step design and responses; the committed
+        latent state is still the majority vote of the draws).
+    observed_noise_scale : nonnegative multiplier ``s``.  When positive, the
+        observed-layer M-step sees ``X + s * sqrt(gamma / temp) * eps`` with
+        standard Gaussian ``eps`` drawn each iteration, an SAEM-style
+        surrogate for the CopDDE rank-likelihood resampling of ``Z``.  The
+        conditional variances are still updated from the clean ``X``.
+    slab_shape, slab_rate : Gamma hyperprior on the slab Laplace rate (CopDDE:
+        1 and 5); see :func:`dde.algorithms.csp.update_csp_layer`.
+    penalty_scaling_power, penalty_scaling_reference : the weighted-L1
+        penalty of every M-step is multiplied by
+        ``c_N = (N / penalty_scaling_reference) ** penalty_scaling_power``
+        (power 0, the CopDDE default, leaves the O(1) prior against the O(N)
+        likelihood; power 1, the default, makes the penalty proportional to
+        N, equivalent to the CopDDE penalty on the average likelihood; power
+        0.5 is the ``sqrt(N)`` rate).  ``penalty_scaling_power`` may be a
+        length-``D`` sequence of per-layer powers.  The scaled penalty needs
+        the proximal solver: the L-BFGS-B step stalls under large L1 weights.
+    penalty_scaling_layers : ``"lower"`` (default: layers 1..D-1, leaving
+        the deepest layer unscaled), ``"all"``, or ``"deep"`` (layers 2..D
+        only); with a per-layer power sequence the excluded layers' powers
+        are zeroed.
+    penalty_scaling_allocation : when ``True`` the CUSP allocation evaluates
+        the spike and slab densities on the scaled coefficients ``c_N * B``,
+        which is the allocation implied by the scaled prior
+        Laplace(0, scale / c_N); when ``False`` only the M-step penalty is
+        scaled (a power prior) and the allocation sees the raw coefficients.
+    latent_transition : ``"synchronous_mean_field"`` (CopDDE: every latent
+        coordinate's conditional probability is computed from the previous
+        iteration's point estimates, then all coordinates are drawn at once)
+        or ``"systematic_coordinate_gibbs"`` (the ``C`` draws are
+        consecutive systematic coordinate-Gibbs sweeps of the exact full
+        conditionals, observed layer first, each coordinate conditioning on
+        the freshly updated state; the persistent chain of the parametric
+        MCEM kernel).  The Gibbs transition requires ``mstep_latent="draw"``.
+    mc_state_update : ``"draw_majority"`` (CopDDE: the committed latent state
+        is the majority vote of the ``C`` draws) or ``"last_draw"`` (the last
+        draw, the persistent-chain rule).  ``None`` selects the majority vote
+        for the mean-field transition and the last draw for Gibbs.
+    estep_row_chunk_size : row block size of the Gibbs sweeps.
+    reinit_top_after : when positive, after this many completed iterations
+        the deepest layer is re-initialized once from the then-current
+        active columns of layer ``D-1``: the latent top state, its
+        coefficient block, ``prop`` and the layer's CUSP state are replaced
+        by the spectral parent initialization, and the inactive children's
+        rows stay zero.  Zero disables the re-initialization.
+    reinit_top_rule : ``"family"`` (:func:`initialize_binary_parent`, the
+        Normal family rule) or ``"copula"`` (the CopDDE ``binary_init``
+        rule) for the re-initialization.
+    reinit_top_source : ``"state"`` (the committed binary child state) or
+        ``"probability"`` (the mean-field conditional probabilities of the
+        children, computed from the current point estimates) as the input
+        of the re-initialization.
+    merge_cosine : when positive, from iteration ``merge_after`` on, active
+        columns of a logistic layer whose coefficient columns have cosine
+        similarity above this value (same sign pattern on the children) are
+        merged: the coefficients are summed into the earliest column of the
+        group, its latent state becomes the majority vote of the members,
+        and the other members are zeroed (they then fall into the CUSP
+        spike).  Such groups are "split" factors, several independent latent
+        columns that share one factor's loadings; a weighted-L1 penalty is
+        indifferent to the split and the coherent (Gibbs) latent chain keeps
+        it alive.  Zero disables merging.
+    merge_after : first iteration (completed iterations) at which merging
+        is applied.
+    merge_layers : ``"top"`` (deepest layer only) or ``"logistic"`` (every
+        layer above the observed one).
+    random_state : ``None`` for the legacy global RNG, else a seed/Generator.
+
+    Returns
+    -------
+    dict with the fitted ``prop``, ``B_list``, ``gamma``, ``A_list``, CUSP
+    state (``allocation``, ``omega``, ``slab_scale``, ``penalty_scale``),
+    ``active_masks``, ``num_active``, ``iterations`` and diagnostics.
     """
-    family = resolve_parametric_family(family)
     X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("X must be a two-dimensional matrix.")
     prop = np.asarray(prop_in, dtype=float).reshape(-1).copy()
+    gamma = np.asarray(gamma_in, dtype=float).reshape(-1).copy()
     B_list = [np.asarray(B, dtype=float).copy() for B in B_list_in]
-    dispersion = family.copy_dispersion(dispersion_in)
-    A_list = [np.asarray(A, dtype=np.uint8).copy() for A in A_list_in]
-    if canonicalize_initial_order is None:
-        canonicalize_initial_order = family.key in {"bernoulli", "poisson"}
-    canonicalize_initial_order = bool(canonicalize_initial_order)
-    if canonicalize_initial_order:
-        prop, B_list, A_list, initial_permutations = (
-            _canonicalize_csp_layer_order(prop, B_list, A_list)
-        )
-    else:
-        initial_permutations = [
-            np.arange(B.shape[1] - 1, dtype=int) for B in B_list
-        ]
-    D = len(B_list)
-    K = [B.shape[1] - 1 for B in B_list]
-    J = X.shape[1]
-    response_cache = family.make_response_cache(X)
-
-    if latent_transition is None:
-        latent_transition = (
-            _SYSTEMATIC_GIBBS
-            if family.key in {"bernoulli", "poisson"}
-            else _LEGACY_SYNCHRONOUS
-        )
-    latent_transition = str(latent_transition).strip().lower()
-    if latent_transition not in {
-        _LEGACY_SYNCHRONOUS,
-        _SYSTEMATIC_GIBBS,
-    }:
-        raise ValueError(
-            "latent_transition must be 'legacy_synchronous' or "
-            "'systematic_coordinate_gibbs'."
-        )
+    A_list = [np.asarray(A, dtype=float).copy() for A in A_list_in]
+    D, N, J, K = _validate(X, prop, gamma, B_list, A_list)
 
     C = int(C)
-    max_iter = int(max_iter)
-    convergence_window = int(convergence_window)
-    stage_min_iter = int(stage_min_iter)
-    stage_width_window = int(stage_width_window)
-    shrinkage_burn = int(shrinkage_burn)
-    reorder_after_shrinkage_burn = bool(reorder_after_shrinkage_burn)
-    burn = int(burn)
+    it = int(it)
     optimizer_maxiter = int(optimizer_maxiter)
-    temperature = float(temperature)
-    threshold = float(threshold)
-    convergence_tol = float(convergence_tol)
-    convergence_mean_tol = float(convergence_mean_tol)
-    stage_transition_mode = str(stage_transition_mode).strip().lower()
-    if stage_transition_mode not in {"none", "reinitialize", "cap_only"}:
+    convergence_window = int(convergence_window)
+    burn = int(burn)
+    temp = float(temp)
+    tau = float(tau)
+    convergence_std = float(convergence_std)
+    if C < 1 or it < 1 or optimizer_maxiter < 1 or convergence_window < 1:
         raise ValueError(
-            "stage_transition_mode must be 'none', 'reinitialize', or "
-            "'cap_only'."
+            "C, it, optimizer_maxiter, and convergence_window must be positive."
         )
-    if not stagewise and stage_transition_mode != "none":
-        raise ValueError("stage_transition_mode requires stagewise=True.")
-    if stagewise and shrinkage_burn:
+    if burn < 0:
+        raise ValueError("burn must be nonnegative.")
+    if not np.isfinite(temp) or not 0.0 < temp <= 1.0:
+        raise ValueError("temp must lie in (0, 1].")
+    if not np.isfinite(tau) or tau < 0:
+        raise ValueError("tau must be finite and nonnegative.")
+    if not np.isfinite(convergence_std) or convergence_std < 0:
+        raise ValueError("convergence_std must be finite and nonnegative.")
+    threshold_rule = str(threshold_rule).strip().lower()
+    if threshold_rule not in _THRESHOLD_RULES:
         raise ValueError(
-            "shrinkage_burn is only supported by simultaneous MCEM."
+            "threshold_rule must be one of " + ", ".join(_THRESHOLD_RULES) + "."
         )
-    if (
-        stage_transition_mode != "reinitialize"
-        and stage_spectral_gap_threshold is not None
-    ):
-        raise ValueError(
-            "stage_spectral_gap_threshold is only valid for the "
-            "reinitialize transition mode."
-        )
-    if stage_spectral_gap_threshold is not None:
-        stage_spectral_gap_threshold = float(stage_spectral_gap_threshold)
-    if C < 1 or max_iter < 1:
-        raise ValueError("C and max_iter must be positive integers.")
-    if (
-        convergence_window < 1
-        or stage_min_iter < 1
-        or stage_width_window < 1
-        or burn < 0
-        or shrinkage_burn < 0
-        or optimizer_maxiter < 1
-    ):
-        raise ValueError(
-            "convergence_window, stage_min_iter, stage_width_window, and "
-            "optimizer_maxiter must be positive, and burn and shrinkage_burn "
-            "nonnegative."
-        )
-    if shrinkage_burn >= max_iter:
-        raise ValueError("shrinkage_burn must be smaller than max_iter.")
-    if not np.isfinite(temperature) or not 0.0 < temperature <= 1.0:
-        raise ValueError("temperature must lie in (0, 1].")
-    if not np.isfinite(threshold) or threshold <= 0:
-        raise ValueError("threshold must be finite and positive.")
-    if not np.isfinite(convergence_tol) or convergence_tol < 0:
-        raise ValueError("convergence_tol must be finite and nonnegative.")
-    if not np.isfinite(convergence_mean_tol) or convergence_mean_tol < 0:
-        raise ValueError(
-            "convergence_mean_tol must be finite and nonnegative."
-        )
-    if stage_spectral_gap_threshold is not None and (
-        not np.isfinite(stage_spectral_gap_threshold)
-        or stage_spectral_gap_threshold <= 1.0
-    ):
-        raise ValueError(
-            "stage_spectral_gap_threshold must be finite and greater than 1."
-        )
-
-    spike_scales = _validate_spike_scales(t_spike, D)
-    penalty_strengths = np.asarray(penalty_strength, dtype=float).reshape(-1)
-    if penalty_strengths.size == 1:
-        penalty_strengths = np.repeat(penalty_strengths.item(), D)
-    if penalty_strengths.size != D:
-        raise ValueError(
-            "penalty_strength must be a scalar or a length-D sequence."
-        )
-    if not np.all(np.isfinite(penalty_strengths)) or np.any(
-        penalty_strengths <= 0
-    ):
-        raise ValueError(
-            "penalty_strength entries must be finite and positive."
-        )
-    rng = _as_rng(random_state)
-    if initial_csp_state is None:
-        slab_scale = [np.ones(Kd, dtype=float) for Kd in K]
-        omega = [np.ones(Kd + 1, dtype=float) / (Kd + 1) for Kd in K]
-        if stagewise or shrinkage_burn:
-            allocation = [np.full(Kd, Kd + 1, dtype=int) for Kd in K]
-            penalty_scale = [
-                np.ones((J if d == 0 else K[d - 1], K[d]), dtype=float)
-                for d in range(D)
-            ]
-        else:
-            allocation = [np.full(Kd, np.floor(Kd / 2), dtype=int) for Kd in K]
-            penalty_scale = [
-                np.full((J if d == 0 else K[d - 1], K[d]), spike_scales[d])
-                for d in range(D)
-            ]
-        active_masks = [np.ones(Kd, dtype=bool) for Kd in K]
-        num_active = np.asarray(K, dtype=int)
-        current_temperature = temperature
-    else:
-        if stagewise or shrinkage_burn:
+    if isinstance(mstep_solver, str):
+        mstep_solver = mstep_solver.strip().lower()
+        if mstep_solver not in _MSTEP_SOLVERS:
             raise ValueError(
-                "initial_csp_state only supports simultaneous CSP without "
-                "shrinkage_burn."
+                "mstep_solver must be one of " + ", ".join(_MSTEP_SOLVERS)
+                + " or a length-D sequence of 'fista'/'lbfgsb'."
             )
-        slab_scale = [
-            np.asarray(value, dtype=float).copy()
-            for value in initial_csp_state["slab_scale"]
-        ]
-        omega = [
-            np.asarray(value, dtype=float).copy()
-            for value in initial_csp_state["omega"]
-        ]
-        allocation = [
-            np.asarray(value, dtype=int).copy()
-            for value in initial_csp_state["allocation"]
-        ]
-        active_masks = [csp_active_mask(value) for value in allocation]
-        num_active = np.asarray(
-            [np.sum(value) for value in active_masks], dtype=int
-        )
-        penalty_scale = [
-            np.broadcast_to(
-                np.where(mask, slab, spike)[None, :],
-                (J if d == 0 else K[d - 1], K[d]),
-            ).copy()
-            for d, (mask, slab, spike) in enumerate(
-                zip(active_masks, slab_scale, spike_scales)
-            )
-        ]
-        current_temperature = float(
-            initial_csp_state.get("temperature", temperature)
-        )
-        expected_shapes = [
-            (Kd, Kd + 1, (J if d == 0 else K[d - 1], Kd))
-            for d, Kd in enumerate(K)
-        ]
-        for d, (Kd, omega_size, penalty_shape) in enumerate(expected_shapes):
-            if slab_scale[d].shape != (Kd,):
-                raise ValueError("initial_csp_state slab_scale shape mismatch.")
-            if omega[d].shape != (omega_size,):
-                raise ValueError("initial_csp_state omega shape mismatch.")
-            if allocation[d].shape != (Kd,):
-                raise ValueError("initial_csp_state allocation shape mismatch.")
-            if penalty_scale[d].shape != penalty_shape:
-                raise ValueError("initial_csp_state penalty_scale shape mismatch.")
-    relative_history = [[] for _ in range(D)]
-    trace = [] if keep_trace else None
-    active_stage = 0 if stagewise else D - 1
-    stage_iteration = 0
-    stage_width_history = []
-    stage_transitions = []
-    stage_transition_events = []
-    stage_caps = np.asarray(K, dtype=int)
-    stopped_by_convergence = False
-    warmup_reordered = False
-
-    iterations = 0
-    while iterations < max_iter:
-        shrinkage_active = iterations >= shrinkage_burn
-        if (
-            shrinkage_active
-            and shrinkage_burn
-            and reorder_after_shrinkage_burn
-            and not warmup_reordered
+        if mstep_solver == "fista":
+            layer_solvers = ("fista",) * D
+        elif mstep_solver == "lbfgsb":
+            layer_solvers = ("lbfgsb",) * D
+        elif mstep_solver == "fista_lower":
+            layer_solvers = ("fista",) * (D - 1) + ("lbfgsb",)
+        else:
+            layer_solvers = ("fista",) + ("lbfgsb",) * (D - 1)
+    else:
+        layer_solvers = tuple(str(value).strip().lower() for value in mstep_solver)
+        if len(layer_solvers) != D or any(
+            value not in ("fista", "lbfgsb") for value in layer_solvers
         ):
-            prop, B_list, A_list, warmup_permutations = (
-                _canonicalize_csp_layer_order(prop, B_list, A_list)
+            raise ValueError(
+                "A per-layer mstep_solver must be a length-D sequence of "
+                "'fista'/'lbfgsb'."
             )
-            initial_permutations = [
-                np.asarray(initial, dtype=int)[np.asarray(warmup, dtype=int)]
-                for initial, warmup in zip(
-                    initial_permutations, warmup_permutations
-                )
-            ]
-            warmup_reordered = True
-        iteration_stage = active_stage
-        if latent_transition == _SYSTEMATIC_GIBBS:
-            A_samples, top_probability = _sample_latent_layers_parametric(
-                X,
-                prop,
-                B_list,
-                dispersion,
-                A_list,
-                C,
-                family=family,
-                row_chunk_size=estep_row_chunk_size,
-                rng=rng,
-                eligible_widths=stage_caps,
-                temperature=current_temperature,
-            )
+        if all(value == "fista" for value in layer_solvers):
+            mstep_solver = "fista"
+        elif all(value == "lbfgsb" for value in layer_solvers):
+            mstep_solver = "lbfgsb"
+        elif layer_solvers == ("fista",) + ("lbfgsb",) * (D - 1):
+            mstep_solver = "hybrid"
+        elif layer_solvers == ("fista",) * (D - 1) + ("lbfgsb",):
+            mstep_solver = "fista_lower"
         else:
-            probabilities = _compute_bernoulli_probabilities_parametric(
-                X,
-                prop,
-                B_list,
-                dispersion,
-                A_list,
-                family=family,
-                row_chunk_size=estep_row_chunk_size,
-                coordinate_chunk_size=estep_coordinate_chunk_size,
-                eligible_widths=stage_caps,
-                temperature=current_temperature,
-            )
-            A_samples = _sample_latent_layers(probabilities, C, rng)
-            for d in range(D):
-                if stage_caps[d] < K[d]:
-                    probabilities[d][:, stage_caps[d] :] = 0.0
-                    A_samples[d][:, stage_caps[d] + 1 :, :] = 0
-            top_probability = probabilities[-1]
+            mstep_solver = "+".join(layer_solvers)
+    mstep_latent = str(mstep_latent).strip().lower()
+    if mstep_latent not in _MSTEP_LATENTS:
+        raise ValueError(
+            "mstep_latent must be one of " + ", ".join(_MSTEP_LATENTS) + "."
+        )
+    observed_noise_scale = float(observed_noise_scale)
+    if not np.isfinite(observed_noise_scale) or observed_noise_scale < 0:
+        raise ValueError("observed_noise_scale must be finite and nonnegative.")
+    fista_maxiter = _DEFAULT_FISTA_MAXITER if fista_maxiter is None else int(fista_maxiter)
+    if fista_maxiter < 1:
+        raise ValueError("fista_maxiter must be a positive integer.")
+    observed_fista = layer_solvers[0] == "fista"
+    slab_shape = float(slab_shape)
+    slab_rate = float(slab_rate)
+    penalty_scaling_power = np.asarray(penalty_scaling_power, dtype=float).reshape(-1)
+    if penalty_scaling_power.size == 1:
+        penalty_scaling_power = np.repeat(penalty_scaling_power.item(), D)
+    if penalty_scaling_power.size != D:
+        raise ValueError(
+            "penalty_scaling_power must be a scalar or a length-D sequence."
+        )
+    penalty_scaling_reference = float(penalty_scaling_reference)
+    penalty_scaling_layers = str(penalty_scaling_layers).strip().lower()
+    penalty_scaling_allocation = bool(penalty_scaling_allocation)
+    if not np.all(np.isfinite(penalty_scaling_power)) or np.any(
+        penalty_scaling_power < 0
+    ):
+        raise ValueError("penalty_scaling_power must be finite and nonnegative.")
+    if not np.isfinite(penalty_scaling_reference) or penalty_scaling_reference <= 0:
+        raise ValueError("penalty_scaling_reference must be finite and positive.")
+    if penalty_scaling_layers not in _PENALTY_SCALING_LAYERS:
+        raise ValueError(
+            "penalty_scaling_layers must be one of "
+            + ", ".join(_PENALTY_SCALING_LAYERS) + "."
+        )
+    latent_transition = str(latent_transition).strip().lower()
+    if latent_transition not in _LATENT_TRANSITIONS:
+        raise ValueError(
+            "latent_transition must be one of " + ", ".join(_LATENT_TRANSITIONS) + "."
+        )
+    gibbs = latent_transition == "systematic_coordinate_gibbs"
+    if gibbs and mstep_latent != "draw":
+        raise ValueError(
+            "mstep_latent='mean_field' requires the synchronous mean-field "
+            "transition."
+        )
+    if mc_state_update is None:
+        mc_state_update = "last_draw" if gibbs else "draw_majority"
+    mc_state_update = str(mc_state_update).strip().lower()
+    if mc_state_update not in _MC_STATE_UPDATES:
+        raise ValueError(
+            "mc_state_update must be one of " + ", ".join(_MC_STATE_UPDATES) + "."
+        )
+    estep_row_chunk_size = int(estep_row_chunk_size)
+    if estep_row_chunk_size < 1:
+        raise ValueError("estep_row_chunk_size must be a positive integer.")
+    reinit_top_after = int(reinit_top_after)
+    if reinit_top_after < 0:
+        raise ValueError("reinit_top_after must be a nonnegative integer.")
+    reinit_top_rule = str(reinit_top_rule).strip().lower()
+    if reinit_top_rule not in _REINIT_TOP_RULES:
+        raise ValueError(
+            "reinit_top_rule must be one of " + ", ".join(_REINIT_TOP_RULES) + "."
+        )
+    reinit_top_source = str(reinit_top_source).strip().lower()
+    if reinit_top_source not in _REINIT_TOP_SOURCES:
+        raise ValueError(
+            "reinit_top_source must be one of " + ", ".join(_REINIT_TOP_SOURCES) + "."
+        )
+    merge_cosine = float(merge_cosine)
+    if not np.isfinite(merge_cosine) or merge_cosine < 0 or merge_cosine >= 1:
+        raise ValueError("merge_cosine must lie in [0, 1).")
+    merge_after = int(merge_after)
+    if merge_after < 0:
+        raise ValueError("merge_after must be a nonnegative integer.")
+    merge_layers = str(merge_layers).strip().lower()
+    if merge_layers not in _MERGE_LAYERS:
+        raise ValueError("merge_layers must be one of " + ", ".join(_MERGE_LAYERS) + ".")
+    if reinit_top_after and D < 2:
+        raise ValueError("reinit_top_after requires at least two latent layers.")
 
-        for d in range(iteration_stage, -1, -1):
-            if shrinkage_active:
-                num_rows = J if d == 0 else int(num_active[d - 1])
-                (
-                    allocation[d],
-                    penalty_scale[d],
-                    slab_scale[d],
-                    omega[d],
-                ) = update_csp_layer(
-                    B_list[d],
-                    omega[d],
-                    spike_scales[d],
-                    slab_scale[d],
-                    num_rows,
-                    rng=rng,
-                )
+    t_spike = np.asarray(t_spike, dtype=float).reshape(-1)
+    if t_spike.size == 1:
+        t_spike = np.repeat(t_spike.item(), D)
+    if t_spike.size != D:
+        raise ValueError("t_spike must be a scalar or a length-D sequence.")
+    if not np.all(np.isfinite(t_spike)) or np.any(t_spike <= 0):
+        raise ValueError("t_spike entries must be finite and positive.")
+
+    random = _resolve_random(random_state)
+    lb, ub = _make_bounds(K, D)
+    if threshold_rule == "first_two":
+        thresholded_layers = min(2, D)
+    elif threshold_rule == "all_but_last":
+        thresholded_layers = D - 1
+    else:
+        thresholded_layers = 0
+
+    # CUSP state, initialized exactly as in the MATLAB kernel: every column
+    # starts in the spike, labels sit at floor(K/2), sticks are uniform.
+    theta_slab = [np.ones(Kd, dtype=float) for Kd in K]
+    omega = [np.ones(Kd + 1, dtype=float) / (Kd + 1) for Kd in K]
+    z_cusp = [np.floor(Kd / 2) * np.ones(Kd, dtype=int) for Kd in K]
+    theta = [
+        np.full((J if d == 0 else K[d - 1], K[d]), t_spike[d], dtype=float)
+        for d in range(D)
+    ]
+    num_act = np.asarray(K, dtype=int)
+    ind_inact = [np.zeros(0, dtype=int) for _ in range(D)]
+    effective_power = penalty_scaling_power.copy()
+    if penalty_scaling_layers == "deep":
+        effective_power[0] = 0.0
+    elif penalty_scaling_layers == "lower":
+        effective_power[-1] = 0.0
+    penalty_factor = (N / penalty_scaling_reference) ** effective_power
+    theta_mstep = [value.copy() for value in theta]
+    rel_hist = [[] for _ in range(D)]
+    trace = [] if keep_trace else None
+    x_sq_sum = np.sum(X**2, axis=0) if observed_fista else None
+    top_reinit = None
+    merge_events = []
+
+    it_num = 0
+    stopped_by_convergence = False
+    while it_num < it:
+        # 0) Optional one-off re-initialization of the deepest layer from
+        #    the current active children.
+        if reinit_top_after and it_num == reinit_top_after and top_reinit is None:
+            if reinit_top_source == "probability":
+                children = _update_bernoulli_probabilities_D(
+                    X, A_list, B_list, gamma, prop, temp
+                )[D - 2]
             else:
-                allocation[d].fill(K[d] + 1)
-                penalty_scale[d][:] = slab_scale[d][None, :]
-            penalty_scale[d] /= penalty_strengths[d]
-            if stage_caps[d] < K[d]:
-                ineligible = np.arange(K[d]) >= stage_caps[d]
-                allocation[d][ineligible] = np.arange(1, K[d] + 1)[ineligible]
-                penalty_scale[d][:, ineligible] = spike_scales[d]
+                children = A_list[D - 2]
+            top_reinit = _reinitialize_top_layer(
+                children, B_list, z_cusp, K, reinit_top_rule, N
+            )
+            if top_reinit is not None:
+                top_reinit["iteration"] = it_num
+                A_list[D - 1] = top_reinit["A_top"].astype(float)
+                B_list[D - 1] = top_reinit["B_top"]
+                prop = np.clip(np.mean(A_list[D - 1], axis=0), 1e-8, 1.0 - 1e-8)
+                theta_slab[D - 1] = np.ones(K[D - 1], dtype=float)
+                omega[D - 1] = np.ones(K[D - 1] + 1, dtype=float) / (K[D - 1] + 1)
+                z_cusp[D - 1] = np.floor(K[D - 1] / 2) * np.ones(K[D - 1], dtype=int)
+                theta[D - 1] = np.full((K[D - 2], K[D - 1]), t_spike[D - 1])
+                theta_mstep[D - 1] = theta[D - 1].copy()
 
-        if stagewise and stage_freeze_deeper and iteration_stage < D - 1:
-            prop_update = prop.copy()
+        # 0b) Optional merge of split (near-parallel) latent columns.
+        if merge_cosine > 0 and it_num >= merge_after and D >= 2:
+            merge_targets = range(D - 1, D) if merge_layers == "top" else range(1, D)
+            for d in merge_targets:
+                groups = _parallel_column_groups(B_list[d], z_cusp[d], merge_cosine)
+                for group in groups:
+                    keep, drop = group[0], group[1:]
+                    B_list[d][:, keep + 1] = B_list[d][:, [g + 1 for g in group]].sum(axis=1)
+                    A_list[d][:, keep] = (A_list[d][:, group].mean(axis=1) > 0.5).astype(float)
+                    B_list[d][:, [g + 1 for g in drop]] = 0.0
+                    A_list[d][:, drop] = 0.0
+                    if d < D - 1:
+                        B_list[d + 1][drop, :] = 0.0
+                    merge_events.append((it_num, d, tuple(int(g) for g in group)))
+                if groups and d == D - 1:
+                    prop = np.clip(np.mean(A_list[d], axis=0), 1e-8, 1.0 - 1e-8)
+
+        # 1) E-step: synchronous mean-field draws from the previous point
+        #    estimates (CopDDE), or persistent systematic coordinate-Gibbs
+        #    sweeps of the exact full conditionals.
+        if gibbs:
+            ber = None
+            samples, ber_top = _sample_latent_layers_parametric(
+                X, prop, B_list, gamma,
+                [A.astype(np.uint8) for A in A_list], C,
+                family=NORMAL_FAMILY, row_chunk_size=estep_row_chunk_size,
+                rng=random, sparse_bernoulli=False, temperature=temp,
+            )
+            A_sample_long = [sample.astype(float) for sample in samples]
         else:
-            prop_update = np.mean(top_probability, axis=0)
+            ber = _update_bernoulli_probabilities_D(X, A_list, B_list, gamma, prop, temp)
+            ber_top = ber[-1]
+            A_sample_long = _sample_latent_layers(ber, C, random)
+        if mstep_latent == "mean_field":
+            A_mstep = [
+                np.concatenate(
+                    (np.ones((N, 1, 1)), probs[:, :, None]), axis=1
+                )
+                for probs in ber
+            ]
+        else:
+            A_mstep = A_sample_long
+
+        # 2) (CopDDE rank-likelihood resampling of Z is omitted: Z = X.)
+        #    Optionally perturb the observed layer seen by the M-step.
+        if observed_noise_scale > 0:
+            X_mstep = X + observed_noise_scale * np.sqrt(gamma / temp)[None, :] * (
+                random.standard_normal((N, J))
+            )
+        else:
+            X_mstep = X
+
+        # 3) CUSP allocation, deepest layer first.  With penalty scaling the
+        #    M-step prior is Laplace(0, scale / c_N); the allocation either
+        #    sees c_N * B (the matching densities) or the raw B (power prior).
+        for d in range(D - 1, -1, -1):
+            num_rows = J if d == 0 else int(num_act[d - 1])
+            B_alloc = (
+                B_list[d] * penalty_factor[d]
+                if penalty_scaling_allocation and penalty_factor[d] != 1.0
+                else B_list[d]
+            )
+            z_cusp[d], theta[d], theta_slab[d], omega[d] = update_csp_layer(
+                B_alloc, omega[d], t_spike[d], theta_slab[d], num_rows,
+                rng=random, slab_shape=slab_shape, slab_rate=slab_rate,
+            )
+            # The M-step prior scale on B is theta / c_N in both modes: with
+            # a scaled allocation ``theta`` describes c_N * B, and with a
+            # power prior the scaled penalty is the definition.
+            theta_mstep[d] = theta[d] / penalty_factor[d]
+
+        # 4) Top-layer Bernoulli MAP.
+        prop_update = np.mean(ber_top, axis=0)
+
+        # 5) Observed Gaussian layer and conditional variances.
         B_update = [None] * D
-        observed_bounds = family.csp_coefficient_bounds(
-            B_list[0].shape[1], bound_val, observed=True
-        )
-        B_update[0], dispersion_update = family.csp_mstep(
-            X,
-            A_samples[0],
-            B_list[0],
-            dispersion,
-            penalty_scale[0],
-            current_temperature,
-            response_cache=response_cache,
-            max_iter=optimizer_maxiter,
-            tol=optimizer_tol,
-            bound=bound_val,
-            bounds=observed_bounds,
-            row_chunk_size=estep_row_chunk_size,
-            coordinate_chunk_size=None,
-        )
+        if not observed_fista:
+            B_update[0], gamma_update = _optimize_gaussian_layer(
+                X_mstep, A_mstep[0], B_list[0], gamma, theta_mstep[0], temp,
+                lb[0], ub[0], optimizer_maxiter, n_jobs, "weighted_l1", tau,
+            )
+        else:
+            B_update[0], gamma_update = _solve_gaussian_weighted_l1(
+                X_mstep, A_mstep[0], B_list[0], gamma, theta_mstep[0], temp,
+                x_sq_sum=None if X_mstep is not X else x_sq_sum,
+                max_iter=fista_maxiter, tol=optimizer_tol, bound=bound_val,
+            )
+        if X_mstep is not X:
+            # Conditional variances from the clean observations.
+            eta = np.tensordot(A_mstep[0], B_update[0], axes=([1], [1]))
+            C_mstep = A_mstep[0].shape[2]
+            sse = np.sum((X[:, None, :] - eta) ** 2, axis=(0, 1))
+            gamma_update = (1.0 + 0.5 * sse) / (1.0 + 0.5 * N * C_mstep + 1.0)
+
+        # 6) Logistic layers.
         for d in range(1, D):
-            if stagewise and stage_freeze_deeper and d > iteration_stage:
-                B_update[d] = B_list[d].copy()
+            if layer_solvers[d] != "fista":
+                B_update[d] = _optimize_logistic_layer(
+                    A_mstep[d - 1], A_mstep[d], B_list[d], theta_mstep[d],
+                    temp, lb[d], ub[d], optimizer_maxiter, n_jobs,
+                    "weighted_l1", tau,
+                )
             else:
                 B_update[d] = _solve_logistic_weighted_l1(
-                    A_samples[d - 1],
-                    A_samples[d],
-                    B_list[d],
-                    penalty_scale[d],
-                    current_temperature,
-                    max_iter=optimizer_maxiter,
-                    tol=optimizer_tol,
-                    bound=bound_val,
-                    bounds=family.csp_coefficient_bounds(
-                        B_list[d].shape[1], bound_val, observed=False
-                    ),
-                    row_chunk_size=estep_row_chunk_size,
-                    coordinate_chunk_size=None,
+                    A_mstep[d - 1], A_mstep[d], B_list[d], theta_mstep[d],
+                    temp, max_iter=fista_maxiter, tol=optimizer_tol,
+                    bound=bound_val, bounds=list(zip(lb[d], ub[d])),
                 )
 
-        iterations += 1
-        stage_iteration += 1
-        inactive_indices = []
+        it_num += 1
+
+        # 7) Active counts, thresholding, and hierarchical gating.
         for d in range(D):
-            if not stagewise or d <= active_stage:
-                active_masks[d] = csp_active_mask(allocation[d])
-                active_masks[d][stage_caps[d] :] = False
-            else:
-                active_masks[d] = np.ones(K[d], dtype=bool)
-            inactive = np.flatnonzero(~active_masks[d])
-            inactive_indices.append(inactive)
-            num_active[d] = int(np.sum(active_masks[d]))
-
-        thresholded_layers = min(2, D)
-        if stagewise:
-            thresholded_layers = min(thresholded_layers, iteration_stage + 1)
-        if shrinkage_active:
-            for d in range(thresholded_layers):
-                slopes = B_update[d][:, 1:]
-                slopes[np.abs(slopes) < threshold] = 0.0
-
-        for d in range(D):
-            if stage_caps[d] < K[d]:
-                B_update[d][:, stage_caps[d] + 1 :] = 0.0
-
+            inactive = np.flatnonzero(~csp_active_mask(z_cusp[d]))
+            ind_inact[d] = inactive
+            num_act[d] = K[d] - inactive.size
+        for d in range(thresholded_layers):
+            B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
         for d in range(D - 1):
-            if inactive_indices[d].size:
-                B_update[d + 1][inactive_indices[d], :] = 0.0
+            if ind_inact[d].size:
+                B_update[d + 1][ind_inact[d], :] = 0.0
 
-        if iterations > burn:
-            current_temperature = min(
-                1.0,
-                current_temperature + 0.01 * ((iterations - burn) - 1),
-            )
+        # 8) Temperature schedule.
+        if it_num > burn:
+            temp = min(1.0, temp + 0.01 * ((it_num - burn) - 1))
 
-        stop_now = not stagewise or active_stage == D - 1
-        if not shrinkage_active:
-            stop_now = False
-        current_relative = []
+        # 9) Rolling relative-change stopping rule.
+        stop_now = True
+        current_rel = []
         for d in range(D):
-            relative = np.linalg.norm(
-                B_update[d][:, 1:] - B_list[d][:, 1:], ord="fro"
-            ) / (np.linalg.norm(B_list[d][:, 1:], ord="fro") + 1e-6)
-            relative_history[d].append(float(relative))
-            current_relative.append(float(relative))
-            if (
-                len(relative_history[d]) < convergence_window
-                or np.mean(relative_history[d][-convergence_window:])
-                >= convergence_mean_tol
-                or np.std(relative_history[d][-convergence_window:])
-                >= convergence_tol
-            ):
-                stop_now = False
-
-        stage_advanced = False
-        if stagewise:
-            stage_width_history.append(int(num_active[active_stage]))
-            stable_current_width = (
-                len(stage_width_history) >= stage_width_window
-                and len(set(stage_width_history[-stage_width_window:])) == 1
+            rel = np.linalg.norm(B_update[d][:, 1:] - B_list[d][:, 1:], ord="fro") / (
+                np.linalg.norm(B_list[d][:, 1:], ord="fro") + 1e-6
             )
+            rel_hist[d].append(float(rel))
+            current_rel.append(float(rel))
             if (
-                active_stage < D - 1
-                and stage_iteration >= stage_min_iter
-                and stable_current_width
+                len(rel_hist[d]) < convergence_window
+                or np.std(rel_hist[d][-convergence_window:]) >= convergence_std
             ):
-                previous_stage = active_stage
-                active_stage += 1
-                stage_iteration = 0
-                stage_width_history = []
-                stage_advanced = True
-                stage_transitions.append(
-                    {
-                        "iteration": iterations,
-                        "from_layer": previous_stage + 1,
-                        "to_layer": active_stage + 1,
-                        "widths": tuple(int(value) for value in num_active),
-                    }
-                )
-            if active_stage < D - 1:
                 stop_now = False
 
         if keep_trace:
             trace.append(
                 {
-                    "iteration": iterations,
-                    "active_stage": active_stage + 1,
-                    "stage_iteration": stage_iteration,
-                    "stage_advanced": stage_advanced,
-                    "num_active": num_active.copy(),
-                    "allocation": [value.copy() for value in allocation],
+                    "iteration": it_num,
+                    "num_active": num_act.copy(),
+                    "allocation": [value.copy() for value in z_cusp],
                     "omega": [value.copy() for value in omega],
-                    "allocation_input_column_l1": [
-                        np.sum(np.abs(B[:, 1:]), axis=0) for B in B_list
-                    ],
+                    "slab_scale": [value.copy() for value in theta_slab],
                     "updated_column_l1": [
                         np.sum(np.abs(B[:, 1:]), axis=0) for B in B_update
                     ],
-                    "relative_change": tuple(current_relative),
-                    "temperature": float(current_temperature),
-                    "shrinkage_active": bool(shrinkage_active),
+                    "relative_change": tuple(current_rel),
+                    "temperature": float(temp),
+                    "will_stop": bool(stop_now),
                 }
             )
 
-        if latent_transition == _SYSTEMATIC_GIBBS:
-            A_list = [sample[:, 1:, -1].copy() for sample in A_samples]
+        # 10) Commit the iteration (majority vote over the C draws, or the
+        #     last draw of the persistent chain).
+        if mc_state_update == "last_draw":
+            A_list = [A_sample_long[d][:, 1:, -1].copy() for d in range(D)]
         else:
             A_list = [
-                (np.mean(sample[:, 1:, :], axis=2) > 0.5).astype(np.uint8)
-                for sample in A_samples
+                (np.mean(A_sample_long[d][:, 1:, :], axis=2) > 0.5).astype(float)
+                for d in range(D)
             ]
         B_list = [B.copy() for B in B_update]
-        dispersion = family.copy_dispersion(dispersion_update)
+        gamma = gamma_update.copy()
         prop = prop_update.copy()
-        if stage_advanced and stage_transition_mode != "none":
-            transition = (
-                _reinitialize_staged_parent
-                if stage_transition_mode == "reinitialize"
-                else _apply_staged_parent_cap_only
-            )
-            prop, transition_event = transition(
-                active_stage,
-                prop,
-                B_list,
-                A_list,
-                active_masks,
-                allocation,
-                penalty_scale,
-                slab_scale,
-                omega,
-                stage_caps,
-                spike_scales,
-                stage_spectral_gap_threshold,
-            )
-            stage_transition_events.append(transition_event)
-            num_active[active_stage] = int(np.sum(active_masks[active_stage]))
 
         if verbose:
             print(
-                f"CSP-MCEM iteration {iterations}, stage={active_stage + 1}, "
-                f"active={num_active.tolist()}, "
-                f"max relative change={max(current_relative):.4g}"
+                f"Normal CSP (copula kernel) iteration {it_num}, "
+                f"active={num_act.tolist()}, max relative change="
+                f"{max(current_rel):.4g}"
             )
         if stop_now:
-            stopped_by_convergence = iterations < max_iter
+            stopped_by_convergence = True
+            if verbose:
+                print("ending algorithm")
             break
 
+    if not stopped_by_convergence and verbose:
+        print("Ending algorithm for iteration budget")
+
+    active_masks = [csp_active_mask(value) for value in z_cusp]
     for d in range(D):
         inactive = np.flatnonzero(~active_masks[d])
         if inactive.size:
@@ -1219,95 +755,47 @@ def fit_parametric_csp_mcem(
     return {
         "prop": prop,
         "B_list": B_list,
-        "gamma": dispersion,
-        "A_list": A_list,
-        "allocation": [value.copy() for value in allocation],
+        "gamma": gamma,
+        "A_list": [A.astype(np.uint8) for A in A_list],
+        "allocation": [value.copy() for value in z_cusp],
         "omega": [value.copy() for value in omega],
-        "slab_scale": [value.copy() for value in slab_scale],
-        "penalty_scale": [value.copy() for value in penalty_scale],
-        "active_masks": [value.copy() for value in active_masks],
-        "num_active": num_active.copy(),
-        "iterations": iterations,
-        "stagewise": bool(stagewise),
-        "stage_transitions": tuple(stage_transitions),
-        "final_stage": active_stage + 1,
-        "stage_freeze_deeper": bool(stage_freeze_deeper),
-        "penalty_strength": tuple(float(value) for value in penalty_strengths),
-        "shrinkage_burn": shrinkage_burn,
-        "reorder_after_shrinkage_burn": reorder_after_shrinkage_burn,
-        "warmup_reordered": warmup_reordered,
-        "stage_transition_mode": stage_transition_mode,
-        "stage_spectral_gap_threshold": stage_spectral_gap_threshold,
-        "stage_transition_events": tuple(stage_transition_events),
-        "stage_caps": tuple(int(value) for value in stage_caps),
+        "slab_scale": [value.copy() for value in theta_slab],
+        "penalty_scale": [value.copy() for value in theta],
+        "active_masks": active_masks,
+        "num_active": num_act.copy(),
+        "iterations": it_num,
         "stopped_by_convergence": bool(stopped_by_convergence),
-        "temperature": float(current_temperature),
-        "canonicalized_initial_order": canonicalize_initial_order,
-        "initial_permutations": tuple(
-            tuple(int(index) for index in permutation)
-            for permutation in initial_permutations
-        ),
+        "temperature": float(temp),
+        "threshold_rule": threshold_rule,
+        "mstep_solver": mstep_solver,
+        "layer_solvers": layer_solvers,
+        "mstep_latent": mstep_latent,
+        "observed_noise_scale": observed_noise_scale,
+        "optimizer_maxiter": optimizer_maxiter,
+        "fista_maxiter": fista_maxiter,
+        "slab_shape": slab_shape,
+        "slab_rate": slab_rate,
+        "penalty_scaling_power": tuple(float(value) for value in penalty_scaling_power),
+        "penalty_scaling_reference": penalty_scaling_reference,
+        "penalty_scaling_layers": penalty_scaling_layers,
+        "penalty_scaling_allocation": penalty_scaling_allocation,
+        "penalty_factor": tuple(float(value) for value in penalty_factor),
         "latent_transition": latent_transition,
-        "mc_state_update": (
-            "last_draw"
-            if latent_transition == _SYSTEMATIC_GIBBS
-            else "draw_majority"
-        ),
-        "relative_history": [tuple(values) for values in relative_history],
+        "mc_state_update": mc_state_update,
+        "reinit_top_after": reinit_top_after,
+        "reinit_top_rule": reinit_top_rule,
+        "reinit_top_source": reinit_top_source,
+        "top_reinit": top_reinit,
+        "merge_cosine": merge_cosine,
+        "merge_after": merge_after,
+        "merge_layers": merge_layers,
+        "merge_events": merge_events,
+        "relative_history": [tuple(values) for values in rel_hist],
         "trace": trace,
     }
 
 
-def fit_normal_csp_mcem(
-    X,
-    prop_in,
-    B_list_in,
-    gamma_in,
-    A_list_in,
-    **kwargs,
-):
-    """Compatibility wrapper for the Normal CSP-MCEM kernel."""
-    return fit_parametric_csp_mcem(
-        X,
-        prop_in,
-        B_list_in,
-        gamma_in,
-        A_list_in,
-        family=NORMAL_FAMILY,
-        **kwargs,
-    )
+# Compatibility alias for the name used while the kernel was being developed.
+fit_normal_csp_copula = fit_normal_csp
 
-
-def fit_bernoulli_csp_mcem(
-    X,
-    prop_in,
-    B_list_in,
-    A_list_in,
-    **kwargs,
-):
-    """Compatibility wrapper for the Bernoulli CSP-MCEM kernel."""
-    return fit_parametric_csp_mcem(
-        X,
-        prop_in,
-        B_list_in,
-        None,
-        A_list_in,
-        family=BERNOULLI_FAMILY,
-        **kwargs,
-    )
-
-
-__all__ = [
-    "_solve_gaussian_weighted_l1",
-    "_solve_gaussian_weighted_l1_from_statistics",
-    "_solve_logistic_weighted_l1",
-    "_poisson_mc_design_and_response_statistic",
-    "_poisson_mc_value_and_grad",
-    "_solve_poisson_weighted_l1",
-    "_canonicalize_csp_layer_order",
-    "_apply_staged_parent_cap_only",
-    "_reinitialize_staged_parent",
-    "fit_bernoulli_csp_mcem",
-    "fit_parametric_csp_mcem",
-    "fit_normal_csp_mcem",
-]
+__all__ = ["fit_normal_csp", "fit_normal_csp_copula"]

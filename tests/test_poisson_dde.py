@@ -6,7 +6,7 @@ from scipy.special import gammaln
 import dde.algorithms.parametric_families as parametric_families
 import dde.algorithms.semi_saem as semi_saem_module
 from dde import fit
-from dde.algorithms.normal_csp import (
+from dde.algorithms.parametric_csp_mcem import (
     _poisson_mc_design_and_response_statistic,
     _poisson_mc_value_and_grad,
     _solve_poisson_weighted_l1,

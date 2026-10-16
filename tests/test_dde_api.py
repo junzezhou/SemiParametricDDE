@@ -191,7 +191,6 @@ def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
         tol=0.0,
         max_it=2,
         optimizer_maxiter=20,
-        csp_backend="mcem",
         random_state=731,
         verbose=False,
     )
@@ -202,14 +201,12 @@ def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
     assert first.model == "DDE"
     assert first.diagnostics["family"] == "Normal"
     assert first.diagnostics["dimension_method"] == "csp"
-    assert first.diagnostics["backend"] == "mcem"
-    assert first.diagnostics["kernel"] == "approximate_mcem_csp"
-    assert first.diagnostics["transition_mode"] == "none"
-    assert first.diagnostics["latent_transition"] == "legacy_synchronous"
+    assert first.diagnostics["backend"] == "copula"
+    assert first.diagnostics["kernel"] == "copdde_csp_mean_field_mcem"
+    assert first.diagnostics["latent_transition"] == "synchronous_mean_field"
     assert first.diagnostics["mc_state_update"] == "draw_majority"
-    assert first.diagnostics["canonicalized_initial_order"] is False
     assert first.diagnostics["K_max_list"] == (6, 2)
-    assert first.diagnostics["threshold_rule"] == "first_two_layers"
+    assert first.diagnostics["threshold_rule"] == "first_two"
     fitted_K = tuple(first.diagnostics["K_list"])
     assert first.K_list == list(fitted_K)
     assert [B.shape for B in first.B_list] == [
@@ -228,6 +225,11 @@ def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
         np.testing.assert_allclose(B_first, B_second)
 
 
+def _binary_matrix(seed=732, N=60, J=18):
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 2, size=(N, J)).astype(float)
+
+
 @pytest.mark.parametrize(
     ("backend", "transition_mode"),
     [
@@ -236,13 +238,12 @@ def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
         ("mcem_cap_only", "cap_only"),
     ],
 )
-def test_fit_dde_normal_csp_routes_three_mcem_backends(backend, transition_mode):
-    X, _, _, _ = _normal_parameters()
+def test_fit_dde_bernoulli_csp_routes_three_mcem_backends(backend, transition_mode):
     result = fit(
-        X,
+        _binary_matrix(),
         method="DDE",
         D=2,
-        family="Normal",
+        family="Bernoulli",
         dimension_method="csp",
         t_spike=[0.03, 0.05],
         temp=0.9,
@@ -263,9 +264,31 @@ def test_fit_dde_normal_csp_routes_three_mcem_backends(backend, transition_mode)
     assert result.diagnostics["stagewise"] == (backend != "mcem")
 
 
+@pytest.mark.parametrize("backend", ["mcem", "mcem_reinitialize", "mcem_cap_only"])
+def test_fit_dde_normal_csp_rejects_removed_mcem_backends(backend):
+    X, _, _, _ = _normal_parameters()
+    with pytest.raises(ValueError, match="copula kernel only"):
+        fit(
+            X,
+            method="DDE",
+            D=2,
+            family="Normal",
+            dimension_method="csp",
+            t_spike=[0.03, 0.05],
+            temp=0.9,
+            tau=0.3,
+            C=1,
+            tol=0.0,
+            max_it=1,
+            csp_backend=backend,
+            random_state=733,
+            verbose=False,
+        )
+
+
 def test_fit_dde_normal_csp_rejects_removed_saem_backend():
     X, _, _, _ = _normal_parameters()
-    with pytest.raises(ValueError, match="mcem_cap_only"):
+    with pytest.raises(ValueError, match="copula kernel only"):
         fit(
             X,
             method="DDE",
@@ -303,7 +326,6 @@ def test_fit_dde_normal_csp_rejects_removed_backend_switches(removed_option):
             C=1,
             tol=0.0,
             max_it=1,
-            csp_backend="mcem",
             random_state=734,
             verbose=False,
             **{removed_option: True},
@@ -311,13 +333,12 @@ def test_fit_dde_normal_csp_rejects_removed_backend_switches(removed_option):
 
 
 def test_cap_only_backend_rejects_spectral_transition_option():
-    X, _, _, _ = _normal_parameters()
     with pytest.raises(ValueError, match="mcem_reinitialize"):
         fit(
-            X,
+            _binary_matrix(735),
             method="DDE",
             D=2,
-            family="Normal",
+            family="Bernoulli",
             dimension_method="csp",
             t_spike=[0.03, 0.05],
             temp=0.9,
@@ -359,10 +380,8 @@ def test_fit_dde_normal_csp_uses_copula_backend_by_default():
     assert result.diagnostics["mstep_solver"] == "fista_lower"
     assert result.diagnostics["fista_maxiter"] == 300
 
-    legacy = fit(X, csp_backend="mcem", **args)
-    assert legacy.diagnostics["backend"] == "mcem"
-    assert legacy.diagnostics["kernel"] == "approximate_mcem_csp"
-    assert legacy.diagnostics["standardized"] is False
+    with pytest.raises(ValueError, match="copula kernel only"):
+        fit(X, csp_backend="mcem", **args)
 
 
 @pytest.mark.parametrize(

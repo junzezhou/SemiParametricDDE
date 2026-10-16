@@ -31,7 +31,7 @@ from evaluate_bernoulli_csp_recovery import simulate as bernoulli_simulate
 from evaluate_bernoulli_fixed_recovery import build_scenario as bernoulli_fixed_scenario
 from evaluate_bernoulli_fixed_recovery import _paper_sparse_coefficients
 from evaluate_bernoulli_fixed_recovery import simulate_bernoulli_dde
-from evaluate_normal_csp_recovery import _scenario_d2, _scenario_d3, _simulate
+from normal_csp_scenarios import _scenario_d2, _scenario_d3, _simulate
 from evaluate_poisson_csp_recovery import build_scenario as poisson_csp_scenario
 from evaluate_poisson_csp_recovery import simulate as poisson_simulate
 from evaluate_semidde_csp_recovery import _scenario as semi_csp_scenario

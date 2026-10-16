@@ -34,7 +34,7 @@ from evaluate_bernoulli_csp_recovery import (
     calculate_metrics as bernoulli_metrics,
     simulate as simulate_bernoulli,
 )
-from evaluate_normal_csp_recovery import (
+from normal_csp_scenarios import (
     _scenario_d2 as normal_scenario_d2,
     _scenario_d3 as normal_scenario_d3,
     _simulate as simulate_normal,

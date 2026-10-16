@@ -12,8 +12,8 @@ from dde.utils import validate_K_list_identifiability, validate_dde_lists
 from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
-from .normal_csp import fit_parametric_csp_mcem
-from .normal_csp_copula import fit_normal_csp_copula
+from .normal_csp import fit_normal_csp
+from .parametric_csp_mcem import fit_parametric_csp_mcem
 from .normal_init_cop import Normal_init_cop
 from .parametric_families import (
     BERNOULLI_FAMILY,
@@ -198,9 +198,10 @@ def fit_parametric_dde(
     For fixed-width fits, ``tol`` is the postprocessed parameter-update RMSE.
     Its default is ``0.005`` for a dimension-independent convergence scale.
 
-    Normal CSP defaults to ``csp_backend="copula"``: the CopDDE D-layer CSP
-    algorithm with the rank-likelihood resampling removed because the Normal
-    DDE observes its Gaussian layer.  It initializes with the Normal family's
+    Normal CSP has a single kernel, ``csp_backend="copula"``: the CopDDE
+    D-layer CSP algorithm with the rank-likelihood resampling removed because
+    the Normal DDE observes its Gaussian layer.  The former MCEM backends are
+    not available for the Normal family.  It initializes with the Normal family's
     own data initializer (``csp_initializer="family"``; the CopDDE
     ``Normal_init_D`` rules remain available as ``csp_initializer="copula"``
     but leave more spurious deep columns active) and uses the CopDDE
@@ -217,11 +218,11 @@ def fit_parametric_dde(
     ``csp_penalty_scaling_power=0`` restores the CopDDE M-step in every
     layer; ``csp_slab_shape`` and ``csp_slab_rate`` change the CUSP slab
     hyperprior (CopDDE 1 and 5).
-    Bernoulli and Poisson CSP default to the simultaneous ``"mcem"`` path.
+    Bernoulli and Poisson CSP use the simultaneous ``"mcem"`` path by default.
     The explicit ``"mcem_reinitialize"`` backend performs staged parent
     rebuilding, while ``"mcem_cap_only"`` applies staged child-implied caps
-    and preserves eligible parent state.  ``mcem_*`` controls are ignored by
-    the copula backend.
+    and preserves eligible parent state.  ``mcem_*`` controls apply to those
+    backends only.
 
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
@@ -310,6 +311,12 @@ def fit_parametric_dde(
     if method == "csp" and backend == "copula" and family_adapter.key != "normal":
         raise NotImplementedError(
             "csp_backend='copula' is implemented for the Normal family only."
+        )
+    if method == "csp" and family_adapter.key == "normal" and backend != "copula":
+        raise ValueError(
+            "Normal CSP uses the copula kernel only; the MCEM backends "
+            "('mcem', 'mcem_reinitialize', 'mcem_cap_only') were removed for "
+            "family='Normal'.  Omit csp_backend or pass csp_backend='copula'."
         )
     if csp_initializer is None:
         csp_initializer = "family"
@@ -471,7 +478,7 @@ def fit_parametric_dde(
         )
 
     if backend == "copula":
-        raw = fit_normal_csp_copula(
+        raw = fit_normal_csp(
             X,
             prop,
             gamma,

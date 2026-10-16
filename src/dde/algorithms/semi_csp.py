@@ -12,7 +12,8 @@ import numpy as np
 
 from dde.utils.result_compression import compress_csp_result_components
 
-from .normal_csp import fit_normal_csp_mcem
+from .parametric_csp_mcem import fit_parametric_csp_mcem
+from .parametric_families import NORMAL_FAMILY
 from .semi_saem import _semiparametric_g_step
 
 
@@ -103,12 +104,13 @@ def get_SAEM_semiparametric_csp(
                 f"{outer_iteration} ====="
             )
 
-        raw = fit_normal_csp_mcem(
+        raw = fit_parametric_csp_mcem(
             X,
             prop,
             B_list,
             gamma,
             A_list,
+            family=NORMAL_FAMILY,
             C=C,
             max_iter=max_inner_iter,
             t_spike=t_spike,

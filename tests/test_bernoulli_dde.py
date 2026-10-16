@@ -13,7 +13,7 @@ from dde.algorithms.bernoulli_init import (
     Bernoulli_init,
     _bernoulli_working_response,
 )
-from dde.algorithms.normal_csp import (
+from dde.algorithms.parametric_csp_mcem import (
     _canonicalize_csp_layer_order,
     _logistic_mc_design_and_response_statistic,
     _logistic_mc_value_and_grad,

@@ -156,7 +156,7 @@ def test_semidde_csp_compresses_a_known_inactive_coefficient_graph(monkeypatch):
             "trace": None,
         }
 
-    monkeypatch.setattr(semi_csp_module, "fit_normal_csp_mcem", fake_inner)
+    monkeypatch.setattr(semi_csp_module, "fit_parametric_csp_mcem", fake_inner)
     result = fit(
         Y,
         model="semi",
@@ -207,7 +207,7 @@ def test_semidde_csp_does_not_cap_overspecified_parent_width(monkeypatch):
             "trace": None,
         }
 
-    monkeypatch.setattr(semi_csp_module, "fit_normal_csp_mcem", fake_inner)
+    monkeypatch.setattr(semi_csp_module, "fit_parametric_csp_mcem", fake_inner)
     result = fit(
         Y,
         model="semi",
@@ -260,7 +260,7 @@ def test_semidde_csp_carries_copula_state_across_outer_updates(monkeypatch):
     def fake_g_step(Y, X, prop, B_list, A1, **kwargs):
         return X.copy(), X.copy(), 1.0
 
-    monkeypatch.setattr(semi_csp_module, "fit_normal_csp_mcem", fake_inner)
+    monkeypatch.setattr(semi_csp_module, "fit_parametric_csp_mcem", fake_inner)
     monkeypatch.setattr(semi_csp_module, "_semiparametric_g_step", fake_g_step)
     result = fit(
         Y,
