@@ -95,7 +95,8 @@ RAW_FIELDS = [
     "graph_accuracy", "sensitivity", "specificity", "false_positive_rate",
     "false_negative_rate", "true_positive", "true_negative", "false_positive",
     "false_negative", "parameter_mse", "parameter_rmse", "latent_accuracy",
-    "layer_graph_accuracy", "layer_latent_accuracy", "alignment_permutations",
+    "layer_graph_accuracy", "layer_parameter_rmse", "layer_latent_accuracy",
+    "alignment_permutations",
 ]
 
 SUMMARY_FIELDS = [
@@ -104,7 +105,8 @@ SUMMARY_FIELDS = [
     "graph_accuracy_sd", "graph_accuracy_se", "sensitivity_mean",
     "specificity_mean", "parameter_rmse_paper", "parameter_rmse_all",
     "removed_mse_outliers", "latent_accuracy_mean",
-    "layer_graph_accuracy_mean", "layer_latent_accuracy_mean",
+    "layer_graph_accuracy_mean", "layer_parameter_rmse_mean",
+    "layer_latent_accuracy_mean",
     "iterations_mean", "iteration_limit_fraction", "seconds_mean",
     "seconds_total",
 ]
@@ -250,6 +252,10 @@ def calculate_metrics(prop, B_list, A_list, scenario, A_true, tau):
         float(np.mean((estimated[:, 1:] != 0.0) == truth_graph_layer))
         for estimated, truth_graph_layer in zip(B_reported, scenario["G_list"])
     ]
+    layer_parameter_rmse = [
+        float(np.sqrt(np.mean((estimated - truth) ** 2)))
+        for estimated, truth in zip(B_reported, scenario["B_list"])
+    ]
     layer_latent_accuracy = [
         float(np.mean(estimated == truth))
         for estimated, truth in zip(A_list, A_true)
@@ -274,6 +280,7 @@ def calculate_metrics(prop, B_list, A_list, scenario, A_true, tau):
         "parameter_rmse": math.sqrt(parameter_mse),
         "latent_accuracy": _safe_ratio(latent_correct, latent_total),
         "layer_graph_accuracy": json.dumps(layer_graph_accuracy),
+        "layer_parameter_rmse": json.dumps(layer_parameter_rmse),
         "layer_latent_accuracy": json.dumps(layer_latent_accuracy),
         "alignment_permutations": json.dumps(permutations),
     }
@@ -437,6 +444,10 @@ def summarize(rows: list[dict], requested_replicates: int):
             layer_latent = np.asarray([
                 json.loads(row["layer_latent_accuracy"]) for row in successful
             ])
+            layer_rmse = np.asarray([
+                json.loads(row["layer_parameter_rmse"]) for row in successful
+                if row.get("layer_parameter_rmse")
+            ])
             iterations = _float_values(successful, "iterations")
             seconds = _float_values(successful, "seconds")
             summary_rows.append({
@@ -455,6 +466,9 @@ def summarize(rows: list[dict], requested_replicates: int):
                 "latent_accuracy_mean": float(np.mean(_float_values(successful, "latent_accuracy"))),
                 "layer_graph_accuracy_mean": json.dumps(
                     np.mean(layer_graph, axis=0).tolist()
+                ),
+                "layer_parameter_rmse_mean": json.dumps(
+                    np.mean(layer_rmse, axis=0).tolist() if layer_rmse.size else []
                 ),
                 "layer_latent_accuracy_mean": json.dumps(
                     np.mean(layer_latent, axis=0).tolist()

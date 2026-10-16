@@ -79,6 +79,7 @@ RAW_FIELDS = [
     "parameter_rmse",
     "transform_rmse",
     "layer_graph_accuracy",
+    "layer_parameter_rmse",
 ]
 
 SUMMARY_FIELDS = [
@@ -100,6 +101,7 @@ SUMMARY_FIELDS = [
     "seconds_mean",
     "seconds_total",
     "layer_graph_accuracy_mean",
+    "layer_parameter_rmse_mean",
 ]
 
 
@@ -131,8 +133,11 @@ def _calculate_metrics(result, scenario, X_true, tau):
 
     squared_error = float(np.sum((result.prop - scenario["prop"]) ** 2))
     parameter_count = int(scenario["prop"].size)
+    layer_rmse = []
     for estimated, truth in zip(B_est, scenario["B_list"]):
-        squared_error += float(np.sum((estimated - truth) ** 2))
+        layer_squared_error = float(np.sum((estimated - truth) ** 2))
+        layer_rmse.append(float(math.sqrt(layer_squared_error / truth.size)))
+        squared_error += layer_squared_error
         parameter_count += int(truth.size)
     squared_error += float(np.sum((result.gamma - scenario["gamma"]) ** 2))
     parameter_count += int(scenario["gamma"].size)
@@ -155,6 +160,7 @@ def _calculate_metrics(result, scenario, X_true, tau):
         "parameter_rmse": float(math.sqrt(parameter_mse)),
         "transform_rmse": transform_rmse,
         "layer_graph_accuracy": json.dumps(layer_accuracy),
+        "layer_parameter_rmse": json.dumps(layer_rmse),
     }
 
 
@@ -285,6 +291,10 @@ def summarize(rows: list[dict], scenarios: list[str], sample_sizes, replicates):
             layer = np.asarray(
                 [json.loads(row["layer_graph_accuracy"]) for row in successful]
             )
+            layer_rmse = np.asarray(
+                [json.loads(row["layer_parameter_rmse"]) for row in successful
+                 if row.get("layer_parameter_rmse")]
+            )
             summaries.append(
                 {
                     **base,
@@ -308,6 +318,9 @@ def summarize(rows: list[dict], scenarios: list[str], sample_sizes, replicates):
                     "seconds_total": float(np.sum(seconds)),
                     "layer_graph_accuracy_mean": json.dumps(
                         np.mean(layer, axis=0).tolist()
+                    ),
+                    "layer_parameter_rmse_mean": json.dumps(
+                        np.mean(layer_rmse, axis=0).tolist() if layer_rmse.size else []
                     ),
                 }
             )
