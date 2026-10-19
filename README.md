@@ -194,10 +194,13 @@ response at zero cannot (a rare latent column otherwise starts at about 50 %
 and drifts into an always-on, intercept-absorbing solution); and
 `fixed_warm_start="layerwise"` estimates the observed layer first with a flat
 latent prior, then the deeper layers as a Bernoulli DDE on the resulting
-latent states, and only then runs the full SAEM.  Pass
-`sa_burn_in=0, fixed_init_binarize="projection", fixed_warm_start="none"` for
-the plain MATLAB-style kernel; `result.diagnostics["warm_start"]` records the
-stage iterations.
+latent states, and only then runs the full SAEM.  The observed-layer M-step
+solves each row's TLP problem on its active support with a KKT screening of
+the zero coordinates (`fixed_observed_solver="active_set"`; `"rowwise"` is the
+dense per-row L-BFGS-B, same objective, far slower for wide layers).  Pass
+`sa_burn_in=0, fixed_init_binarize="projection", fixed_warm_start="none",
+fixed_observed_solver="rowwise"` for the plain MATLAB-style kernel;
+`result.diagnostics["warm_start"]` records the stage iterations.
 
 Poisson CSP uses the same maximum-width initialization and cumulative
 shrinkage state as the other parametric families. Its observed M-step solves
