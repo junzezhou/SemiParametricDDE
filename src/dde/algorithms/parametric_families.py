@@ -166,8 +166,8 @@ def _solve_poisson_tlp_active_set(
     *,
     max_rounds=3,
     max_iter=50,
-    max_support=16,
-    max_added=8,
+    max_support=12,
+    max_added=4,
 ):
     """Row-wise TLP Poisson M-step restricted to each row's active support.
 
@@ -176,11 +176,14 @@ def _solve_poisson_tlp_active_set(
     zero and the problem over ``(intercept, x_S)`` is solved exactly with
     L-BFGS-B on the sub-pattern weights of ``S_j`` (``2**|S_j|`` terms
     instead of one term per stored pattern).  The full gradient at the
-    solution is then evaluated from the cross table; coordinates at zero
-    whose gradient exceeds the TLP slope ``penalty`` violate the optimality
-    condition and are added to the support (the ``max_added`` largest), and
-    the row is re-solved.  Each round costs one pass over the packed
-    patterns, against one pass per optimizer evaluation in the dense solver.
+    solution is then evaluated from the cross table; a coordinate at zero
+    whose gradient exceeds the TLP slope ``penalty`` violates the optimality
+    condition.  Because the sweep ends with the hard threshold at ``tau``, a
+    violating coordinate is added to the support (the ``max_added`` largest)
+    only if its one-step Newton estimate ``(|g_k| - penalty) / H_kk`` would
+    exceed ``tau``; the row is then re-solved.  Each round costs one pass
+    over the patterns, against one pass per optimizer evaluation in the dense
+    solver.
     """
     B_start = np.asarray(B_start, dtype=float)
     J, n_features = B_start.shape
@@ -227,13 +230,17 @@ def _solve_poisson_tlp_active_set(
             x_full = np.zeros(n_features, dtype=float)
             x_full[0] = z[0]
             x_full[1:][support] = z[1:]
-            # full gradient of the data term at x_full, from the cross table
+            # full gradient and diagonal curvature of the data term at
+            # x_full, from the cross table (d_pk^2 = d_pk for binary designs)
             rate_s = _poisson_optimization_rate(design_s @ z)
-            gradient_full = (w_active * rate_s) @ cross[active] - q_full
+            curvature_full = (w_active * rate_s) @ cross[active]
+            gradient_full = curvature_full - q_full
             inactive = np.ones(K, dtype=bool)
             inactive[support] = False
             slope_grad = gradient_full[1:]
-            violation = np.abs(slope_grad) - penalty
+            excess = np.abs(slope_grad) - penalty
+            newton_step = excess / np.maximum(curvature_full[1:], 1e-12)
+            violation = np.where(excess > 0.0, newton_step - float(tau), -np.inf)
             violation[~inactive] = -np.inf
             # a zero coordinate must also be able to move inside its bounds
             lower = np.array([b[0] for b in bounds[1:]])
@@ -323,6 +330,7 @@ class _ObservedPoissonAccumulator:
         self.q_all = np.zeros((self.n_responses, self.n_features), dtype=float)
         self._design = None
         self._bits = None
+        self._bits_float = None
 
     @property
     def design(self):
@@ -410,6 +418,7 @@ class _ObservedPoissonAccumulator:
         self.q_all = (1.0 - alpha) * self.q_all + alpha * q_new
         self._design = None
         self._bits = None
+        self._bits_float = None
 
     @property
     def bits(self):
@@ -447,14 +456,22 @@ class _ObservedPoissonAccumulator:
         weights = np.bincount(codes, weights=self.counts, minlength=n_sub)
         cross = np.zeros((n_sub, self.n_features), dtype=float)
         cross[:, 0] = weights
+        bits_float = self.bits_float
         for start in range(0, n_patterns, int(row_chunk_size)):
             stop = min(start + int(row_chunk_size), n_patterns)
             grouping = csr_matrix(
                 (self.counts[start:stop], (codes[start:stop], np.arange(stop - start))),
                 shape=(n_sub, stop - start),
             )
-            cross[:, 1:] += grouping @ bits[start:stop].astype(float)
+            cross[:, 1:] += grouping @ bits_float[start:stop]
         return weights, cross
+
+    @property
+    def bits_float(self):
+        """Float copy of :attr:`bits`, cached per update for the sparse products."""
+        if self._bits_float is None:
+            self._bits_float = self.bits.astype(float)
+        return self._bits_float
 
     def value(self, response_index, x):
         x = np.asarray(x, dtype=float)
