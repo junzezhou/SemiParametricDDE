@@ -105,3 +105,29 @@ def test_poisson_two_layer_recovery_with_oracle_labels():
         assert np.mean((np.asarray(B_hat)[:, 1:] != 0) == G_t) >= 0.95
     assert np.sqrt(np.mean((np.asarray(result.B_list[0]) - B_true[0]) ** 2)) < 0.1
     assert np.mean(np.asarray(result.A_list[0]) == A_true[0]) > 0.9
+
+
+def test_accumulators_reset_history_on_unit_step_size():
+    from dde.algorithms.parametric_families import _ObservedPoissonAccumulator
+    from dde.algorithms.semi_saem import (
+        _BernoulliLayerAccumulator,
+        _BinaryHistoryBernoulliLayerAccumulator,
+    )
+    rng = np.random.default_rng(0)
+    N, K = 300, 25   # K > direct-address bits: grouped and binary-history backends
+    X = rng.poisson(2.0, size=(N, 4)).astype(float)
+    draws = [np.concatenate([np.ones((N, 1, 1)), rng.random((N, K, 1)) < 0.5], axis=1).astype(np.uint8) for _ in range(3)]
+    acc = _ObservedPoissonAccumulator(4, K + 1)
+    acc.update(X, draws[0], 1); acc.update(X, draws[1], 1)        # two burn-in sweeps: history replaced
+    assert acc.pattern_count == np.unique(np.packbits(draws[1][:, 1:, 0], axis=1, bitorder="little"), axis=0).shape[0]
+    acc.update(X, draws[2], 2)                                     # averaging starts: union of two sweeps
+    assert acc.pattern_count > N // 2 and abs(acc.counts.sum() - N) < 1e-9
+    grouped = _BernoulliLayerAccumulator(K, 4)
+    children = (rng.random((N, 4)) < 0.5).astype(np.uint8)
+    grouped.update(children, draws[0], 1); grouped.update(children, draws[1], 1)
+    assert grouped.codes.size <= N and abs(grouped.counts.sum() - N) < 1e-9
+    history = _BinaryHistoryBernoulliLayerAccumulator(K, 4)
+    history.update(children, draws[0], 1); history.update(children, draws[1], 1)
+    assert history._size == N                                      # history dropped, then one sweep stored
+    history.update(children, draws[2], 2)                          # sequential 1/t continues from the reset
+    assert history._size == 2 * N

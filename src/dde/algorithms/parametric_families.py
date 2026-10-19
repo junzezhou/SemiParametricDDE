@@ -296,7 +296,7 @@ class _ObservedPoissonAccumulator:
         new_patterns, inverse = np.unique(packed, axis=0, return_inverse=True)
         new_counts = np.bincount(inverse).astype(float) / C
 
-        if self._packed_patterns.size:
+        if self._packed_patterns.size and alpha < 1.0:
             stacked = np.vstack([self._packed_patterns, new_patterns])
             all_patterns, positions = np.unique(
                 stacked, axis=0, return_inverse=True
@@ -1165,6 +1165,7 @@ class BernoulliFamilyAdapter:
         B_list_true=None,
         G_list_true=None,
         random_state=None,
+        binarize="projection",
     ):
         return Bernoulli_init(
             X,
@@ -1174,6 +1175,8 @@ class BernoulliFamilyAdapter:
             B_list=B_list_true,
             G_list=G_list_true,
             random_state=random_state,
+        
+            binarize=binarize,
         )
 
     def observed_conditional_logit(

@@ -76,6 +76,57 @@ def _bernoulli_working_response(children, K_parent, epsilon, *, rng=None):
     return working
 
 
+def _two_class_latent_class_model(Y, *, max_iter=200, tol=1e-7):
+    """Two-class latent class model with conditionally independent Bernoulli
+    items.  Returns the responsibility of the high-prevalence-of-ones class
+    and that class's prevalence."""
+    Y = np.asarray(Y, dtype=float)
+    m = Y.shape[1]
+    lo = np.full(m, 0.15)
+    hi = np.full(m, 0.85)
+    pi = 0.3
+    resp = np.full(Y.shape[0], pi)
+    for _ in range(max_iter):
+        log1 = np.log(pi) + (Y * np.log(hi) + (1.0 - Y) * np.log1p(-hi)).sum(axis=1)
+        log0 = np.log1p(-pi) + (Y * np.log(lo) + (1.0 - Y) * np.log1p(-lo)).sum(axis=1)
+        resp = 1.0 / (1.0 + np.exp(np.clip(log0 - log1, -50.0, 50.0)))
+        pi_new = float(np.clip(resp.mean(), 1e-3, 1.0 - 1e-3))
+        hi_new = np.clip((resp[:, None] * Y).sum(axis=0) / max(resp.sum(), 1e-12), 1e-3, 1.0 - 1e-3)
+        lo_new = np.clip(((1.0 - resp)[:, None] * Y).sum(axis=0) / max((1.0 - resp).sum(), 1e-12), 1e-3, 1.0 - 1e-3)
+        converged = abs(pi_new - pi) + np.abs(hi_new - hi).sum() + np.abs(lo_new - lo).sum() < tol
+        pi, hi, lo = pi_new, hi_new, lo_new
+        if converged:
+            break
+    if hi.mean() < lo.mean():
+        resp, pi = 1.0 - resp, 1.0 - pi
+    return resp, pi
+
+
+def _anchor_lca_binarize(children, B_estimate):
+    """Classify every latent column from its positive-loading anchor children.
+
+    Binary children carry no single-variable mixture information, so each
+    column is read off a two-class latent class model over its anchors
+    (identified with three or more anchors); with fewer than two anchors the
+    two largest loadings are used.  Returns the binary parent matrix and the
+    per-column prevalence estimates.
+    """
+    children = np.asarray(children, dtype=float)
+    B_estimate = np.asarray(B_estimate, dtype=float)
+    N = children.shape[0]
+    K = B_estimate.shape[1]
+    parent = np.zeros((N, K), dtype=np.uint8)
+    prevalence = np.zeros(K, dtype=float)
+    for k in range(K):
+        anchors = np.flatnonzero(B_estimate[:, k] > 0.0)
+        if anchors.size < 2:
+            anchors = np.argsort(-B_estimate[:, k])[:2]
+        resp, pi = _two_class_latent_class_model(children[:, anchors])
+        parent[:, k] = resp > 0.5
+        prevalence[k] = pi
+    return parent, prevalence
+
+
 def _initialize_binary_parent_layer(
     children,
     K_parent,
@@ -85,8 +136,18 @@ def _initialize_binary_parent_layer(
     B_reference=None,
     G_reference=None,
     rng=None,
+    binarize="projection",
 ):
-    """Initialize one binary parent layer from binary child variables."""
+    """Initialize one binary parent layer from binary child variables.
+
+    ``binarize="projection"`` thresholds the projected centered working
+    response at zero (MATLAB ``binary_init``); ``"anchor_lca"`` classifies
+    each column with a two-class latent class model over its anchor children,
+    which recovers the column prevalence.
+    """
+    binarize = str(binarize).strip().lower()
+    if binarize not in {"projection", "anchor_lca"}:
+        raise ValueError("binarize must be 'projection' or 'anchor_lca'.")
     children = np.asarray(children, dtype=np.uint8)
     K_parent = int(K_parent)
     working = _bernoulli_working_response(
@@ -125,10 +186,13 @@ def _initialize_binary_parent_layer(
         )
 
     graph_estimate = B_estimate != 0.0
-    parent_nonbinary = working @ _safe_lstsq(
-        B_estimate.T @ B_estimate, B_estimate.T
-    ).T
-    parent = (parent_nonbinary > 0.0).astype(np.uint8)
+    if binarize == "anchor_lca":
+        parent, _ = _anchor_lca_binarize(children, B_estimate)
+    else:
+        parent_nonbinary = working @ _safe_lstsq(
+            B_estimate.T @ B_estimate, B_estimate.T
+        ).T
+        parent = (parent_nonbinary > 0.0).astype(np.uint8)
     parent_centered = parent - np.mean(parent, axis=0, keepdims=True)
     B_reestimated = _safe_proj(parent_centered, working).T / 2.0
 
@@ -171,8 +235,13 @@ def Bernoulli_init(
     B_list=None,
     G_list=None,
     random_state=None,
+    binarize="projection",
 ):
-    """Initialize a D-layer Bernoulli DDE using the MATLAB double-SVD scheme."""
+    """Initialize a D-layer Bernoulli DDE using the MATLAB double-SVD scheme.
+
+    ``binarize`` selects the latent-state rule of every layer (see
+    :func:`_initialize_binary_parent_layer`).
+    """
     X_array = np.asarray(X)
     if X_array.ndim != 2 or min(X_array.shape) < 1:
         raise ValueError("X must be a nonempty two-dimensional binary matrix.")
@@ -221,6 +290,7 @@ def Bernoulli_init(
             B_reference=None if not oracle else B_list[layer],
             G_reference=None if not oracle else G_list[layer],
             rng=rng,
+            binarize=binarize,
         )
         B_initial.append(B_layer)
         A_initial.append(parent)
@@ -236,6 +306,7 @@ bernoulli_init = Bernoulli_init
 
 __all__ = [
     "Bernoulli_init",
+    "_anchor_lca_binarize",
     "_bernoulli_working_response",
     "_initialize_binary_parent_layer",
     "_stable_varimax",

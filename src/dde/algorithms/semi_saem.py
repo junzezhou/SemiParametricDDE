@@ -143,6 +143,17 @@ class _BernoulliLayerAccumulator:
         np.add.at(new_sum_y, inverse, children)
         new_sum_y /= C
 
+        if alpha >= 1.0:
+            # Step size one (burn-in sweep): the objective is the current
+            # draw alone, so the history is dropped instead of kept at
+            # weight zero.
+            self.codes = new_codes
+            self.counts = new_counts
+            self.sum_y = new_sum_y
+            self._parent_states = None
+            self._design = None
+            return
+
         all_codes = np.union1d(self.codes, new_codes)
         merged_counts = np.zeros(all_codes.size, dtype=float)
         merged_sum_y = np.zeros(
@@ -355,6 +366,15 @@ class _BinaryHistoryBernoulliLayerAccumulator:
         alpha = 1.0 / t
         C = A_upper_samples.shape[2]
         new_row_weight = alpha / C
+        if alpha >= 1.0 and self._size:
+            # Step size one (burn-in sweep): the stored history would carry
+            # weight zero, so it is discarded and the sequence restarts.
+            self._size = 0
+            self._parent_chunks = []
+            self._packed_child_chunks = []
+            self._row_weight = 0.0
+            self._draws_per_update = None
+            self._response_stats = np.zeros_like(self._response_stats)
         if self._size:
             old_row_weight = (1.0 - alpha) * self._row_weight
             if self._draws_per_update != C or not np.isclose(
