@@ -84,6 +84,74 @@ def _poisson_working_response(counts, K_parent, epsilon, *, rng=None):
     return low_rank
 
 
+def _two_component_poisson_mixture(x, *, max_iter=200, tol=1e-7):
+    """Fit a two-component Poisson mixture to one count column by EM.
+
+    Returns ``(pi, lam0, lam1)`` with ``lam0 <= lam1``: the prevalence of the
+    high-rate component and the two rates.
+    """
+    x = np.asarray(x, dtype=float)
+    lam0 = max(float(np.quantile(x, 0.3)), 0.05)
+    lam1 = max(float(np.quantile(x, 0.9)), 3.0 * lam0 + 0.5)
+    pi = 0.3
+    for _ in range(max_iter):
+        log1 = np.log(pi) + x * np.log(lam1) - lam1
+        log0 = np.log1p(-pi) + x * np.log(lam0) - lam0
+        resp = 1.0 / (1.0 + np.exp(np.clip(log0 - log1, -50.0, 50.0)))
+        pi_new = float(np.clip(resp.mean(), 1e-3, 1.0 - 1e-3))
+        lam1_new = max(float((resp * x).sum() / max(resp.sum(), 1e-12)), 1e-3)
+        lam0_new = max(
+            float(((1.0 - resp) * x).sum() / max((1.0 - resp).sum(), 1e-12)), 1e-3
+        )
+        converged = (
+            abs(pi_new - pi) + abs(lam1_new - lam1) + abs(lam0_new - lam0) < tol
+        )
+        pi, lam0, lam1 = pi_new, lam0_new, lam1_new
+        if converged:
+            break
+    if lam1 < lam0:
+        lam0, lam1, pi = lam1, lam0, 1.0 - pi
+    return pi, lam0, lam1
+
+
+def _anchor_mixture_binarize(counts, B_estimate):
+    """Classify every latent column from its positive-loading anchor variables.
+
+    The projection step of the double-SVD initializer thresholds centered
+    scores at zero, which assigns roughly half of the observations to every
+    latent column whatever its true prevalence.  For a rare latent variable
+    that mislabels most observations and starts the observed-layer intercepts
+    far from the truth.  Here each anchor (a child with a positive spectral
+    loading) is summarized by a two-component Poisson mixture; the
+    log-likelihood ratios of the anchors are summed with the mixture
+    prevalence as prior, and the sign of the total classifies the
+    observation.  Returns the binary parent matrix and the per-column
+    prevalence estimates.
+    """
+    counts = np.asarray(counts, dtype=float)
+    B_estimate = np.asarray(B_estimate, dtype=float)
+    N = counts.shape[0]
+    K = B_estimate.shape[1]
+    parent = np.zeros((N, K), dtype=np.uint8)
+    prevalence = np.zeros(K, dtype=float)
+    for k in range(K):
+        anchors = np.flatnonzero(B_estimate[:, k] > 0.0)
+        if anchors.size == 0:
+            anchors = np.array([int(np.argmax(np.abs(B_estimate[:, k])))])
+        logit = np.zeros(N, dtype=float)
+        pis = []
+        for j in anchors:
+            x = counts[:, j]
+            pi, lam0, lam1 = _two_component_poisson_mixture(x)
+            logit += x * np.log(lam1 / lam0) - (lam1 - lam0)
+            pis.append(pi)
+        pi = float(np.clip(np.mean(pis), 1e-3, 1.0 - 1e-3))
+        logit += np.log(pi / (1.0 - pi))
+        parent[:, k] = logit > 0.0
+        prevalence[k] = pi
+    return parent, prevalence
+
+
 def _initialize_poisson_parent_layer(
     counts,
     K_parent,
@@ -92,8 +160,19 @@ def _initialize_poisson_parent_layer(
     B_reference=None,
     G_reference=None,
     rng=None,
+    binarize="projection",
 ):
-    """Initialize the first binary layer beneath Poisson observations."""
+    """Initialize the first binary layer beneath Poisson observations.
+
+    ``binarize`` selects how the latent states are read off the spectral
+    loadings: ``"projection"`` thresholds the projected centered working
+    response at zero (the MATLAB ``Poi_init`` rule); ``"anchor_mixture"``
+    classifies each column with two-component Poisson mixtures on its anchor
+    variables, which recovers the column prevalence.
+    """
+    binarize = str(binarize).strip().lower()
+    if binarize not in {"projection", "anchor_mixture"}:
+        raise ValueError("binarize must be 'projection' or 'anchor_mixture'.")
     working = _poisson_working_response(
         counts, K_parent, epsilon, rng=rng
     )
@@ -128,10 +207,13 @@ def _initialize_poisson_parent_layer(
         )
 
     graph_estimate = B_estimate != 0.0
-    parent_nonbinary = working @ _safe_lstsq(
-        B_estimate.T @ B_estimate, B_estimate.T
-    ).T
-    parent = (parent_nonbinary > 0.0).astype(np.uint8)
+    if binarize == "anchor_mixture":
+        parent, _ = _anchor_mixture_binarize(counts, B_estimate)
+    else:
+        parent_nonbinary = working @ _safe_lstsq(
+            B_estimate.T @ B_estimate, B_estimate.T
+        ).T
+        parent = (parent_nonbinary > 0.0).astype(np.uint8)
     parent_centered = parent - np.mean(parent, axis=0, keepdims=True)
     B_reestimated = _safe_proj(parent_centered, working).T / 2.0
 
@@ -174,11 +256,14 @@ def Poisson_init(
     B_list=None,
     G_list=None,
     random_state=None,
+    binarize="projection",
 ):
     """Initialize an arbitrary-depth Poisson DDE.
 
-    The observed layer follows the original Poisson double-SVD construction.
-    Every deeper layer uses the shared Bernoulli-child spectral initializer.
+    The observed layer follows the original Poisson double-SVD construction
+    (``binarize`` chooses the latent-state rule, see
+    :func:`_initialize_poisson_parent_layer`).  Every deeper layer uses the
+    shared Bernoulli-child spectral initializer.
     """
     X_array = np.asarray(X)
     if X_array.ndim != 2 or min(X_array.shape) < 1:
@@ -223,6 +308,7 @@ def Poisson_init(
         B_reference=None if not oracle else B_list[0],
         G_reference=None if not oracle else G_list[0],
         rng=rng,
+        binarize=binarize,
     )
     B_initial.append(B_first)
     A_initial.append(A_first)
@@ -253,6 +339,7 @@ poisson_init = Poisson_init
 
 __all__ = [
     "Poisson_init",
+    "_anchor_mixture_binarize",
     "_initialize_poisson_parent_layer",
     "_poisson_working_response",
     "poisson_init",

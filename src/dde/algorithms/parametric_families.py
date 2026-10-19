@@ -915,6 +915,7 @@ class PoissonFamilyAdapter:
         B_list_true=None,
         G_list_true=None,
         random_state=None,
+        binarize="projection",
     ):
         return Poisson_init(
             X,
@@ -924,6 +925,7 @@ class PoissonFamilyAdapter:
             B_list=B_list_true,
             G_list=G_list_true,
             random_state=random_state,
+            binarize=binarize,
         )
 
     def observed_conditional_logit(

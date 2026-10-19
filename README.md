@@ -182,6 +182,23 @@ result = fit(
 )
 ```
 
+Fixed-width Poisson fits use three controls that the other families leave
+off by default (`Results/dde_poisson_fixed_d2_d5_r100/REPORT.md` holds the
+study behind them): `sa_burn_in=10` runs the first ten sweeps with step size
+one before the `1/t` stochastic approximation starts, so draws made from the
+initialization do not keep a lasting weight in the averaged objectives;
+`fixed_init_binarize="anchor_mixture"` reads the initial latent states off
+two-component Poisson mixtures on each column's anchor variables, which
+recovers the column prevalence that thresholding the projected working
+response at zero cannot (a rare latent column otherwise starts at about 50 %
+and drifts into an always-on, intercept-absorbing solution); and
+`fixed_warm_start="layerwise"` estimates the observed layer first with a flat
+latent prior, then the deeper layers as a Bernoulli DDE on the resulting
+latent states, and only then runs the full SAEM.  Pass
+`sa_burn_in=0, fixed_init_binarize="projection", fixed_warm_start="none"` for
+the plain MATLAB-style kernel; `result.diagnostics["warm_start"]` records the
+stage iterations.
+
 Poisson CSP uses the same maximum-width initialization and cumulative
 shrinkage state as the other parametric families. Its observed M-step solves
 the tempered Poisson likelihood with CSP-weighted L1 penalties by bounded

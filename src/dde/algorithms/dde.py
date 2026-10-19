@@ -118,6 +118,105 @@ def _validate_pen_list(pen_list: Sequence[float], D: int) -> list[float]:
     return penalties
 
 
+def _layerwise_warm_start(
+    X,
+    prop,
+    B_list,
+    A_list,
+    *,
+    family_adapter,
+    penalties,
+    tau,
+    C,
+    tol,
+    max_it,
+    bound_val,
+    epsilon,
+    estep_row_chunk_size,
+    sa_burn_in,
+    oracle,
+    B_list_true,
+    G_list_true,
+    verbose,
+):
+    """Layer-wise warm start for fixed-width fits.
+
+    Stage 1 runs the SAEM kernel on the observed layer alone (one latent
+    layer with a flat Bernoulli prior) from the spectral initialization.
+    Stage 2 fits the deeper layers as a fixed-width Bernoulli DDE on the
+    stage-1 latent states, with the Bernoulli spectral initializer (labelled
+    by the true deep coefficients when ``oracle``).  The assembled state is
+    the starting point of the full SAEM.  Identifiability of a DDE is
+    layer-wise (the collapsed one-layer model identifies the observed layer;
+    each deeper layer is identified from the layer below), so each stage
+    solves an identified sub-problem from its own initialization instead of
+    letting the deep layers drift while the observed layer is still far from
+    its optimum.
+    """
+    D = len(B_list)
+    A1 = np.asarray(A_list[0], dtype=float)
+    prop_stage1 = np.clip(np.mean(A1, axis=0), 1e-3, 1.0 - 1e-3)
+    prop_stage1, B_stage1, _, A_stage1, iterations_stage1 = get_SAEM_parametric(
+        X,
+        prop_stage1,
+        [np.asarray(B_list[0], dtype=float)],
+        None,
+        [penalties[0]],
+        tau,
+        [A1],
+        C,
+        tol,
+        max_iter=max_it,
+        bound_val=bound_val,
+        verbose=False,
+        estep_row_chunk_size=estep_row_chunk_size,
+        family=family_adapter,
+        sa_burn_in=sa_burn_in,
+    )
+    A1 = np.asarray(A_stage1[0], dtype=float)
+    deep_widths = [int(np.asarray(B).shape[1] - 1) for B in B_list[1:]]
+    deep_kwargs = dict(
+        family="bernoulli",
+        D=D - 1,
+        K_list=deep_widths,
+        dimension_method="fixed",
+        pen_list=list(penalties[1:]),
+        tau=tau,
+        C=C,
+        tol=tol,
+        max_it=max_it,
+        bound_val=bound_val,
+        epsilon=epsilon,
+        sa_burn_in=sa_burn_in,
+        fixed_warm_start="none",
+        estep_row_chunk_size=estep_row_chunk_size,
+        verbose=False,
+    )
+    if oracle:
+        deep_kwargs.update(
+            initialize="oracle",
+            B_list_true=list(B_list_true[1:]),
+            G_list_true=list(G_list_true[1:]),
+        )
+    deep = fit_parametric_dde(A1, **deep_kwargs)
+    if verbose:
+        print(
+            f"Layer-wise warm start: stage 1 {iterations_stage1} sweeps, "
+            f"stage 2 {deep.diagnostics['iterations']} sweeps"
+        )
+    prop_out = np.asarray(deep.prop, dtype=float)
+    B_out = [np.asarray(B_stage1[0], dtype=float)] + [
+        np.asarray(B, dtype=float) for B in deep.B_list
+    ]
+    A_out = [A1] + [np.asarray(A, dtype=float) for A in deep.A_list]
+    diagnostics = {
+        "stage1_iterations": int(iterations_stage1),
+        "stage2_iterations": int(deep.diagnostics["iterations"]),
+        "stage2_initialization": deep.diagnostics.get("initialization"),
+    }
+    return prop_out, B_out, A_out, diagnostics
+
+
 def fit_parametric_dde(
     Y,
     *,
@@ -179,6 +278,9 @@ def fit_parametric_dde(
     n_jobs: int = 1,
     standardize=None,
     burn: int = 5,
+    sa_burn_in=None,
+    fixed_init_binarize=None,
+    fixed_warm_start=None,
     estep_row_chunk_size: int = 2048,
     estep_coordinate_chunk_size: int = 1,
     keep_trace: bool = False,
@@ -242,6 +344,24 @@ def fit_parametric_dde(
     burn-in of 10 iterations when ``D >= 3`` and ``max_it >= 20`` together
     with ``csp_penalty_scaling_power=0.5``, and no burn-in otherwise (the
     Normal family never burns in).
+
+    Fixed-width fits take three further controls, with Poisson defaults
+    chosen by the D=2..5 recovery study of ``Results/dde_poisson_fixed_*``:
+    ``sa_burn_in`` (default 10 for Poisson, 0 otherwise) runs that many
+    initial sweeps with step size one before the ``1/t`` stochastic
+    approximation starts, so draws made from the initialization do not keep
+    a lasting weight in the averaged objectives; ``fixed_init_binarize``
+    (default ``"anchor_mixture"`` for Poisson, ``"projection"`` otherwise)
+    reads the initial latent states off two-component Poisson mixtures on
+    each column's anchor variables instead of thresholding the projected
+    working response at zero, which otherwise assigns about half of the
+    observations to every latent column and starts rare columns at the
+    wrong prevalence; ``fixed_warm_start`` (default ``"layerwise"`` for
+    Poisson with ``D >= 2``, ``"none"`` otherwise) estimates the observed
+    layer first with a flat latent prior, then the deeper layers as a
+    Bernoulli DDE on the resulting latent states, and only then runs the
+    full SAEM from the assembled state.  The warm start is skipped when a
+    full state (``prop_in``, ``B_list_in``, ``A_list_in``) is supplied.
 
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
@@ -318,6 +438,33 @@ def fit_parametric_dde(
         raise ValueError("C must be a positive integer.")
     if max_it < 1:
         raise ValueError("max_it must be a positive integer.")
+
+    is_poisson = family_adapter.key == "poisson"
+    if sa_burn_in is None:
+        sa_burn_in = 10 if (is_poisson and method == "fixed") else 0
+    sa_burn_in = int(sa_burn_in)
+    if sa_burn_in < 0:
+        raise ValueError("sa_burn_in must be a nonnegative integer.")
+    if sa_burn_in and method != "fixed":
+        raise ValueError("sa_burn_in applies to dimension_method='fixed' only.")
+    if fixed_init_binarize is None:
+        fixed_init_binarize = "anchor_mixture" if (is_poisson and method == "fixed") else "projection"
+    fixed_init_binarize = str(fixed_init_binarize).strip().lower()
+    if fixed_init_binarize not in {"projection", "anchor_mixture"}:
+        raise ValueError("fixed_init_binarize must be 'projection' or 'anchor_mixture'.")
+    if fixed_init_binarize == "anchor_mixture" and (not is_poisson or method != "fixed"):
+        raise ValueError(
+            "fixed_init_binarize='anchor_mixture' is implemented for fixed-width Poisson fits only."
+        )
+    if fixed_warm_start is None:
+        fixed_warm_start = "layerwise" if (is_poisson and method == "fixed" and D >= 2) else "none"
+    fixed_warm_start = str(fixed_warm_start).strip().lower()
+    if fixed_warm_start not in {"none", "layerwise"}:
+        raise ValueError("fixed_warm_start must be 'none' or 'layerwise'.")
+    if fixed_warm_start == "layerwise" and (method != "fixed" or D < 2):
+        raise ValueError(
+            "fixed_warm_start='layerwise' needs dimension_method='fixed' and D >= 2."
+        )
 
     if csp_backend is None:
         backend = (
@@ -433,6 +580,7 @@ def fit_parametric_dde(
                     epsilon=epsilon,
                     mode="data",
                     random_state=random_state if method == "csp" else None,
+                    **({"binarize": fixed_init_binarize} if is_poisson else {}),
                 )
         elif initialization == "oracle":
             if B_list_true is None or G_list_true is None:
@@ -447,6 +595,7 @@ def fit_parametric_dde(
                 epsilon=epsilon,
                 mode="oracle",
                 random_state=random_state if method == "csp" else None,
+                **({"binarize": fixed_init_binarize} if is_poisson else {}),
             )
         else:
             raise ValueError("initialize must be 'data' or 'oracle'.")
@@ -457,6 +606,28 @@ def fit_parametric_dde(
                 "random_state is currently supported by the CSP path only."
             )
         fixed_trace = [] if keep_trace else None
+        warm_start_diagnostics = None
+        if fixed_warm_start == "layerwise" and initialization != "provided":
+            prop, B_list, A_list, warm_start_diagnostics = _layerwise_warm_start(
+                X,
+                prop,
+                B_list,
+                A_list,
+                family_adapter=family_adapter,
+                penalties=penalties,
+                tau=tau,
+                C=C,
+                tol=tol,
+                max_it=max_it,
+                bound_val=bound_val,
+                epsilon=epsilon,
+                estep_row_chunk_size=estep_row_chunk_size,
+                sa_burn_in=sa_burn_in,
+                oracle=(initialization == "oracle"),
+                B_list_true=B_list_true,
+                G_list_true=G_list_true,
+                verbose=bool(verbose),
+            )
         prop, B_list, gamma, A_list, iterations = get_SAEM_parametric(
             X,
             prop,
@@ -473,6 +644,7 @@ def fit_parametric_dde(
             estep_row_chunk_size=estep_row_chunk_size,
             trace=fixed_trace,
             family=family_adapter,
+            sa_burn_in=sa_burn_in,
         )
 
         X_result = X.copy()
@@ -487,7 +659,14 @@ def fit_parametric_dde(
             "mc_state_update": "last_draw",
             "convergence_metric": "postprocessed_parameter_rmse",
             "convergence_tol": tol,
+            "sa_burn_in": sa_burn_in,
+            "fixed_init_binarize": fixed_init_binarize,
+            "fixed_warm_start": (
+                fixed_warm_start if initialization != "provided" else "none"
+            ),
         }
+        if warm_start_diagnostics is not None:
+            diagnostics["warm_start"] = warm_start_diagnostics
         if fixed_trace is not None:
             diagnostics["trace"] = fixed_trace
         return DDEResult(

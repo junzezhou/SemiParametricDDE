@@ -1264,12 +1264,24 @@ def _compute_bernoulli_probabilities_normal(
 def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                         pen_list, tau, A_list_in, C, tol,
                         max_iter=50, bound_val=10.0, verbose=True,
-                        estep_row_chunk_size=2048, trace=None, *, family):
+                        estep_row_chunk_size=2048, trace=None, *, family,
+                        sa_burn_in=0):
     """Run fixed-width SAEM with observed behavior supplied by ``family``.
 
     ``tol`` is compared with the root-mean-square parameter change after the
     family coefficient postprocessor has been applied.
+
+    ``sa_burn_in`` is the number of initial sweeps run with step size one
+    (plain Monte Carlo EM: every accumulated objective is replaced by the
+    current draw) before the Robbins-Monro averaging ``1/(t - sa_burn_in)``
+    starts.  With a step size of ``1/t`` from the first sweep, the draws made
+    from a poor initialization keep a weight of order ``1/t`` in every later
+    objective; the burn-in lets the latent states move first.  The
+    convergence test starts after the burn-in.
     """
+    sa_burn_in = int(sa_burn_in)
+    if sa_burn_in < 0:
+        raise ValueError("sa_burn_in must be a nonnegative integer.")
     family = resolve_parametric_family(family)
     N, J = X.shape
     D = len(B_list_in)
@@ -1320,9 +1332,10 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
         )
         estep_seconds = time.perf_counter() - estep_started
 
+        t_sa = max(1, t - sa_burn_in)
         p_top = (
-            (1.0 - 1.0 / t) * p_top
-            + (1.0 / t) * top_probability
+            (1.0 - 1.0 / t_sa) * p_top
+            + (1.0 / t_sa) * top_probability
         )
         prop_update = np.mean(p_top, axis=0)
 
@@ -1333,7 +1346,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
             B_list[0],
             dispersion,
             f_acc_obs,
-            iteration=t,
+            iteration=t_sa,
             depth=D,
             penalty=pen_list[0],
             tau=tau,
@@ -1348,7 +1361,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
             n_rows = B_list[d_idx].shape[0]
             bidx = d_idx - 1
             f_acc_bern[bidx].update(
-                A_samples[d_idx - 1], A_samples[d_idx], t
+                A_samples[d_idx - 1], A_samples[d_idx], t_sa
             )
             bounds = family.fixed_latent_bounds(K[d_idx] + 1, bound_val)
             if family.key in {"bernoulli", "poisson"}:
@@ -1436,7 +1449,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
         t += 1
         if verbose:
             print(f'EM Iteration {t},\t Err {err:.4g}')
-        if abs(err) <= tol or t >= max_iter:
+        if (t > sa_burn_in + 1 and abs(err) <= tol) or t >= max_iter:
             break
  
     return prop, B_list, dispersion, A_list, t
