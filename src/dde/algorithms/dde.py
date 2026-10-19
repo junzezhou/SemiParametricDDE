@@ -138,6 +138,7 @@ def _layerwise_warm_start(
     B_list_true,
     G_list_true,
     verbose,
+    observed_solver=None,
 ):
     """Layer-wise warm start for fixed-width fits.
 
@@ -177,6 +178,7 @@ def _layerwise_warm_start(
         estep_row_chunk_size=estep_row_chunk_size,
         family=family_adapter,
         sa_burn_in=sa_burn_in,
+        observed_solver=observed_solver,
     )
     A1 = np.asarray(A_stage1[0], dtype=float)
     deep_widths = [int(np.asarray(B).shape[1] - 1) for B in B_list[1:]]
@@ -287,6 +289,7 @@ def fit_parametric_dde(
     sa_burn_in=None,
     fixed_init_binarize=None,
     fixed_warm_start=None,
+    fixed_observed_solver=None,
     estep_row_chunk_size: int = 2048,
     estep_coordinate_chunk_size: int = 1,
     keep_trace: bool = False,
@@ -469,6 +472,12 @@ def fit_parametric_dde(
         raise ValueError(
             "fixed_init_binarize='anchor_lca' is implemented for fixed-width Bernoulli fits only."
         )
+    if fixed_observed_solver is not None:
+        fixed_observed_solver = str(fixed_observed_solver).strip().lower()
+        if not is_poisson or method != "fixed":
+            raise ValueError("fixed_observed_solver is a fixed-width Poisson option.")
+        if fixed_observed_solver not in {"active_set", "rowwise"}:
+            raise ValueError("fixed_observed_solver must be 'active_set' or 'rowwise'.")
     if fixed_warm_start is None:
         fixed_warm_start = "layerwise" if (is_poisson and method == "fixed" and D >= 2) else "none"
     if fixed_warm_start == "layerwise" and family_adapter.key == "normal":
@@ -642,6 +651,7 @@ def fit_parametric_dde(
                 B_list_true=B_list_true,
                 G_list_true=G_list_true,
                 verbose=bool(verbose),
+                observed_solver=fixed_observed_solver,
             )
         prop, B_list, gamma, A_list, iterations = get_SAEM_parametric(
             X,
@@ -660,6 +670,7 @@ def fit_parametric_dde(
             trace=fixed_trace,
             family=family_adapter,
             sa_burn_in=sa_burn_in,
+            observed_solver=fixed_observed_solver,
         )
 
         X_result = X.copy()
@@ -678,6 +689,9 @@ def fit_parametric_dde(
             "fixed_init_binarize": fixed_init_binarize,
             "fixed_warm_start": (
                 fixed_warm_start if initialization != "provided" else "none"
+            ),
+            "fixed_observed_solver": (
+                (fixed_observed_solver or "active_set") if is_poisson else "family"
             ),
         }
         if warm_start_diagnostics is not None:

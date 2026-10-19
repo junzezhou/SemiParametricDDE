@@ -1285,7 +1285,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                         pen_list, tau, A_list_in, C, tol,
                         max_iter=50, bound_val=10.0, verbose=True,
                         estep_row_chunk_size=2048, trace=None, *, family,
-                        sa_burn_in=0):
+                        sa_burn_in=0, observed_solver=None):
     """Run fixed-width SAEM with observed behavior supplied by ``family``.
 
     ``tol`` is compared with the root-mean-square parameter change after the
@@ -1372,6 +1372,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
             tau=tau,
             bound_val=bound_val,
             response_cache=response_cache,
+            observed_solver=observed_solver,
         )
         mstep_seconds = [time.perf_counter() - observed_mstep_started]
  

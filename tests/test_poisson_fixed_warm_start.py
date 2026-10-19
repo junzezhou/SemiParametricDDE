@@ -131,3 +131,37 @@ def test_accumulators_reset_history_on_unit_step_size():
     assert history._size == N                                      # history dropped, then one sweep stored
     history.update(children, draws[2], 2)                          # sequential 1/t continues from the reset
     assert history._size == 2 * N
+
+
+def test_poisson_support_tables_match_dense_design_and_active_set_matches_rowwise():
+    from dde.algorithms.parametric_families import (
+        _ObservedPoissonAccumulator,
+        _solve_poisson_tlp_active_set,
+        _solve_poisson_tlp_rowwise,
+    )
+    rng = np.random.default_rng(3)
+    N, K, J = 400, 7, 5
+    A = (rng.random((N, K)) < 0.4).astype(np.uint8)
+    B_true = np.zeros((J, K + 1)); B_true[:, 0] = -0.5
+    for j in range(J):
+        B_true[j, 1 + (j % K)] = 2.0
+    X = rng.poisson(np.exp(np.column_stack([np.ones(N), A]) @ B_true.T)).astype(float)
+    acc = _ObservedPoissonAccumulator(J, K + 1)
+    draws = np.concatenate([np.ones((N, 1, 1)), A[:, :, None]], axis=1).astype(np.uint8)
+    acc.update(X, draws, 1)
+    support = np.array([1, 4])
+    weights, cross = acc.support_tables(support)
+    assert abs(weights.sum() - N) < 1e-9
+    np.testing.assert_allclose(cross.sum(axis=0), acc.counts @ acc.design, rtol=1e-12)
+    # cross-table for sub-pattern 0 only counts patterns with both support bits off
+    design = acc.design
+    mask = (design[:, 2] == 0) & (design[:, 5] == 0)
+    np.testing.assert_allclose(cross[0], acc.counts[mask] @ design[mask], rtol=1e-12)
+    bounds = [(-5.0, 5.0)] + [(-2.5, 5.0)] * K
+    start = B_true + rng.normal(0, 0.1, B_true.shape)
+    active = _solve_poisson_tlp_active_set(acc, start, 1.0, 0.3, bounds)
+    dense = _solve_poisson_tlp_rowwise(acc, start, 1.0, 0.3, bounds, max_iter=200)
+    def penalized(B):
+        return sum(acc.value(j, B[j]) + 1.0 * np.sum(np.minimum(np.abs(B[j, 1:]), 0.3)) for j in range(J))
+    assert penalized(active) <= penalized(dense) + 1e-3
+    assert np.max(np.abs(active - B_true)) < 0.35

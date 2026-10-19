@@ -475,6 +475,7 @@ def test_poisson_fixed_mstep_preserves_responsewise_optimizer(monkeypatch):
         tau=0.25,
         bound_val=10.0,
         response_cache=None,
+        observed_solver="rowwise",
     )
 
     np.testing.assert_array_equal(actual, expected)

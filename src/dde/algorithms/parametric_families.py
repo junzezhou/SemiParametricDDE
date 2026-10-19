@@ -157,6 +157,99 @@ def _solve_poisson_tlp_rowwise(
     return B_update
 
 
+def _solve_poisson_tlp_active_set(
+    accumulator,
+    B_start,
+    penalty,
+    tau,
+    bounds,
+    *,
+    max_rounds=3,
+    max_iter=50,
+    max_support=16,
+    max_added=8,
+):
+    """Row-wise TLP Poisson M-step restricted to each row's active support.
+
+    Same objective and penalty as ``_solve_poisson_tlp_rowwise``.  For row
+    ``j`` the coefficients outside the current support ``S_j`` are held at
+    zero and the problem over ``(intercept, x_S)`` is solved exactly with
+    L-BFGS-B on the sub-pattern weights of ``S_j`` (``2**|S_j|`` terms
+    instead of one term per stored pattern).  The full gradient at the
+    solution is then evaluated from the cross table; coordinates at zero
+    whose gradient exceeds the TLP slope ``penalty`` violate the optimality
+    condition and are added to the support (the ``max_added`` largest), and
+    the row is re-solved.  Each round costs one pass over the packed
+    patterns, against one pass per optimizer evaluation in the dense solver.
+    """
+    B_start = np.asarray(B_start, dtype=float)
+    J, n_features = B_start.shape
+    K = n_features - 1
+    penalty = float(penalty)
+    bounds = list(bounds)
+    B_update = np.zeros_like(B_start)
+    for j in range(J):
+        row = B_start[j].copy()
+        support = np.flatnonzero(row[1:] != 0.0)
+        if support.size > max_support:
+            support = support[np.argsort(-np.abs(row[1:][support]))[:max_support]]
+        x_full = row.copy()
+        for _ in range(int(max_rounds)):
+            support = np.sort(support)
+            weights, cross = accumulator.support_tables(support)
+            active = np.flatnonzero(weights > 0.0)
+            w_active = weights[active]
+            bits = ((active[:, None] >> np.arange(support.size)[None, :]) & 1).astype(float)
+            design_s = np.column_stack([np.ones(active.size), bits])
+            q_full = accumulator.q_all[j]
+            q_s = np.concatenate([[q_full[0]], q_full[1:][support]])
+            sub_bounds = [bounds[0]] + [bounds[k + 1] for k in support]
+
+            def objective(z):
+                eta = design_s @ z
+                rate = _poisson_optimization_rate(eta)
+                excess = np.maximum(eta - _POISSON_OPTIMIZATION_EXP_LIMIT, 0.0)
+                value = float(w_active @ (rate * (1.0 + excess)) - q_s @ z)
+                gradient = design_s.T @ (w_active * rate) - q_s
+                pen_value, pen_grad = _tlp_penalty_value_grad(z[1:], penalty, tau)
+                gradient[1:] += pen_grad
+                return value + pen_value, gradient
+
+            z0 = np.concatenate([[x_full[0]], x_full[1:][support]])
+            z = minimize(
+                objective,
+                z0,
+                method="L-BFGS-B",
+                jac=True,
+                bounds=sub_bounds,
+                options={"maxiter": int(max_iter)},
+            ).x
+            x_full = np.zeros(n_features, dtype=float)
+            x_full[0] = z[0]
+            x_full[1:][support] = z[1:]
+            # full gradient of the data term at x_full, from the cross table
+            rate_s = _poisson_optimization_rate(design_s @ z)
+            gradient_full = (w_active * rate_s) @ cross[active] - q_full
+            inactive = np.ones(K, dtype=bool)
+            inactive[support] = False
+            slope_grad = gradient_full[1:]
+            violation = np.abs(slope_grad) - penalty
+            violation[~inactive] = -np.inf
+            # a zero coordinate must also be able to move inside its bounds
+            lower = np.array([b[0] for b in bounds[1:]])
+            upper = np.array([b[1] for b in bounds[1:]])
+            violation[(slope_grad > 0) & (lower >= 0.0)] = -np.inf
+            violation[(slope_grad < 0) & (upper <= 0.0)] = -np.inf
+            candidates = np.flatnonzero(violation > 0.0)
+            if candidates.size == 0 or support.size >= max_support:
+                break
+            candidates = candidates[np.argsort(-violation[candidates])[:max_added]]
+            room = max_support - support.size
+            support = np.concatenate([support, candidates[:room]])
+        B_update[j] = x_full
+    return B_update
+
+
 def _matlab_debias(x, tau):
     """Match the deep-Normal MATLAB ``debias.m`` elementwise."""
     x = np.asarray(x, dtype=float)
@@ -229,6 +322,7 @@ class _ObservedPoissonAccumulator:
         self.counts = np.empty(0, dtype=float)
         self.q_all = np.zeros((self.n_responses, self.n_features), dtype=float)
         self._design = None
+        self._bits = None
 
     @property
     def design(self):
@@ -315,6 +409,52 @@ class _ObservedPoissonAccumulator:
         q_new = X.T @ np.mean(A_samples, axis=2)
         self.q_all = (1.0 - alpha) * self.q_all + alpha * q_new
         self._design = None
+        self._bits = None
+
+    @property
+    def bits(self):
+        """Unpacked parent patterns (uint8, patterns x parent_width), cached."""
+        if self._bits is None:
+            self._bits = np.unpackbits(
+                self._packed_patterns,
+                axis=1,
+                count=self.parent_width,
+                bitorder="little",
+            )
+        return self._bits
+
+    def support_tables(self, support, *, row_chunk_size=65536):
+        """Aggregate the pattern weights by the sub-pattern on ``support``.
+
+        Returns ``(weights, cross)``: ``weights[s]`` is the total weight of
+        the patterns whose restriction to the latent coordinates in
+        ``support`` has code ``s`` (bit ``i`` = coordinate ``support[i]``),
+        and ``cross[s, :]`` is the weighted sum of the full design rows
+        (intercept column first) of those patterns.  For a coefficient
+        vector supported on ``support`` the objective depends on the patterns
+        only through ``weights``, and the full gradient only through
+        ``cross``, so one pass over the patterns replaces one objective
+        evaluation per optimizer step.
+        """
+        from scipy.sparse import csr_matrix
+
+        support = np.asarray(support, dtype=np.intp).reshape(-1)
+        n_sub = 1 << support.size
+        bits = self.bits
+        n_patterns = bits.shape[0]
+        code_weights = (np.int64(1) << np.arange(support.size, dtype=np.int64))
+        codes = bits[:, support].astype(np.int64) @ code_weights
+        weights = np.bincount(codes, weights=self.counts, minlength=n_sub)
+        cross = np.zeros((n_sub, self.n_features), dtype=float)
+        cross[:, 0] = weights
+        for start in range(0, n_patterns, int(row_chunk_size)):
+            stop = min(start + int(row_chunk_size), n_patterns)
+            grouping = csr_matrix(
+                (self.counts[start:stop], (codes[start:stop], np.arange(stop - start))),
+                shape=(n_sub, stop - start),
+            )
+            cross[:, 1:] += grouping @ bits[start:stop].astype(float)
+        return weights, cross
 
     def value(self, response_index, x):
         x = np.asarray(x, dtype=float)
@@ -742,6 +882,7 @@ class NormalFamilyAdapter:
         tau,
         bound_val,
         response_cache,
+        observed_solver=None,
     ):
         """Perform the existing fixed-width Normal observed-layer update."""
         N, J = X.shape
@@ -1005,21 +1146,23 @@ class PoissonFamilyAdapter:
         tau,
         bound_val,
         response_cache,
+        observed_solver=None,
     ):
         del dispersion, depth, response_cache
         accumulator.update(X, A_samples, iteration)
         bounds = self.fixed_latent_bounds(B_start.shape[1], bound_val)
-        return (
-            _solve_poisson_tlp_rowwise(
-                accumulator,
-                B_start,
-                penalty,
-                tau,
-                bounds,
-                max_iter=10,
-            ),
-            None,
-        )
+        solver = str(observed_solver or "active_set").strip().lower()
+        if solver == "active_set":
+            B_update = _solve_poisson_tlp_active_set(
+                accumulator, B_start, penalty, tau, bounds
+            )
+        elif solver == "rowwise":
+            B_update = _solve_poisson_tlp_rowwise(
+                accumulator, B_start, penalty, tau, bounds, max_iter=10
+            )
+        else:
+            raise ValueError("Poisson observed_solver must be 'active_set' or 'rowwise'.")
+        return B_update, None
 
     def csp_mstep(
         self,
@@ -1244,6 +1387,7 @@ class BernoulliFamilyAdapter:
         tau,
         bound_val,
         response_cache,
+        observed_solver=None,
     ):
         del dispersion, depth, response_cache
         accumulator.update(X, A_samples, iteration)
