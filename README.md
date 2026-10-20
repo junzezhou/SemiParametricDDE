@@ -108,7 +108,9 @@ is omitted; the staged backends remain explicit options.
 Bernoulli DDE uses the same fixed and CSP interfaces, requires a binary 0/1
 matrix, and has no `gamma` dispersion parameter. For fixed-width parametric
 DDEs, `tol` is the RMSE of the postprocessed parameter update and defaults to
-`0.005`:
+`0.005`.  Fixed-width Bernoulli fits start from the anchor latent-class
+initialization (`fixed_init_binarize="anchor_lca"`) and run ten unit-step
+burn-in sweeps (`sa_burn_in=10`); see the fixed-width controls below:
 
 ```python
 result = fit(
@@ -182,25 +184,33 @@ result = fit(
 )
 ```
 
-Fixed-width Poisson fits use three controls that the other families leave
-off by default (`Results/dde_poisson_fixed_d2_d5_r100/REPORT.md` holds the
-study behind them): `sa_burn_in=10` runs the first ten sweeps with step size
-one before the `1/t` stochastic approximation starts, so draws made from the
-initialization do not keep a lasting weight in the averaged objectives;
-`fixed_init_binarize="anchor_mixture"` reads the initial latent states off
-two-component Poisson mixtures on each column's anchor variables, which
+Fixed-width Poisson and Bernoulli fits use controls that the Normal family
+leaves off by default (`Results/dde_poisson_fixed_recon/REPORT.md` and
+`Results/bernoulli_fixed_recon/REPORT.md` hold the studies behind them):
+`sa_burn_in=10` runs the first ten sweeps with step size one before the `1/t`
+stochastic approximation starts, so draws made from the initialization do not
+keep a lasting weight in the averaged objectives; `fixed_init_binarize` reads
+the initial latent states off each column's anchor variables, with
+two-component Poisson mixtures (`"anchor_mixture"`, Poisson) or a two-class
+latent class model over the binary anchors (`"anchor_lca"`, Bernoulli), which
 recovers the column prevalence that thresholding the projected working
 response at zero cannot (a rare latent column otherwise starts at about 50 %
-and drifts into an always-on, intercept-absorbing solution); and
-`fixed_warm_start="layerwise"` estimates the observed layer first with a flat
-latent prior, then the deeper layers as a Bernoulli DDE on the resulting
-latent states, and only then runs the full SAEM.  The observed-layer M-step
-solves each row's TLP problem on its active support with a KKT screening of
-the zero coordinates (`fixed_observed_solver="active_set"`; `"rowwise"` is the
-dense per-row L-BFGS-B, same objective, far slower for wide layers).  Pass
-`sa_burn_in=0, fixed_init_binarize="projection", fixed_warm_start="none",
-fixed_observed_solver="rowwise"` for the plain MATLAB-style kernel;
-`result.diagnostics["warm_start"]` records the stage iterations.
+and drifts into an always-on, intercept-absorbing solution); and, for Poisson
+only, `fixed_warm_start="layerwise"` estimates the observed layer first with a
+flat latent prior, then the deeper layers as a Bernoulli DDE on the resulting
+latent states, and only then runs the full SAEM (binary data keep
+`fixed_warm_start="none"`: a flat-prior fit of one binary layer loses the
+layers above it).  In the Bernoulli D=2..4 paper design the burn-in and the
+anchor initialization together lift the layer-2 graph accuracy at D=3 from
+0.67-0.71 to 0.79-0.89 and halve the deep-layer coefficient RMSE, with the
+same cost per fit.  The Poisson observed-layer M-step solves each row's TLP
+problem on its active support with a KKT screening of the zero coordinates
+(`fixed_observed_solver="active_set"`; `"rowwise"` is the dense per-row
+L-BFGS-B, same objective, far slower for wide layers).  Pass `sa_burn_in=0,
+fixed_init_binarize="projection", fixed_warm_start="none"` (and
+`fixed_observed_solver="rowwise"` for Poisson) for the plain MATLAB-style
+kernel; `result.diagnostics["warm_start"]` records the Poisson stage
+iterations.
 
 Poisson CSP uses the same maximum-width initialization and cumulative
 shrinkage state as the other parametric families. Its observed M-step solves

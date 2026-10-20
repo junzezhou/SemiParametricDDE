@@ -23,6 +23,12 @@ Outputs are checkpointed under ``results/bernoulli_fixed_tau03_rmse_tol005``:
 
 Re-running the same command resumes from completed replicate rows. Pass
 ``--no-resume`` to replace an existing run.
+
+The fixed-kernel controls ``--sa-burn-in``, ``--binarize`` and
+``--warm-start`` override the package defaults for ablations (``sa_burn_in``,
+``fixed_init_binarize`` and ``fixed_warm_start`` of :func:`dde.fit`); the
+values used are recorded per replicate.  The deep-layer check behind the
+Bernoulli defaults is ``Results/bernoulli_fixed_recon/REPORT.md``.
 """
 
 from __future__ import annotations
@@ -90,7 +96,8 @@ PAPER_D2_SAEM = {
 
 RAW_FIELDS = [
     "scenario", "D", "J", "K_list", "N", "replicate", "data_seed",
-    "fit_seed", "penalty", "tau", "C", "tol", "max_iter", "status",
+    "fit_seed", "penalty", "tau", "C", "tol", "max_iter", "sa_burn_in",
+    "fixed_init_binarize", "fixed_warm_start", "status",
     "error", "finite", "iterations", "hit_iteration_limit", "seconds",
     "graph_accuracy", "sensitivity", "specificity", "false_positive_rate",
     "false_negative_rate", "true_positive", "true_negative", "false_positive",
@@ -321,6 +328,18 @@ def run_one(task: tuple) -> dict:
         "C": settings["C"],
         "tol": tolerance,
         "max_iter": settings["max_iter"],
+        "sa_burn_in": "" if settings["sa_burn_in"] is None else settings["sa_burn_in"],
+        "fixed_init_binarize": settings["binarize"] or "",
+        "fixed_warm_start": settings["warm_start"] or "",
+    }
+    kernel_options = {
+        key: value
+        for key, value in (
+            ("sa_burn_in", settings["sa_burn_in"]),
+            ("fixed_init_binarize", settings["binarize"]),
+            ("fixed_warm_start", settings["warm_start"]),
+        )
+        if value is not None
     }
     started = time.perf_counter()
     try:
@@ -342,7 +361,10 @@ def run_one(task: tuple) -> dict:
                 initialize="data",
                 epsilon=settings["epsilon"],
                 verbose=False,
+                **kernel_options,
             )
+        for key in ("sa_burn_in", "fixed_init_binarize", "fixed_warm_start"):
+            common[key] = result.diagnostics[key]
         metrics = calculate_metrics(
             result.prop, result.B_list, result.A_list, scenario, A_true, tau
         )
@@ -540,6 +562,19 @@ def parse_args():
         help="Fixed TLP fitting and graph-scoring threshold (default: 0.3).",
     )
     parser.add_argument("--epsilon", type=float, default=1e-4)
+    parser.add_argument(
+        "--sa-burn-in", type=int, default=None,
+        help="Unit-step SAEM burn-in sweeps (default: the package default).",
+    )
+    parser.add_argument(
+        "--binarize", choices=["projection", "anchor_lca"], default=None,
+        help="Initial latent-state rule (default: the package default).",
+    )
+    parser.add_argument(
+        "--warm-start", choices=["none", "layerwise"], default=None,
+        help="Layer-wise warm start (default: the package default; "
+        "'layerwise' hurts binary data and is kept for ablations only).",
+    )
     parser.add_argument("--base-seed", type=int, default=20260901)
     parser.add_argument(
         "--output-dir", type=Path,
@@ -579,6 +614,19 @@ def main():
             "Existing recovery rows use incompatible tol, max_iter, C, or tau; "
             "select a new output directory or pass --no-resume."
         )
+    requested_options = {
+        "sa_burn_in": args.sa_burn_in,
+        "fixed_init_binarize": args.binarize,
+        "fixed_warm_start": args.warm_start,
+    }
+    for key, value in requested_options.items():
+        if value is None:
+            continue
+        if any(row.get(key, "") not in ("", str(value)) for row in rows):
+            raise ValueError(
+                f"Existing recovery rows use a different {key}; "
+                "select a new output directory or pass --no-resume."
+            )
     completed = {
         (row["scenario"], int(row["N"]), int(row["replicate"])) for row in rows
     }
@@ -589,6 +637,9 @@ def main():
         "tau": args.tau,
         "epsilon": args.epsilon,
         "base_seed": args.base_seed,
+        "sa_burn_in": args.sa_burn_in,
+        "binarize": args.binarize,
+        "warm_start": args.warm_start,
     }
     tasks = []
     for key in args.scenarios:
@@ -657,6 +708,7 @@ def main():
             "tol_definition": "postprocessed parameter-update RMSE",
             "family": "Bernoulli",
             "dimension_method": "fixed",
+            "kernel_options": "package defaults unless --sa-burn-in/--binarize/--warm-start are given; the values used are in replicates.csv",
         },
         "metrics": {
             "graph_accuracy": "Entrywise accuracy over all slope support matrices after bottom-up Hungarian alignment.",

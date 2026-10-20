@@ -1161,6 +1161,7 @@ def test_public_fixed_bernoulli_matches_direct_kernel_with_provided_state():
         C=common["C"],
         tol=common["tol"],
         max_it=common["max_iter"],
+        sa_burn_in=0,  # the direct kernel call runs the plain 1/t schedule
         verbose=False,
     )
 

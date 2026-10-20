@@ -355,22 +355,28 @@ def fit_parametric_dde(
     Normal family never burns in).
 
     Fixed-width fits take three further controls, with Poisson defaults
-    chosen by the D=2..5 recovery study of ``Results/dde_poisson_fixed_*``:
-    ``sa_burn_in`` (default 10 for Poisson, 0 otherwise) runs that many
-    initial sweeps with step size one before the ``1/t`` stochastic
-    approximation starts, so draws made from the initialization do not keep
-    a lasting weight in the averaged objectives; ``fixed_init_binarize``
-    (default ``"anchor_mixture"`` for Poisson, ``"projection"`` otherwise)
-    reads the initial latent states off two-component Poisson mixtures on
-    each column's anchor variables instead of thresholding the projected
-    working response at zero, which otherwise assigns about half of the
-    observations to every latent column and starts rare columns at the
-    wrong prevalence; ``fixed_warm_start`` (default ``"layerwise"`` for
-    Poisson with ``D >= 2``, ``"none"`` otherwise) estimates the observed
-    layer first with a flat latent prior, then the deeper layers as a
-    Bernoulli DDE on the resulting latent states, and only then runs the
-    full SAEM from the assembled state.  The warm start is skipped when a
-    full state (``prop_in``, ``B_list_in``, ``A_list_in``) is supplied.
+    chosen by the D=2..5 recovery study of ``Results/dde_poisson_fixed_*``
+    and Bernoulli defaults by ``Results/bernoulli_fixed_recon/REPORT.md``:
+    ``sa_burn_in`` (default 10 for Poisson and Bernoulli, 0 for Normal) runs
+    that many initial sweeps with step size one before the ``1/t``
+    stochastic approximation starts, so draws made from the initialization
+    do not keep a lasting weight in the averaged objectives;
+    ``fixed_init_binarize`` (default ``"anchor_mixture"`` for Poisson,
+    ``"anchor_lca"`` for Bernoulli, ``"projection"`` for Normal) reads the
+    initial latent states off each column's anchor variables (two-component
+    Poisson mixtures, or a two-class latent class model over binary
+    anchors) instead of thresholding the projected working response at
+    zero, which otherwise assigns about half of the observations to every
+    latent column and starts rare columns at the wrong prevalence;
+    ``fixed_warm_start`` (default ``"layerwise"`` for Poisson with
+    ``D >= 2``, ``"none"`` otherwise) estimates the observed layer first
+    with a flat latent prior, then the deeper layers as a Bernoulli DDE on
+    the resulting latent states, and only then runs the full SAEM from the
+    assembled state.  The warm start stays off for Bernoulli data, where a
+    flat-prior fit of one binary layer loses the layers above it.  It is
+    skipped when a full state (``prop_in``, ``B_list_in``, ``A_list_in``)
+    is supplied; the burn-in still applies to a supplied state (pass
+    ``sa_burn_in=0`` for the plain MATLAB-style schedule).
 
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
@@ -449,21 +455,26 @@ def fit_parametric_dde(
         raise ValueError("max_it must be a positive integer.")
 
     is_poisson = family_adapter.key == "poisson"
+    is_bernoulli = family_adapter.key == "bernoulli"
     if sa_burn_in is None:
-        sa_burn_in = 10 if (is_poisson and method == "fixed") else 0
+        sa_burn_in = 10 if ((is_poisson or is_bernoulli) and method == "fixed") else 0
     sa_burn_in = int(sa_burn_in)
     if sa_burn_in < 0:
         raise ValueError("sa_burn_in must be a nonnegative integer.")
     if sa_burn_in and method != "fixed":
         raise ValueError("sa_burn_in applies to dimension_method='fixed' only.")
     if fixed_init_binarize is None:
-        fixed_init_binarize = "anchor_mixture" if (is_poisson and method == "fixed") else "projection"
+        if method == "fixed" and is_poisson:
+            fixed_init_binarize = "anchor_mixture"
+        elif method == "fixed" and is_bernoulli:
+            fixed_init_binarize = "anchor_lca"
+        else:
+            fixed_init_binarize = "projection"
     fixed_init_binarize = str(fixed_init_binarize).strip().lower()
     if fixed_init_binarize not in {"projection", "anchor_mixture", "anchor_lca"}:
         raise ValueError(
             "fixed_init_binarize must be 'projection', 'anchor_mixture' (Poisson) or 'anchor_lca' (Bernoulli)."
         )
-    is_bernoulli = family_adapter.key == "bernoulli"
     if fixed_init_binarize == "anchor_mixture" and (not is_poisson or method != "fixed"):
         raise ValueError(
             "fixed_init_binarize='anchor_mixture' is implemented for fixed-width Poisson fits only."
