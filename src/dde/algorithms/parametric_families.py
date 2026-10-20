@@ -168,6 +168,7 @@ def _solve_poisson_tlp_active_set(
     max_iter=50,
     max_support=12,
     max_added=4,
+    newton_screen=True,
 ):
     """Row-wise TLP Poisson M-step restricted to each row's active support.
 
@@ -240,7 +241,10 @@ def _solve_poisson_tlp_active_set(
             slope_grad = gradient_full[1:]
             excess = np.abs(slope_grad) - penalty
             newton_step = excess / np.maximum(curvature_full[1:], 1e-12)
-            violation = np.where(excess > 0.0, newton_step - float(tau), -np.inf)
+            if newton_screen:
+                violation = np.where(excess > 0.0, newton_step - float(tau), -np.inf)
+            else:
+                violation = excess.copy()
             violation[~inactive] = -np.inf
             # a zero coordinate must also be able to move inside its bounds
             lower = np.array([b[0] for b in bounds[1:]])
@@ -1168,17 +1172,26 @@ class PoissonFamilyAdapter:
         del dispersion, depth, response_cache
         accumulator.update(X, A_samples, iteration)
         bounds = self.fixed_latent_bounds(B_start.shape[1], bound_val)
-        solver = str(observed_solver or "active_set").strip().lower()
+        solver = str(observed_solver or "rowwise").strip().lower()
+        if solver == "hybrid":
+            # dense row-wise steps while the step size is one (burn-in,
+            # single-draw objective), active set once the averaging starts
+            solver = "rowwise" if int(iteration) <= 1 else "active_set"
         if solver == "active_set":
             B_update = _solve_poisson_tlp_active_set(
                 accumulator, B_start, penalty, tau, bounds
+            )
+        elif solver == "active_set_wide":
+            B_update = _solve_poisson_tlp_active_set(
+                accumulator, B_start, penalty, tau, bounds,
+                max_support=16, max_added=8, newton_screen=False,
             )
         elif solver == "rowwise":
             B_update = _solve_poisson_tlp_rowwise(
                 accumulator, B_start, penalty, tau, bounds, max_iter=10
             )
         else:
-            raise ValueError("Poisson observed_solver must be 'active_set' or 'rowwise'.")
+            raise ValueError("Poisson observed_solver must be 'active_set', 'rowwise', 'hybrid' or 'active_set_wide'.")
         return B_update, None
 
     def csp_mstep(
