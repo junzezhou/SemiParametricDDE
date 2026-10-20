@@ -377,6 +377,14 @@ def fit_parametric_dde(
     skipped when a full state (``prop_in``, ``B_list_in``, ``A_list_in``)
     is supplied; the burn-in still applies to a supplied state (pass
     ``sa_burn_in=0`` for the plain MATLAB-style schedule).
+    ``fixed_observed_solver`` (Poisson, default ``"rowwise"``: the MATLAB
+    per-row L-BFGS-B with ten steps on the stochastic-approximation
+    objective) also offers ``"active_set"`` (exact solve on each row's
+    support with KKT screening), ``"hybrid"`` (row-wise during the burn-in,
+    active set afterwards) and ``"active_set_wide"``; on the D=4 design the
+    exact variants lose observed-layer accuracy (layer-1 RMSE 0.12 versus
+    0.07 at N=16000), so they are kept for wide layers where the dense
+    solve is too slow.
 
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
@@ -487,8 +495,8 @@ def fit_parametric_dde(
         fixed_observed_solver = str(fixed_observed_solver).strip().lower()
         if not is_poisson or method != "fixed":
             raise ValueError("fixed_observed_solver is a fixed-width Poisson option.")
-        if fixed_observed_solver not in {"active_set", "rowwise"}:
-            raise ValueError("fixed_observed_solver must be 'active_set' or 'rowwise'.")
+        if fixed_observed_solver not in {"active_set", "rowwise", "hybrid", "active_set_wide"}:
+            raise ValueError("fixed_observed_solver must be 'active_set', 'rowwise', 'hybrid' or 'active_set_wide'.")
     if fixed_warm_start is None:
         fixed_warm_start = "layerwise" if (is_poisson and method == "fixed" and D >= 2) else "none"
     if fixed_warm_start == "layerwise" and family_adapter.key == "normal":
@@ -702,7 +710,7 @@ def fit_parametric_dde(
                 fixed_warm_start if initialization != "provided" else "none"
             ),
             "fixed_observed_solver": (
-                (fixed_observed_solver or "active_set") if is_poisson else "family"
+                (fixed_observed_solver or "rowwise") if is_poisson else "family"
             ),
         }
         if warm_start_diagnostics is not None:

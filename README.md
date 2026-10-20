@@ -203,14 +203,15 @@ latent states, and only then runs the full SAEM (binary data keep
 layers above it).  In the Bernoulli D=2..4 paper design the burn-in and the
 anchor initialization together lift the layer-2 graph accuracy at D=3 from
 0.67-0.71 to 0.79-0.89 and halve the deep-layer coefficient RMSE, with the
-same cost per fit.  The Poisson observed-layer M-step solves each row's TLP
-problem on its active support with a KKT screening of the zero coordinates
-(`fixed_observed_solver="active_set"`; `"rowwise"` is the dense per-row
-L-BFGS-B, same objective, far slower for wide layers).  Pass `sa_burn_in=0,
-fixed_init_binarize="projection", fixed_warm_start="none"` (and
-`fixed_observed_solver="rowwise"` for Poisson) for the plain MATLAB-style
-kernel; `result.diagnostics["warm_start"]` records the Poisson stage
-iterations.
+same cost per fit.  The Poisson observed-layer M-step keeps the
+MATLAB per-row L-BFGS-B (`fixed_observed_solver="rowwise"`); `"active_set"`
+solves each row's TLP problem exactly on its support with a KKT screening of
+the zero coordinates and `"hybrid"` uses it after the burn-in only; both are
+cheaper for very wide layers but lose observed-layer accuracy on the D=4
+design, so they are options rather than defaults.  Pass `sa_burn_in=0,
+fixed_init_binarize="projection", fixed_warm_start="none"` for the plain
+MATLAB-style kernel; `result.diagnostics["warm_start"]` records the Poisson
+stage iterations.
 
 Poisson CSP uses the same maximum-width initialization and cumulative
 shrinkage state as the other parametric families. Its observed M-step solves

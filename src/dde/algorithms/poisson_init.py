@@ -114,6 +114,28 @@ def _two_component_poisson_mixture(x, *, max_iter=200, tol=1e-7):
     return pi, lam0, lam1
 
 
+def _strong_anchors(loadings, *, relative=0.4, max_anchors=6, min_anchors=2):
+    """Indices of a column's strongest positive loadings.
+
+    The varimax loadings of a wide layer keep many small positive entries
+    after the double-SVD threshold (a median of 136 per column for
+    K_1 = 162, against three true children), so only loadings at least
+    ``relative`` times the column maximum are used as anchors, capped at
+    ``max_anchors`` and with at least ``min_anchors`` by loading size.
+    """
+    loadings = np.asarray(loadings, dtype=float)
+    order = np.argsort(-loadings)
+    top = loadings[order[0]]
+    if top <= 0.0:
+        order = np.argsort(-np.abs(loadings))
+        return order[:min_anchors]
+    keep = order[loadings[order] >= relative * top]
+    keep = keep[:max_anchors]
+    if keep.size < min_anchors:
+        keep = order[:min_anchors]
+    return keep
+
+
 def _anchor_mixture_binarize(counts, B_estimate):
     """Classify every latent column from its positive-loading anchor variables.
 
@@ -135,9 +157,7 @@ def _anchor_mixture_binarize(counts, B_estimate):
     parent = np.zeros((N, K), dtype=np.uint8)
     prevalence = np.zeros(K, dtype=float)
     for k in range(K):
-        anchors = np.flatnonzero(B_estimate[:, k] > 0.0)
-        if anchors.size == 0:
-            anchors = np.array([int(np.argmax(np.abs(B_estimate[:, k])))])
+        anchors = _strong_anchors(B_estimate[:, k])
         logit = np.zeros(N, dtype=float)
         pis = []
         for j in anchors:
