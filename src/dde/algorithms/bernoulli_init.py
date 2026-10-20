@@ -102,6 +102,21 @@ def _two_class_latent_class_model(Y, *, max_iter=200, tol=1e-7):
     return resp, pi
 
 
+def _strong_anchors(loadings, *, relative=0.4, max_anchors=6, min_anchors=2):
+    """Indices of a column's strongest positive loadings (see poisson_init)."""
+    loadings = np.asarray(loadings, dtype=float)
+    order = np.argsort(-loadings)
+    top = loadings[order[0]]
+    if top <= 0.0:
+        order = np.argsort(-np.abs(loadings))
+        return order[:min_anchors]
+    keep = order[loadings[order] >= relative * top]
+    keep = keep[:max_anchors]
+    if keep.size < min_anchors:
+        keep = order[:min_anchors]
+    return keep
+
+
 def _anchor_lca_binarize(children, B_estimate):
     """Classify every latent column from its positive-loading anchor children.
 
@@ -118,9 +133,7 @@ def _anchor_lca_binarize(children, B_estimate):
     parent = np.zeros((N, K), dtype=np.uint8)
     prevalence = np.zeros(K, dtype=float)
     for k in range(K):
-        anchors = np.flatnonzero(B_estimate[:, k] > 0.0)
-        if anchors.size < 2:
-            anchors = np.argsort(-B_estimate[:, k])[:2]
+        anchors = _strong_anchors(B_estimate[:, k])
         resp, pi = _two_class_latent_class_model(children[:, anchors])
         parent[:, k] = resp > 0.5
         prevalence[k] = pi
