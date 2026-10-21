@@ -197,3 +197,25 @@ def test_staged_schedule_rejects_unpaired_oracle_lists():
             Y, X0, prop, B_init, gamma, [1.0, 1.0], 0.3, A_init, 0.01, 1,
             schedule="bogus", verbose=False,
         )
+
+
+def test_sparse_normal_gibbs_matches_dense_fixed_seed_sweep():
+    """The sparse observed-coordinate update only skips zero-slope children."""
+    from dde.algorithms.parametric_families import NORMAL_FAMILY
+    from dde.algorithms.semi_saem import _sample_latent_layers_parametric
+
+    X, A_true, prop, B_list, _, gamma = _design((18, 6, 2), 21, 300)
+    A_list = [A.astype(np.uint8) for A in A_true]
+    runs = []
+    for sparse in (True, False):
+        runs.append(
+            _sample_latent_layers_parametric(
+                X, prop, B_list, gamma, A_list, 3,
+                family=NORMAL_FAMILY, rng=np.random.default_rng(5),
+                sparse_bernoulli=sparse,
+            )
+        )
+    (sparse_samples, sparse_top), (dense_samples, dense_top) = runs
+    for sparse_sample, dense_sample in zip(sparse_samples, dense_samples):
+        np.testing.assert_array_equal(sparse_sample, dense_sample)
+    np.testing.assert_allclose(sparse_top, dense_top, rtol=0.0, atol=1e-12)

@@ -221,6 +221,45 @@ fixed_init_binarize="projection", fixed_warm_start="none"` for the plain
 MATLAB-style kernel; `result.diagnostics["warm_start"]` records the
 warm-start stage iterations.
 
+Fixed-width SemiDDE fits a Normal DDE to pseudo-observations `X = g(Y)` and
+re-estimates the monotone transformations between SAEM fits
+(`Results/semidde_fixed_recon/REPORT.md` holds the study behind the
+defaults):
+
+```python
+result = fit(
+    Y_continuous,
+    model="SemiDDE",
+    D=3,
+    dimension_method="fixed",
+    K_list=[18, 6, 2],
+    pen_list=[N ** 0.25] * 3,
+    tau=0.3,
+    C=1,
+    tol=0.01,
+)
+```
+
+Each parent class `s` of `Y_j` (the nonzero slopes of row `j` of `B_1`)
+gives its own estimate `mu_j(s) + sigma_j Phi^{-1}(F_hat_s(y))`; the default
+`g_estimator="precision"` averages them pointwise with weights equal to
+their asymptotic precision at the current pseudo-observation, projects the
+result onto increasing functions of `Y_j` and standardizes it.
+`g_estimator="average"` is the manuscript's estimator
+`sum_s pi(s) Phi^{-1}(F_hat_s(y))`, which needs every class's CDF where the
+class has no data and keeps an error that does not shrink with N.  The
+default `schedule="staged"` alternates a one-layer SAEM of the observed
+layer with the transformation update until the relative change of `X` is
+below `g_tol=0.002` (at most `max_outer_iter=50` updates), then runs the
+Normal fixed kernel's layer-wise warm start and a full SAEM on the final
+`X`; `schedule="nested"` keeps the manuscript's outer loop of full inner
+SAEM fits.  The initializer uses the anchor-mixture binarization
+(`init_binarize`) and the SAEM fits use `sa_burn_in=10`, as for the Normal
+family.  `result.diagnostics` records `g_iterations`, `g_converged`,
+`g_relative_history` and the warm-start iterations.  Pass
+`schedule="nested", g_estimator="average", sa_burn_in=0,
+init_binarize="projection", g_tol=0.01` for the earlier kernel.
+
 Poisson CSP uses the same maximum-width initialization and cumulative
 shrinkage state as the other parametric families. Its observed M-step solves
 the tempered Poisson likelihood with CSP-weighted L1 penalties by bounded

@@ -891,6 +891,73 @@ def _sparse_poisson_coordinate_probability(
     )
 
 
+def _sparse_normal_coordinate_probability(
+    X,
+    prop,
+    B_list,
+    gamma,
+    A_list,
+    coordinate,
+    child_eta,
+    active_children,
+    *,
+    row_chunk_size=2048,
+    eligible_widths=None,
+    temperature=1.0,
+):
+    """Evaluate a Normal observed-coordinate update on nonzero slopes.
+
+    Children with a zero slope contribute nothing to the coordinate's
+    log-likelihood odds, so only the active columns of ``X`` are read; the
+    dense update costs O(N J) per coordinate (D=5: J = 486 children for every
+    one of the 162 first-layer coordinates).
+    """
+    X = np.asarray(X, dtype=float)
+    state = np.asarray(A_list[0], dtype=np.uint8)
+    coefficient = np.asarray(B_list[0], dtype=float)
+    gamma = np.asarray(gamma, dtype=float)
+    active_children = np.asarray(active_children, dtype=np.intp)
+    if active_children.ndim != 1:
+        raise ValueError("Active Normal child indices must be one-dimensional.")
+
+    if active_children.size:
+        slope = coefficient[active_children, coordinate + 1]
+        eta_zero_active = (
+            np.asarray(child_eta[:, active_children], dtype=float)
+            - state[:, coordinate, None] * slope[None, :]
+        )
+        if row_chunk_size is None:
+            row_chunk_size = X.shape[0]
+        row_chunk_size = max(1, int(row_chunk_size))
+        likelihood_logit = np.empty(X.shape[0], dtype=float)
+        for start in range(0, X.shape[0], row_chunk_size):
+            stop = min(start + row_chunk_size, X.shape[0])
+            likelihood_logit[start:stop] = (
+                NORMAL_FAMILY.observed_coordinate_loglik_delta(
+                    X[start:stop][:, active_children],
+                    eta_zero_active[start:stop],
+                    slope,
+                    gamma[active_children],
+                )
+            )
+    else:
+        eta_zero_active = np.empty((state.shape[0], 0), dtype=float)
+        likelihood_logit = np.zeros(state.shape[0], dtype=float)
+
+    prior_logit = _coordinate_prior_logit(
+        prop,
+        B_list,
+        A_list,
+        0,
+        coordinate,
+        eligible_widths=eligible_widths,
+    )
+    return (
+        expit(float(temperature) * (prior_logit + likelihood_logit)),
+        eta_zero_active,
+    )
+
+
 def _sparse_observed_child_linear_cache(X, coefficient, active_children):
     """Cache ``X @ slope`` for the observed Bernoulli Gibbs layer."""
     X = np.asarray(X)
@@ -1060,8 +1127,15 @@ def _sample_latent_layers_parametric(
     state = [A.copy() for A in initial_state]
     for layer, width in enumerate(eligible_widths):
         state[layer][:, width:] = 0
+    # MARK: Original sparse coordinate updates covered the Bernoulli and
+    # Poisson families only; Normal fits evaluated every observed child for
+    # every first-layer coordinate.
+    # use_sparse_updates = (
+    #     bool(sparse_bernoulli) and family.key in {"bernoulli", "poisson"}
+    # )
     use_sparse_updates = (
-        bool(sparse_bernoulli) and family.key in {"bernoulli", "poisson"}
+        bool(sparse_bernoulli)
+        and family.key in {"bernoulli", "poisson", "normal"}
     )
     active_children_by_layer = None
     observed_child_linear = None
@@ -1114,6 +1188,22 @@ def _sample_latent_layers_parametric(
                                 X,
                                 prop,
                                 B_list,
+                                state,
+                                coordinate,
+                                child_eta,
+                                active_children,
+                                row_chunk_size=row_chunk_size,
+                                eligible_widths=eligible_widths,
+                                temperature=temperature,
+                            )
+                        )
+                    elif layer == 0 and family.key == "normal":
+                        probability, eta_zero_active = (
+                            _sparse_normal_coordinate_probability(
+                                X,
+                                prop,
+                                B_list,
+                                dispersion,
                                 state,
                                 coordinate,
                                 child_eta,
@@ -1910,42 +2000,43 @@ def _precision_weighted_g_estimate(Y, X_ref, B1, gamma, A1, *, max_parents=20):
     gamma = np.asarray(gamma, dtype=float).reshape(-1)
     A1 = np.asarray(A1).astype(np.uint8)
     N, J = Y.shape
+    rows = np.arange(N)
     g_est = np.empty((N, J), dtype=float)
     for j in range(J):
         parents = np.flatnonzero(B1[j, 1:] != 0.0)
         if parents.size > max_parents:
             parents = parents[np.argsort(-np.abs(B1[j, 1 + parents]))[:max_parents]]
-        if parents.size:
-            classes, labels = np.unique(A1[:, parents], axis=0, return_inverse=True)
-            labels = np.asarray(labels).reshape(-1)
-        else:
-            classes = np.zeros((1, 0), dtype=np.uint8)
-            labels = np.zeros(N, dtype=np.int64)
+        bits = np.arange(parents.size, dtype=np.int64)
+        codes = A1[:, parents].astype(np.int64) @ (np.int64(1) << bits)
+        observed_codes, labels = np.unique(codes, return_inverse=True)
+        classes = ((observed_codes[:, None] >> bits) & 1).astype(float)
         sigma = float(np.sqrt(max(gamma[j], 1e-12)))
-        means = B1[j, 0] + classes.astype(float) @ B1[j, 1 + parents]
+        means = B1[j, 0] + classes @ B1[j, 1 + parents]
+        # Everything below runs in the sorted order of Y_j: a class's
+        # cumulative membership count is its empirical CDF, minus one half
+        # at its own members (mid-rank).
         order = np.argsort(Y[:, j], kind="mergesort")
-        ranks = np.empty(N, dtype=np.int64)
-        ranks[order] = np.arange(N, dtype=np.int64)
-        estimates = np.empty((classes.shape[0], N), dtype=float)
-        log_precision = np.empty((classes.shape[0], N), dtype=float)
-        for c in range(classes.shape[0]):
-            member = labels == c
-            n_c = int(np.count_nonzero(member))
-            counts = np.searchsorted(
-                np.sort(ranks[member]), ranks, side="right"
-            ).astype(float)
-            counts[member] -= 0.5
-            cdf = np.clip(counts / n_c, 0.5 / n_c, 1.0 - 0.5 / n_c)
-            estimates[c] = means[c] + sigma * ndtri(cdf)
-            q = (X_ref[:, j] - means[c]) / sigma
-            log_precision[c] = np.log(n_c) - q * q - log_ndtr(q) - log_ndtr(-q)
+        membership = np.zeros((observed_codes.size, N), dtype=float)
+        membership[np.asarray(labels).reshape(-1)[order], rows] = 1.0
+        class_sizes = np.sum(membership, axis=1, keepdims=True)
+        cdf = np.clip(
+            (np.cumsum(membership, axis=1) - 0.5 * membership) / class_sizes,
+            0.5 / class_sizes,
+            1.0 - 0.5 / class_sizes,
+        )
+        estimates = means[:, None] + sigma * ndtri(cdf)
+        q = (X_ref[order, j][None, :] - means[:, None]) / sigma
+        log_precision = np.log(class_sizes) - q * q - log_ndtr(q) - log_ndtr(-q)
         log_precision -= np.max(log_precision, axis=0, keepdims=True)
         weights = np.exp(log_precision)
-        g_col = np.sum(weights * estimates, axis=0) / np.sum(weights, axis=0)
         # Weights that vary with y can bend the average downwards where two
         # class estimates disagree; the L2 projection onto increasing
         # functions of Y_j is closer to the (increasing) truth.
-        g_col[order] = isotonic_regression(g_col[order])
+        g_sorted = isotonic_regression(
+            np.sum(weights * estimates, axis=0) / np.sum(weights, axis=0)
+        )
+        g_col = np.empty(N, dtype=float)
+        g_col[order] = g_sorted
         g_est[:, j] = (g_col - np.mean(g_col)) / (np.std(g_col) + 1e-12)
     return g_est
 

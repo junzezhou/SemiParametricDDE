@@ -923,9 +923,7 @@ class NormalFamilyAdapter:
             )
 
         B_update = np.zeros_like(B_start)
-        gamma_update = np.zeros(J)
         for j in range(J):
-            Xj = X[:, j]
 
             def obj(x, __j=j, __pen=penalty):
                 value, grad = accumulator.value_and_grad(__j, x)
@@ -945,8 +943,12 @@ class NormalFamilyAdapter:
                 options={"maxiter": 10},
             )
             B_update[j, :] = res.x
-            eta = np.tensordot(A_samples, res.x, axes=([1], [0]))
-            gamma_update[j] = np.sum((Xj[:, None] - eta) ** 2) / (N * C)
+            # MARK: Original variance update formed each row's (N, C) mean
+            # inside the loop; the residuals are now computed once for all rows.
+            # eta = np.tensordot(A_samples, res.x, axes=([1], [0]))
+            # gamma_update[j] = np.sum((Xj[:, None] - eta) ** 2) / (N * C)
+        eta = np.tensordot(A_samples, B_update, axes=([1], [1]))
+        gamma_update = np.sum((X[:, None, :] - eta) ** 2, axis=(0, 1)) / (N * C)
         return B_update, gamma_update
 
     def csp_mstep(
