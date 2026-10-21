@@ -1,12 +1,19 @@
 """Run the fixed-width SemiDDE simulation used by the example notebook.
 
-The defaults reproduce the settings in ``examples/02_simulation_SemiDDE`` for
-the D=2 and D=3 designs:
+The designs follow ``examples/02_simulation_SemiDDE``:
 
-* widths ``(6, 2)`` and ``(18, 6, 2)`` with ``J=3*K_1``;
+* widths ``(6, 2)``, ``(18, 6, 2)``, ``(54, 18, 6, 2)``, ``(162, 54, 18, 6, 2)``
+  with ``J=3*K_1``;
 * log-normal observed margins, ``Y = exp(X)``;
-* ``lambda_d = N**(1/4)``, ``tau=0.3``, ``tol=K_D/2``;
-* one Monte Carlo draw, at most 200 outer iterations and 50 inner iterations;
+* ``lambda_d = N**(1/4)``, ``tau=0.3``, ``tol=0.01`` (manuscript setting; the
+  notebook's ``tol=K_D/2`` stops every inner SAEM after one sweep because the
+  kernel compares ``tol`` with the RMS parameter change, ``--tol-kd-half``);
+* one Monte Carlo draw, at most 50 outer (transformation) iterations, 50
+  inner iterations, ``g_tol=0.002``;
+* the package's fixed-width SemiDDE defaults (staged schedule, precision
+  weighted transformation estimate, anchor-mixture initialization, burn-in
+  10); ``--schedule nested --g-estimator average --sa-burn-in 0 --binarize
+  projection --g-tol 0.01 --tol-kd-half`` reproduces the earlier kernel;
 * seeds ``150 + replicate`` for each sample size, as in the notebook.
 
 Replicate metrics are checkpointed after every completed fit, so rerunning the
@@ -80,6 +87,12 @@ RAW_FIELDS = [
     "transform_rmse",
     "layer_graph_accuracy",
     "layer_parameter_rmse",
+    "layer_parameter_rmse_full_threshold",
+    "latent_accuracy",
+    "g_iterations",
+    "g_converged",
+    "final_iterations",
+    "settings",
 ]
 
 SUMMARY_FIELDS = [
@@ -102,6 +115,9 @@ SUMMARY_FIELDS = [
     "seconds_total",
     "layer_graph_accuracy_mean",
     "layer_parameter_rmse_mean",
+    "latent_accuracy_mean",
+    "g_iterations_mean",
+    "g_converged_fraction",
 ]
 
 
@@ -119,8 +135,24 @@ def build_scenario(key: str) -> dict:
     return spec
 
 
-def _calculate_metrics(result, scenario, X_true, tau):
-    B_est = [thres(value, tau) for value in result.B_list]
+def _calculate_metrics(result, scenario, X_true, A_true, tau):
+    # MARK: Original metrics thresholded the complete coefficient matrices,
+    # intercepts included (the MATLAB reporting convention).  The D=2 design
+    # has two layer-1 intercepts below tau in magnitude (-0.212, -0.171), so
+    # the layer-1 RMSE kept an N-independent floor of about 0.025.  Slopes are
+    # thresholded as before; the intercepts are scored as fitted, as in the
+    # Normal DDE paper driver.  The old value is kept as
+    # layer_parameter_rmse_full_threshold.
+    # B_est = [thres(value, tau) for value in result.B_list]
+    B_est = []
+    for value in result.B_list:
+        estimated = np.asarray(value, dtype=float).copy()
+        estimated[:, 1:] = thres(estimated[:, 1:], tau)
+        B_est.append(estimated)
+    layer_rmse_full_threshold = [
+        float(math.sqrt(np.mean((thres(value, tau) - truth) ** 2)))
+        for value, truth in zip(result.B_list, scenario["B_list"])
+    ]
     layer_accuracy = []
     correct = 0
     entries = 0
@@ -153,14 +185,22 @@ def _calculate_metrics(result, scenario, X_true, tau):
         and np.all(np.isfinite(result.prop))
         and np.all(np.isfinite(result.gamma))
     )
+    # Oracle initialization aligns the latent columns with the truth, so the
+    # per-layer state accuracy needs no column matching.
+    latent_accuracy = [
+        float(np.mean(np.asarray(estimated) == np.asarray(truth)))
+        for estimated, truth in zip(result.A_list, A_true)
+    ]
     return {
         "finite": finite,
+        "latent_accuracy": json.dumps(latent_accuracy),
         "graph_accuracy": float(correct / entries),
         "parameter_mse": float(parameter_mse),
         "parameter_rmse": float(math.sqrt(parameter_mse)),
         "transform_rmse": transform_rmse,
         "layer_graph_accuracy": json.dumps(layer_accuracy),
         "layer_parameter_rmse": json.dumps(layer_rmse),
+        "layer_parameter_rmse_full_threshold": json.dumps(layer_rmse_full_threshold),
     }
 
 
@@ -190,10 +230,23 @@ def _fit_one(task: tuple) -> dict:
         # The original notebook resets NumPy before both data generation and
         # fitting; retain that exact convention for comparable replicates.
         np.random.seed(seed)
-        X_true, _ = generate_X_normal(
+        X_true, A_true = generate_X_normal(
             N, scenario["prop"], scenario["B_list"], scenario["gamma"]
         )
         Y = np.exp(X_true)
+        tol = (
+            scenario["K_list"][-1] / 2
+            if args_dict["tol_kd_half"]
+            else args_dict["tol"]
+        )
+        settings = {
+            "tol": tol,
+            "g_tol": args_dict["g_tol"],
+            "schedule": args_dict["schedule"],
+            "g_estimator": args_dict["g_estimator"],
+            "sa_burn_in": args_dict["sa_burn_in"],
+            "init_binarize": args_dict["binarize"],
+        }
         with threadpool_limits(limits=1):
             result = fit(
                 Y,
@@ -206,23 +259,32 @@ def _fit_one(task: tuple) -> dict:
                 G_list_true=scenario["G_list"],
                 pen_list=[N ** 0.25] * scenario["D"],
                 tau=args_dict["tau"],
-                tol=scenario["K_list"][-1] / 2,
+                tol=tol,
                 C=1,
                 epsilon=args_dict["epsilon"],
                 max_outer_iter=max_outer_iter,
                 max_inner_iter=args_dict["max_inner_iter"],
                 g_tol=args_dict["g_tol"],
+                schedule=args_dict["schedule"],
+                g_estimator=args_dict["g_estimator"],
+                sa_burn_in=args_dict["sa_burn_in"],
+                init_binarize=args_dict["binarize"],
                 verbose=False,
             )
         metrics = _calculate_metrics(
-            result, scenario, X_true, args_dict["tau"]
+            result, scenario, X_true, A_true, args_dict["tau"]
         )
+        diagnostics = result.diagnostics
         return {
             **common,
             "status": "ok" if metrics["finite"] else "nonfinite",
             "error": "",
             "max_outer_iter_budget": max_outer_iter,
-            "iterations": int(result.diagnostics["iterations"]),
+            "iterations": int(diagnostics["iterations"]),
+            "g_iterations": int(diagnostics["g_iterations"]),
+            "g_converged": bool(diagnostics["g_converged"]),
+            "final_iterations": diagnostics["final_iterations"],
+            "settings": json.dumps(settings),
             "seconds": time.perf_counter() - started,
             **metrics,
         }
@@ -295,6 +357,18 @@ def summarize(rows: list[dict], scenarios: list[str], sample_sizes, replicates):
                 [json.loads(row["layer_parameter_rmse"]) for row in successful
                  if row.get("layer_parameter_rmse")]
             )
+            latent = np.asarray(
+                [json.loads(row["latent_accuracy"]) for row in successful
+                 if row.get("latent_accuracy")]
+            )
+            g_iterations = [
+                float(row["g_iterations"]) for row in successful
+                if row.get("g_iterations")
+            ]
+            g_converged = [
+                row["g_converged"] == "True" for row in successful
+                if row.get("g_converged")
+            ]
             summaries.append(
                 {
                     **base,
@@ -322,6 +396,15 @@ def summarize(rows: list[dict], scenarios: list[str], sample_sizes, replicates):
                     "layer_parameter_rmse_mean": json.dumps(
                         np.mean(layer_rmse, axis=0).tolist() if layer_rmse.size else []
                     ),
+                    "latent_accuracy_mean": json.dumps(
+                        np.mean(latent, axis=0).tolist() if latent.size else []
+                    ),
+                    "g_iterations_mean": (
+                        float(np.mean(g_iterations)) if g_iterations else ""
+                    ),
+                    "g_converged_fraction": (
+                        float(np.mean(g_converged)) if g_converged else ""
+                    ),
                 }
             )
     return summaries
@@ -340,17 +423,26 @@ def parse_args():
     parser.add_argument("--base-seed", type=int, default=150)
     parser.add_argument("--tau", type=float, default=0.3)
     parser.add_argument("--epsilon", type=float, default=1e-4)
-    parser.add_argument("--max-outer-iter", type=int, default=200)
-    parser.add_argument("--n4000-max-outer-iter", type=int, default=100)
+    parser.add_argument("--max-outer-iter", type=int, default=50)
+    parser.add_argument("--n4000-max-outer-iter", type=int, default=50)
     parser.add_argument("--n8000-max-outer-iter", type=int, default=50)
     parser.add_argument("--n16000-max-outer-iter", type=int, default=50)
-    parser.add_argument("--g-tol", type=float, default=1e-2,
+    parser.add_argument("--g-tol", type=float, default=2e-3,
                         help="outer-loop stopping threshold on the relative change of g")
+    parser.add_argument("--tol", type=float, default=0.01,
+                        help="inner SAEM tolerance on the RMS parameter change")
+    parser.add_argument("--tol-kd-half", action="store_true",
+                        help="use the notebook's tol = K_D/2 instead of --tol")
+    parser.add_argument("--schedule", choices=["staged", "nested"], default="staged")
+    parser.add_argument("--g-estimator", choices=["precision", "average"], default="precision")
+    parser.add_argument("--sa-burn-in", type=int, default=10)
+    parser.add_argument("--binarize", choices=["anchor_mixture", "projection"],
+                        default="anchor_mixture")
     parser.add_argument("--max-inner-iter", type=int, default=50)
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/semidde_fixed_d2_d3_r100"),
+        default=Path("results/semidde_fixed_recon"),
     )
     parser.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True
@@ -395,6 +487,12 @@ def main():
         "n16000_max_outer_iter": args.n16000_max_outer_iter,
         "max_inner_iter": args.max_inner_iter,
         "g_tol": args.g_tol,
+        "tol": args.tol,
+        "tol_kd_half": args.tol_kd_half,
+        "schedule": args.schedule,
+        "g_estimator": args.g_estimator,
+        "sa_burn_in": args.sa_burn_in,
+        "binarize": args.binarize,
     }
     tasks = []
     for key in args.scenarios:
@@ -421,7 +519,11 @@ def main():
         "max_val": 4,
         "penalty": "N**(1/4) for every layer",
         "tau": args.tau,
-        "tol": "K_D/2 (=1 for both scenarios)",
+        "tol": "K_D/2" if args.tol_kd_half else args.tol,
+        "schedule": args.schedule,
+        "g_estimator": args.g_estimator,
+        "sa_burn_in": args.sa_burn_in,
+        "init_binarize": args.binarize,
         "C": 1,
         "epsilon": args.epsilon,
         "max_outer_iter_schedule": {
@@ -433,11 +535,15 @@ def main():
         "max_inner_iter": args.max_inner_iter,
         "g_tol": args.g_tol,
         "initialization": (
-            "oracle-labelled spectral initialization, matching the notebook's "
-            "Normal_init(X, K1, K_list, B_true, G_true, epsilon) call"
+            "oracle-labelled spectral initialization of the rank-Gaussianized "
+            "data (Normal_init_semi, mode='oracle'); the true deep "
+            "coefficients also label the staged schedule's deep-layer "
+            "initializer"
         ),
         "metric_definitions": {
             "graph_accuracy": "fraction of slope support entries correctly recovered after tau thresholding",
+            "layer_parameter_rmse": "RMSE of each B matrix with slopes thresholded at tau and intercepts as fitted",
+            "layer_parameter_rmse_full_threshold": "the same after thresholding the complete B matrix (MATLAB convention, earlier runs)",
             "parameter_rmse": "sqrt(mean replicate parameter MSE), matching the notebook",
         },
     }

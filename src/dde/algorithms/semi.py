@@ -50,6 +50,7 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method):
             observed_name="X_in",
             require_binary_A=True,
         )
+        kwargs.pop("init_binarize", None)
         if verbose:
             print(
                 "SemiDDE initialization: not triggered; using supplied "
@@ -76,6 +77,17 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method):
         raise ValueError("initialize must be 'data' or 'oracle'.")
 
     epsilon = float(kwargs.pop("epsilon", 1e-4))
+    if dimension_method == "fixed":
+        # The fixed kernel's deep-layer warm start also needs epsilon.
+        kwargs["epsilon"] = epsilon
+    # MARK: Original initializer thresholded the projected scores at zero for
+    # both dimension methods; the fixed-width default is now the Normal fixed
+    # kernel's anchor-mixture binarization (rare columns otherwise start near
+    # 40 % prevalence and some collapse; D=3 design, true prevalence 0.14).
+    binarize = kwargs.pop(
+        "init_binarize",
+        "anchor_mixture" if dimension_method == "fixed" else "projection",
+    )
     X_init = rank_gaussianize_columns(Y)
     if verbose:
         print(f"SemiDDE initialization: triggered using initialize='{mode}'.")
@@ -96,7 +108,13 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method):
             G_list_true,
             epsilon,
             mode="oracle",
+            binarize=binarize,
         )
+        if dimension_method == "fixed":
+            # Simulation-only labels for the deep-layer initializer of the
+            # staged schedule, as in the Normal fixed kernel's oracle mode.
+            kwargs.setdefault("B_list_true", B_list_true)
+            kwargs.setdefault("G_list_true", G_list_true)
         if dimension_method == "fixed" and kwargs.get("final_refit", False):
             kwargs.setdefault("final_refit_B_list_true", B_list_true)
             kwargs.setdefault("final_refit_G_list_true", G_list_true)
@@ -109,6 +127,7 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method):
             K_list,
             epsilon=epsilon,
             mode="data",
+            binarize=binarize,
         )
 
     kwargs.update(
@@ -140,8 +159,8 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization):
             + ", ".join(missing)
         )
 
-    X, prop, B_list, gamma, A_list, iterations = (
-        get_SAEM_semiparametricv1(Y=Y, **kwargs)
+    X, prop, B_list, gamma, A_list, iterations, kernel_diagnostics = (
+        get_SAEM_semiparametricv1(Y=Y, return_diagnostics=True, **kwargs)
     )
     return DDEResult(
         model="semi",
@@ -158,6 +177,7 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization):
             "dimension_method": "fixed",
             "initialization": initialization,
             "pseudo_observation_update": "semiparametric_g",
+            **kernel_diagnostics,
         },
         raw=(X, prop, B_list, gamma, A_list, iterations),
     )
