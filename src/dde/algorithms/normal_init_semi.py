@@ -126,6 +126,74 @@ def _normal_residual_variance(X, A, B, row_chunk_size=2048):
     return residual_sum_squares / N
 
 
+def _two_class_gaussian_mixture(Y, *, max_iter=200, tol=1e-7):
+    """Two-class Gaussian mixture with conditionally independent coordinates.
+
+    The class means are free and each coordinate keeps one variance shared by
+    both classes, the observed-layer model of a Normal DDE restricted to the
+    anchors of one latent column.  EM starts from the top 30 % of the summed
+    standardized coordinates.  Returns the responsibility of the class with
+    the larger means and that class's prevalence.
+    """
+    Y = np.asarray(Y, dtype=float)
+    N = Y.shape[0]
+    centered = Y - Y.mean(axis=0, keepdims=True)
+    scale = np.maximum(Y.std(axis=0), 1e-12)
+    score = (centered / scale).sum(axis=1)
+    resp = (score > np.quantile(score, 0.7)).astype(float)
+    variance_floor = 1e-6 * scale**2
+    pi = float(np.clip(resp.mean(), 1e-3, 1.0 - 1e-3))
+    for _ in range(max_iter):
+        weight1 = max(resp.sum(), 1e-12)
+        weight0 = max(N - resp.sum(), 1e-12)
+        mu1 = resp @ Y / weight1
+        mu0 = (1.0 - resp) @ Y / weight0
+        variance = np.maximum(
+            (resp @ (Y - mu1) ** 2 + (1.0 - resp) @ (Y - mu0) ** 2) / N,
+            variance_floor,
+        )
+        log_ratio = (
+            np.log(pi / (1.0 - pi))
+            + ((Y - mu0) ** 2 - (Y - mu1) ** 2) @ (0.5 / variance)
+        )
+        resp_new = 1.0 / (1.0 + np.exp(-np.clip(log_ratio, -50.0, 50.0)))
+        pi_new = float(np.clip(resp_new.mean(), 1e-3, 1.0 - 1e-3))
+        converged = abs(pi_new - pi) + np.mean(np.abs(resp_new - resp)) < tol
+        resp, pi = resp_new, pi_new
+        if converged:
+            break
+    if np.sum(mu1 - mu0) < 0.0:
+        resp, pi = 1.0 - resp, 1.0 - pi
+    return resp, pi
+
+
+def _anchor_gaussian_mixture_binarize(X, B_estimate):
+    """Classify every latent column from its strongest Gaussian anchors.
+
+    The projection step of the double-SVD initializer thresholds centered
+    scores at zero, which starts every latent column near 50 % prevalence;
+    a rare column (5.6 % in the D=5 paper design) then has most of its zero
+    observations mislabelled and collapses.  Here each column is read off a
+    two-class Gaussian mixture over its anchor variables (the loadings of at
+    least 0.4 times the column maximum, see ``bernoulli_init._strong_anchors``).
+    Returns the binary parent matrix and the per-column prevalence estimates.
+    """
+    from .bernoulli_init import _strong_anchors
+
+    X = np.asarray(X, dtype=float)
+    B_estimate = np.asarray(B_estimate, dtype=float)
+    N = X.shape[0]
+    K = B_estimate.shape[1]
+    parent = np.zeros((N, K), dtype=np.uint8)
+    prevalence = np.zeros(K, dtype=float)
+    for k in range(K):
+        anchors = _strong_anchors(B_estimate[:, k])
+        resp, pi = _two_class_gaussian_mixture(X[:, anchors])
+        parent[:, k] = resp > 0.5
+        prevalence[k] = pi
+    return parent, prevalence
+
+
 def initialize_binary_parent(A_prev, K_parent, epsilon=1e-4, *, binary=True):
     """Spectrally initialize one binary parent from active child states.
 
@@ -187,6 +255,7 @@ def Normal_init_semi(
     epsilon=1e-4,
     *,
     mode=None,
+    binarize="projection",
 ):
     """
     Algorithm 1 (extended): Spectral initialization for Normal-D-latent-layer DDEs
@@ -209,6 +278,15 @@ def Normal_init_semi(
               for simulation-only column alignment and initialization
               structure diagnostics. If omitted, mode is inferred from
               whether B_list and G_list are supplied.
+    binarize : {"projection", "anchor_mixture"}, optional
+              How the latent states are read off the spectral loadings.
+              "projection" thresholds the projected centered response at
+              zero in every layer (the MATLAB rule). "anchor_mixture"
+              classifies each layer-1 column with a two-class Gaussian
+              mixture over its strongest anchors and each deeper column with
+              a two-class latent class model over its anchor children
+              (``bernoulli_init._anchor_lca_binarize``), which recovers the
+              column prevalences.
 
     Returns
     -------
@@ -231,6 +309,12 @@ def Normal_init_semi(
             raise ValueError("B_list and G_list are required when mode='oracle'.")
         assert len(B_list) == D
         assert len(G_list) == D
+    binarize = str(binarize).strip().lower()
+    if binarize not in {"projection", "anchor_mixture"}:
+        raise ValueError("binarize must be 'projection' or 'anchor_mixture'.")
+    use_anchors = binarize == "anchor_mixture"
+    if use_anchors:
+        from .bernoulli_init import _anchor_lca_binarize
 
     B_list_ini = [None] * D
     A_list_ini = [None] * D
@@ -262,10 +346,14 @@ def Normal_init_semi(
             (B1_est[:, :min(K1, K1_max)] != 0) == G_list[0][:, :min(K1, K1_max)]
         )
 
-    # estimate A1 via least-squares projection (robust to rank deficiency)
-    BtB = B1_est.T @ B1_est
-    A1_est_nonbin = X_centered @ _safe_lstsq(BtB, B1_est.T).T
-    A1_est = (A1_est_nonbin > 0).astype(np.uint8)
+    if use_anchors:
+        A1_est, _ = _anchor_gaussian_mixture_binarize(X, B1_est)
+        A1_est_nonbin = None
+    else:
+        # estimate A1 via least-squares projection (robust to rank deficiency)
+        BtB = B1_est.T @ B1_est
+        A1_est_nonbin = X_centered @ _safe_lstsq(BtB, B1_est.T).T
+        A1_est = (A1_est_nonbin > 0).astype(np.uint8)
     G1_est = (B1_est != 0)
 
     # re-estimate B1 via least-squares
@@ -312,9 +400,12 @@ def Normal_init_semi(
             sign_flip[sign_flip == 0] = 1
             Bd_est = Bd_est * sign_flip
 
-            BdtBd = Bd_est.T @ Bd_est
-            Ad_est = A_inv_adj @ _safe_lstsq(BdtBd, Bd_est.T).T
-            Ad_est = (Ad_est > 0).astype(np.uint8)
+            if use_anchors:
+                Ad_est, _ = _anchor_lca_binarize(A_prev, Bd_est)
+            else:
+                BdtBd = Bd_est.T @ Bd_est
+                Ad_est = A_inv_adj @ _safe_lstsq(BdtBd, Bd_est.T).T
+                Ad_est = (Ad_est > 0).astype(np.uint8)
             Ad_centered = Ad_est - np.mean(Ad_est, axis=0, keepdims=True)
             Bd_re_est = _safe_proj(Ad_centered, A_inv_adj).T / 2
             if not use_oracle:
@@ -334,10 +425,13 @@ def Normal_init_semi(
                 # Simulation-only alignment to true columns.
                 Bd_est, _ = _permute_columns_hungarian(Bd_est, B_list[d][:, 1:])
 
-            # estimate Ad via robust projection
-            BdtBd = Bd_est.T @ Bd_est
-            Ad_est = A_inv_adj @ _safe_lstsq(BdtBd, Bd_est.T).T
-            Ad_est = (Ad_est > 0).astype(np.uint8)
+            if use_anchors:
+                Ad_est, _ = _anchor_lca_binarize(A_prev, Bd_est)
+            else:
+                # estimate Ad via robust projection
+                BdtBd = Bd_est.T @ Bd_est
+                Ad_est = A_inv_adj @ _safe_lstsq(BdtBd, Bd_est.T).T
+                Ad_est = (Ad_est > 0).astype(np.uint8)
 
             # re-estimate Bd via least-squares
             Ad_centered = Ad_est - np.mean(Ad_est, axis=0, keepdims=True)

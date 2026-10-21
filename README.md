@@ -184,34 +184,42 @@ result = fit(
 )
 ```
 
-Fixed-width Poisson and Bernoulli fits use controls that the Normal family
-leaves off by default (`Results/dde_poisson_fixed_recon/REPORT.md` and
-`Results/bernoulli_fixed_recon/REPORT.md` hold the studies behind them):
+Fixed-width fits use three controls on top of the MATLAB SAEM schedule
+(`Results/dde_poisson_fixed_recon/REPORT.md`,
+`Results/bernoulli_fixed_recon/REPORT.md` and
+`Results/dde_normal_fixed_recon/REPORT.md` hold the studies behind them):
 `sa_burn_in=10` runs the first ten sweeps with step size one before the `1/t`
 stochastic approximation starts, so draws made from the initialization do not
 keep a lasting weight in the averaged objectives; `fixed_init_binarize` reads
 the initial latent states off each column's anchor variables, with
-two-component Poisson mixtures (`"anchor_mixture"`, Poisson) or a two-class
-latent class model over the binary anchors (`"anchor_lca"`, Bernoulli), which
-recovers the column prevalence that thresholding the projected working
-response at zero cannot (a rare latent column otherwise starts at about 50 %
-and drifts into an always-on, intercept-absorbing solution); and, for Poisson
-only, `fixed_warm_start="layerwise"` estimates the observed layer first with a
-flat latent prior, then the deeper layers as a Bernoulli DDE on the resulting
-latent states, and only then runs the full SAEM (binary data keep
-`fixed_warm_start="none"`: a flat-prior fit of one binary layer loses the
-layers above it).  In the Bernoulli D=2..4 paper design the burn-in and the
-anchor initialization together lift the layer-2 graph accuracy at D=3 from
-0.67-0.71 to 0.79-0.89 and halve the deep-layer coefficient RMSE, with the
-same cost per fit.  The Poisson observed-layer M-step keeps the
+two-component mixtures on the observed layer (`"anchor_mixture"`: Poisson
+mixtures for Poisson, Gaussian mixtures for Normal, whose deeper layers use
+the latent class model) or a two-class latent class model over the binary
+anchors (`"anchor_lca"`, Bernoulli), which recovers the column prevalence
+that thresholding the projected working response at zero cannot (a rare
+latent column otherwise starts at about 50 % and drifts into an always-on,
+intercept-absorbing solution, or collapses while neighbouring columns absorb
+its signal); and, for Poisson and Normal, `fixed_warm_start="layerwise"`
+estimates the observed layer first with a flat latent prior, then the deeper
+layers as a Bernoulli DDE on the resulting latent states, and only then runs
+the full SAEM (binary data keep `fixed_warm_start="none"`: a flat-prior fit
+of one binary layer loses the layers above it).  In the Bernoulli D=2..4
+paper design the burn-in and the anchor initialization together lift the
+layer-2 graph accuracy at D=3 from 0.67-0.71 to 0.79-0.89 and halve the
+deep-layer coefficient RMSE, with the same cost per fit.  In the Normal D=4
+paper design the three controls lift the layer-3/4 graph accuracy at
+N=16000 from 0.55/0.70 to 0.93/0.96 at about three times the cost per fit;
+at N=500 the mean deep-layer RMSE is higher than with the plain kernel (a
+few fits lock a deep row with a rare child into a near-deterministic link
+during the unit-step sweeps).  The Poisson observed-layer M-step keeps the
 MATLAB per-row L-BFGS-B (`fixed_observed_solver="rowwise"`); `"active_set"`
 solves each row's TLP problem exactly on its support with a KKT screening of
 the zero coordinates and `"hybrid"` uses it after the burn-in only; both are
 cheaper for very wide layers but lose observed-layer accuracy on the D=4
 design, so they are options rather than defaults.  Pass `sa_burn_in=0,
 fixed_init_binarize="projection", fixed_warm_start="none"` for the plain
-MATLAB-style kernel; `result.diagnostics["warm_start"]` records the Poisson
-stage iterations.
+MATLAB-style kernel; `result.diagnostics["warm_start"]` records the
+warm-start stage iterations.
 
 Poisson CSP uses the same maximum-width initialization and cumulative
 shrinkage state as the other parametric families. Its observed M-step solves

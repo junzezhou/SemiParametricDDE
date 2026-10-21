@@ -810,6 +810,7 @@ class NormalFamilyAdapter:
         B_list_true=None,
         G_list_true=None,
         random_state=None,
+        binarize="projection",
     ):
         del random_state
         working_response = self.initial_working_response(X, epsilon=epsilon)
@@ -820,6 +821,7 @@ class NormalFamilyAdapter:
                 K_list,
                 epsilon=epsilon,
                 mode="data",
+                binarize=binarize,
             )
         return Normal_init_semi(
             working_response,
@@ -829,6 +831,7 @@ class NormalFamilyAdapter:
             G_list_true,
             epsilon,
             mode="oracle",
+            binarize=binarize,
         )
 
     def observed_conditional_logit(

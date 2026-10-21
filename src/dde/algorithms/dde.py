@@ -139,17 +139,20 @@ def _layerwise_warm_start(
     G_list_true,
     verbose,
     observed_solver=None,
+    dispersion=None,
 ):
     """Layer-wise warm start for fixed-width fits.
 
     Stage 1 runs the SAEM kernel on the observed layer alone (one latent
-    layer with a flat Bernoulli prior) from the spectral initialization.
+    layer with a flat Bernoulli prior) from the spectral initialization;
+    ``dispersion`` is its starting dispersion (Normal variances, ``None``
+    for Poisson) and the stage-1 estimate is returned with the state.
     Stage 2 fits the deeper layers as a fixed-width Bernoulli DDE on the
     stage-1 latent states, with the Bernoulli spectral initializer (anchor
     latent-class binarization, labelled by the true deep coefficients when
     ``oracle``) and the same burn-in.  The deep stage is not itself warm
     started layer by layer: binary children are far less informative per
-    observation than counts, and a flat-prior fit of one binary layer loses
+    observation than counts or Gaussian responses, and a flat-prior fit of one binary layer loses
     the layers above it (D=4 design check: recursive warm start 0.89/0.67/0.54
     versus 0.99/0.92/0.92 per-layer graph accuracy for the deep layers).  The assembled state is
     the starting point of the full SAEM.  Identifiability of a DDE is
@@ -162,11 +165,11 @@ def _layerwise_warm_start(
     D = len(B_list)
     A1 = np.asarray(A_list[0], dtype=float)
     prop_stage1 = np.clip(np.mean(A1, axis=0), 1e-3, 1.0 - 1e-3)
-    prop_stage1, B_stage1, _, A_stage1, iterations_stage1 = get_SAEM_parametric(
+    prop_stage1, B_stage1, dispersion, A_stage1, iterations_stage1 = get_SAEM_parametric(
         X,
         prop_stage1,
         [np.asarray(B_list[0], dtype=float)],
-        None,
+        dispersion,
         [penalties[0]],
         tau,
         [A1],
@@ -222,7 +225,7 @@ def _layerwise_warm_start(
         "stage2_iterations": int(deep.diagnostics["iterations"]),
         "stage2_initialization": deep.diagnostics.get("initialization"),
     }
-    return prop_out, B_out, A_out, diagnostics
+    return prop_out, B_out, dispersion, A_out, diagnostics
 
 
 def fit_parametric_dde(
@@ -355,28 +358,35 @@ def fit_parametric_dde(
     Normal family never burns in).
 
     Fixed-width fits take three further controls, with Poisson defaults
-    chosen by the D=2..5 recovery study of ``Results/dde_poisson_fixed_*``
-    and Bernoulli defaults by ``Results/bernoulli_fixed_recon/REPORT.md``:
-    ``sa_burn_in`` (default 10 for Poisson and Bernoulli, 0 for Normal) runs
-    that many initial sweeps with step size one before the ``1/t``
-    stochastic approximation starts, so draws made from the initialization
-    do not keep a lasting weight in the averaged objectives;
-    ``fixed_init_binarize`` (default ``"anchor_mixture"`` for Poisson,
-    ``"anchor_lca"`` for Bernoulli, ``"projection"`` for Normal) reads the
-    initial latent states off each column's anchor variables (two-component
-    Poisson mixtures, or a two-class latent class model over binary
-    anchors) instead of thresholding the projected working response at
-    zero, which otherwise assigns about half of the observations to every
-    latent column and starts rare columns at the wrong prevalence;
-    ``fixed_warm_start`` (default ``"layerwise"`` for Poisson with
-    ``D >= 2``, ``"none"`` otherwise) estimates the observed layer first
-    with a flat latent prior, then the deeper layers as a Bernoulli DDE on
-    the resulting latent states, and only then runs the full SAEM from the
-    assembled state.  The warm start stays off for Bernoulli data, where a
-    flat-prior fit of one binary layer loses the layers above it.  It is
-    skipped when a full state (``prop_in``, ``B_list_in``, ``A_list_in``)
-    is supplied; the burn-in still applies to a supplied state (pass
-    ``sa_burn_in=0`` for the plain MATLAB-style schedule).
+    chosen by the D=2..5 recovery study of ``Results/dde_poisson_fixed_*``,
+    Bernoulli defaults by ``Results/bernoulli_fixed_recon/REPORT.md`` and
+    Normal defaults by ``Results/dde_normal_fixed_recon/REPORT.md``:
+    ``sa_burn_in`` (default 10) runs that many initial sweeps with step size
+    one before the ``1/t`` stochastic approximation starts, so draws made
+    from the initialization do not keep a lasting weight in the averaged
+    objectives;
+    ``fixed_init_binarize`` (default ``"anchor_mixture"`` for Poisson and
+    Normal, ``"anchor_lca"`` for Bernoulli) reads the initial latent states
+    off each column's anchor variables (two-component Poisson or Gaussian
+    mixtures on the observed layer, a two-class latent class model over
+    binary anchors in the deeper Normal layers and for Bernoulli) instead of
+    thresholding the projected working response at zero, which otherwise
+    assigns about half of the observations to every latent column and
+    starts rare columns at the wrong prevalence;
+    ``fixed_warm_start`` (default ``"layerwise"`` for Poisson and Normal
+    with ``D >= 2``, ``"none"`` otherwise) estimates the observed layer
+    first with a flat latent prior, then the deeper layers as a Bernoulli
+    DDE on the resulting latent states, and only then runs the full SAEM
+    from the assembled state; every stage burns in.  The warm start stays
+    off for Bernoulli data, where a flat-prior fit of one binary layer loses
+    the layers above it.  It is skipped when a full state (``prop_in``,
+    ``B_list_in``, ``A_list_in``) is supplied; the burn-in still applies to
+    a supplied state (pass ``sa_burn_in=0`` for the plain MATLAB-style
+    schedule).  For Normal data with ``N <= 1000`` the unit-step sweeps of
+    the full SAEM occasionally drive a deep row with a rare child into a
+    separated (near-deterministic) link that the latent draws then
+    reinforce, which raises the mean deep-layer RMSE at ``N = 500`` above
+    that of the plain kernel while the graph accuracy is higher.
     ``fixed_observed_solver`` (Poisson, default ``"rowwise"``: the MATLAB
     per-row L-BFGS-B with ten steps on the stochastic-approximation
     objective) also offers ``"active_set"`` (exact solve on each row's
@@ -464,15 +474,16 @@ def fit_parametric_dde(
 
     is_poisson = family_adapter.key == "poisson"
     is_bernoulli = family_adapter.key == "bernoulli"
+    is_normal = family_adapter.key == "normal"
     if sa_burn_in is None:
-        sa_burn_in = 10 if ((is_poisson or is_bernoulli) and method == "fixed") else 0
+        sa_burn_in = 10 if method == "fixed" else 0
     sa_burn_in = int(sa_burn_in)
     if sa_burn_in < 0:
         raise ValueError("sa_burn_in must be a nonnegative integer.")
     if sa_burn_in and method != "fixed":
         raise ValueError("sa_burn_in applies to dimension_method='fixed' only.")
     if fixed_init_binarize is None:
-        if method == "fixed" and is_poisson:
+        if method == "fixed" and (is_poisson or is_normal):
             fixed_init_binarize = "anchor_mixture"
         elif method == "fixed" and is_bernoulli:
             fixed_init_binarize = "anchor_lca"
@@ -481,11 +492,13 @@ def fit_parametric_dde(
     fixed_init_binarize = str(fixed_init_binarize).strip().lower()
     if fixed_init_binarize not in {"projection", "anchor_mixture", "anchor_lca"}:
         raise ValueError(
-            "fixed_init_binarize must be 'projection', 'anchor_mixture' (Poisson) or 'anchor_lca' (Bernoulli)."
+            "fixed_init_binarize must be 'projection', 'anchor_mixture' (Poisson, Normal) or 'anchor_lca' (Bernoulli)."
         )
-    if fixed_init_binarize == "anchor_mixture" and (not is_poisson or method != "fixed"):
+    if fixed_init_binarize == "anchor_mixture" and (
+        not (is_poisson or is_normal) or method != "fixed"
+    ):
         raise ValueError(
-            "fixed_init_binarize='anchor_mixture' is implemented for fixed-width Poisson fits only."
+            "fixed_init_binarize='anchor_mixture' is implemented for fixed-width Poisson and Normal fits only."
         )
     if fixed_init_binarize == "anchor_lca" and (not is_bernoulli or method != "fixed"):
         raise ValueError(
@@ -498,9 +511,11 @@ def fit_parametric_dde(
         if fixed_observed_solver not in {"active_set", "rowwise", "hybrid", "active_set_wide"}:
             raise ValueError("fixed_observed_solver must be 'active_set', 'rowwise', 'hybrid' or 'active_set_wide'.")
     if fixed_warm_start is None:
-        fixed_warm_start = "layerwise" if (is_poisson and method == "fixed" and D >= 2) else "none"
-    if fixed_warm_start == "layerwise" and family_adapter.key == "normal":
-        raise ValueError("fixed_warm_start='layerwise' is implemented for the Poisson and Bernoulli families.")
+        fixed_warm_start = (
+            "layerwise"
+            if (is_poisson or is_normal) and method == "fixed" and D >= 2
+            else "none"
+        )
     fixed_warm_start = str(fixed_warm_start).strip().lower()
     if fixed_warm_start not in {"none", "layerwise"}:
         raise ValueError("fixed_warm_start must be 'none' or 'layerwise'.")
@@ -623,7 +638,7 @@ def fit_parametric_dde(
                     epsilon=epsilon,
                     mode="data",
                     random_state=random_state if method == "csp" else None,
-                    **({"binarize": fixed_init_binarize} if (is_poisson or is_bernoulli) else {}),
+                    binarize=fixed_init_binarize,
                 )
         elif initialization == "oracle":
             if B_list_true is None or G_list_true is None:
@@ -638,7 +653,7 @@ def fit_parametric_dde(
                 epsilon=epsilon,
                 mode="oracle",
                 random_state=random_state if method == "csp" else None,
-                **({"binarize": fixed_init_binarize} if (is_poisson or is_bernoulli) else {}),
+                binarize=fixed_init_binarize,
             )
         else:
             raise ValueError("initialize must be 'data' or 'oracle'.")
@@ -651,7 +666,7 @@ def fit_parametric_dde(
         fixed_trace = [] if keep_trace else None
         warm_start_diagnostics = None
         if fixed_warm_start == "layerwise" and initialization != "provided":
-            prop, B_list, A_list, warm_start_diagnostics = _layerwise_warm_start(
+            prop, B_list, gamma, A_list, warm_start_diagnostics = _layerwise_warm_start(
                 X,
                 prop,
                 B_list,
@@ -671,6 +686,7 @@ def fit_parametric_dde(
                 G_list_true=G_list_true,
                 verbose=bool(verbose),
                 observed_solver=fixed_observed_solver,
+                dispersion=gamma,
             )
         prop, B_list, gamma, A_list, iterations = get_SAEM_parametric(
             X,

@@ -84,14 +84,15 @@ def test_poisson_one_layer_and_provided_state_skip_the_warm_start():
 
 def test_other_families_keep_their_fixed_defaults():
     rng = np.random.default_rng(7)
-    Y = rng.normal(size=(200, 18))
-    normal = fit(Y, method="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
-                 pen_list=[1.0, 1.0], tau=0.3, C=1, tol=0.5, max_it=3, verbose=False)
-    assert normal.diagnostics["sa_burn_in"] == 0
-    assert normal.diagnostics["fixed_init_binarize"] == "projection"
-    assert normal.diagnostics["fixed_warm_start"] == "none"
+    Y = (rng.random((200, 18)) < 0.4).astype(float)
+    bernoulli = fit(Y, method="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
+                    pen_list=[1.0, 1.0], tau=0.3, C=1, tol=0.5, max_it=3, verbose=False)
+    assert bernoulli.diagnostics["sa_burn_in"] == 10
+    assert bernoulli.diagnostics["fixed_init_binarize"] == "anchor_lca"
+    assert bernoulli.diagnostics["fixed_warm_start"] == "none"
+    # the Normal defaults are covered by tests/test_normal_fixed_defaults.py
     with pytest.raises(ValueError):
-        fit(Y, method="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
+        fit(Y, method="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
             pen_list=[1.0, 1.0], tau=0.3, C=1, max_it=2, verbose=False, fixed_init_binarize="anchor_mixture")
 
 

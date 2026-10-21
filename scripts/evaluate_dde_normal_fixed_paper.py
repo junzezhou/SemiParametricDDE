@@ -4,8 +4,12 @@ Reproduces the ``simulation_fit_dde.ipynb`` paper profile (``build_true_params``
 designs with ``J = 3 K_1``, ``pen_list = [N**(2/8)] * D``, ``tau = 0.3``,
 one draw, ``tol = K_D / 2``, ``max_it = 10``, oracle-labelled spectral
 initialization, seeds ``20260827 + 100000 D + 1000 N + replicate``) and
-records, per replicate, the overall and per-layer graph accuracy and the
-overall and per-layer coefficient RMSE.  Checkpointed and resumable.
+records, per replicate, the overall and per-layer graph accuracy, the
+overall and per-layer coefficient RMSE and the per-layer latent-state
+accuracy.  ``--sa-burn-in``, ``--binarize`` and ``--warm-start`` override the
+package defaults of ``sa_burn_in``, ``fixed_init_binarize`` and
+``fixed_warm_start`` for ablations; the values used are recorded per
+replicate.  Checkpointed and resumable.
 """
 
 from __future__ import annotations
@@ -55,13 +59,15 @@ def run_one(task):
     started = time.perf_counter()
     try:
         np.random.seed(seed)
-        X, _ = generate_X_normal(int(N), prop_t, B_t, gamma_t)
+        X, A_true = generate_X_normal(int(N), prop_t, B_t, gamma_t)
         with threadpool_limits(limits=1):
             result = fit(X, method="DDE", D=D, family="Normal", dimension_method="fixed",
                          K_list=list(spec["K_list"]), pen_list=[float(N) ** (2 / 8)] * D,
                          tau=settings["tau"], C=1,
                          tol=spec["K_list"][-1] / 2 if settings["tol"] is None else settings["tol"],
-                         max_it=settings["max_it"], initialize="oracle",
+                         max_it=settings["max_it"], sa_burn_in=settings["sa_burn_in"],
+                         fixed_init_binarize=settings["binarize"], fixed_warm_start=settings["warm_start"],
+                         initialize="oracle",
                          B_list_true=B_t, G_list_true=G_t, verbose=False)
         layer_acc, layer_rmse, correct, edges, sq = [], [], 0, 0, []
         for B_hat, B_true, G_true in zip(result.B_list, B_t, G_t):
@@ -76,7 +82,12 @@ def run_one(task):
                    B_rmse=float(np.sqrt(np.mean(np.concatenate(sq)))), layer_parameter_rmse=json.dumps(layer_rmse),
                    parameter_rmse=float(np.sqrt(np.mean(all_err))),
                    prop_mse=float(np.mean((result.prop - prop_t) ** 2)),
-                   gamma_mse=float(np.mean((np.asarray(result.gamma) - gamma_t) ** 2)))
+                   gamma_mse=float(np.mean((np.asarray(result.gamma) - gamma_t) ** 2)),
+                   latent_accuracy=json.dumps([float(np.mean(np.asarray(A) == np.asarray(At))) for A, At in zip(result.A_list, A_true)]),
+                   sa_burn_in=int(result.diagnostics["sa_burn_in"]),
+                   fixed_init_binarize=result.diagnostics["fixed_init_binarize"],
+                   fixed_warm_start=result.diagnostics["fixed_warm_start"],
+                   warm_start=json.dumps(result.diagnostics.get("warm_start")))
     except Exception as exc:  # noqa: BLE001
         row["error"] = f"{type(exc).__name__}: {exc}"
     row["seconds"] = time.perf_counter() - started
@@ -93,6 +104,7 @@ def _summarize(rows, out_dir):
     for (name, N), rs in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         acc = np.array([json.loads(r["layer_graph_accuracy"]) for r in rs])
         rmse = np.array([json.loads(r["layer_parameter_rmse"]) for r in rs])
+        lat = [json.loads(r["latent_accuracy"]) for r in rs if r.get("latent_accuracy")]
         out.append({"scenario": name, "D": rs[0]["D"], "J": rs[0]["J"], "K_list": rs[0]["K_list"], "N": N,
                     "replicates": len(rs),
                     "graph_accuracy_mean": float(np.mean([r["graph_accuracy"] for r in rs])),
@@ -101,6 +113,7 @@ def _summarize(rows, out_dir):
                     "parameter_rmse_mean": float(np.mean([r["parameter_rmse"] for r in rs])),
                     "layer_graph_accuracy_mean": json.dumps(acc.mean(0).tolist()),
                     "layer_parameter_rmse_mean": json.dumps(rmse.mean(0).tolist()),
+                    "latent_accuracy_mean": json.dumps(np.mean(lat, axis=0).tolist()) if len(lat) == len(rs) else "",
                     "iterations_mean": float(np.mean([r["iterations"] for r in rs])),
                     "seconds_mean": float(np.mean([r["seconds"] for r in rs]))})
     if out:
@@ -121,11 +134,17 @@ def main():
     p.add_argument("--tol", type=float, default=None,
                    help="postprocessed parameter-update RMSE tolerance; default K_D/2 (the notebook's MATLAB-style value, "
                         "which stops the RMSE-based kernel after 2 sweeps); the manuscript uses 0.01 with max_it 50")
+    p.add_argument("--sa-burn-in", type=int, default=None, help="unit-step sweeps before 1/t averaging (default: the package default)")
+    p.add_argument("--binarize", choices=["projection", "anchor_mixture"], default=None,
+                   help="initial latent-state rule (default: the package default)")
+    p.add_argument("--warm-start", choices=["none", "layerwise"], default=None,
+                   help="layer-wise warm start (default: the package default)")
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    settings = {"base_seed": args.base_seed, "tau": args.tau, "max_it": args.max_it, "tol": args.tol}
-    (args.output_dir / "metadata.json").write_text(json.dumps({"args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}, "design": f"build_true_params(K_list, J=3K1, 4.0); pen N^(2/8); tau {args.tau}; tol {'K_D/2' if args.tol is None else args.tol}; max_it {args.max_it}; oracle init; seeds 20260827+100000D+1000N+rep"}, indent=2))
+    settings = {"base_seed": args.base_seed, "tau": args.tau, "max_it": args.max_it, "tol": args.tol,
+                "sa_burn_in": args.sa_burn_in, "binarize": args.binarize, "warm_start": args.warm_start}
+    (args.output_dir / "metadata.json").write_text(json.dumps({"args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}, "design": f"build_true_params(K_list, J=3K1, 4.0); pen N^(2/8); tau {args.tau}; tol {'K_D/2' if args.tol is None else args.tol}; max_it {args.max_it}; sa_burn_in {'default' if args.sa_burn_in is None else args.sa_burn_in}; binarize {args.binarize or 'default'}; warm_start {args.warm_start or 'default'}; oracle init; seeds 20260827+100000D+1000N+rep"}, indent=2))
     checkpoint = args.output_dir / "replicates.jsonl"
     rows = [json.loads(l) for l in checkpoint.read_text().splitlines() if l.strip()] if checkpoint.exists() else []
     done = {(r["scenario"], int(r["N"]), int(r["replicate"])) for r in rows if r["status"] == "ok"}
