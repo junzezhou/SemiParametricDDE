@@ -718,6 +718,19 @@ def test_deep_normal_debias_matches_matlab_rule():
     np.testing.assert_allclose(_matlab_debias(values, tau=0.1), expected)
 
 
+
+@pytest.mark.parametrize("depth", [2, 3, 5])
+def test_normal_fixed_postprocess_hard_thresholds_at_every_depth(depth):
+    values = np.array([[0.7, -0.4, -0.15, 0.05, 0.0, 0.15, 0.4, 2.0]])
+    expected = values.copy()
+    expected[:, 1:] = np.where(np.abs(values[:, 1:]) < 0.3, 0.0, values[:, 1:])
+
+    (actual,) = NORMAL_FAMILY.postprocess_fixed_coefficients(
+        [values.copy()], tau=0.3, depth=depth
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+
 @pytest.mark.parametrize(
     ("J", "K_list"),
     [

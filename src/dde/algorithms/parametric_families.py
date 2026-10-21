@@ -262,7 +262,7 @@ def _solve_poisson_tlp_active_set(
 
 
 def _matlab_debias(x, tau):
-    """Match the deep-Normal MATLAB ``debias.m`` elementwise."""
+    """Match the deep-Normal MATLAB ``debias.m`` elementwise (reference only; the kernel hard-thresholds)."""
     x = np.asarray(x, dtype=float)
     out = x.copy()
     out[x > tau] = x[x > tau] + tau
@@ -992,11 +992,13 @@ class NormalFamilyAdapter:
         )
 
     def postprocess_fixed_coefficients(self, B_updates, *, tau, depth):
+        # Hard threshold at every depth.  The deep-Normal MATLAB script also
+        # applies ``debias.m`` (``_matlab_debias``) for D >= 3, but TLP leaves
+        # coefficients above ``tau`` unshrunk, so adding ``tau`` back biases
+        # every surviving coefficient by ``tau`` regardless of N.
+        del depth
         for B_update in B_updates:
-            if depth >= 3:
-                B_update[:, 1:] = _matlab_debias(B_update[:, 1:], tau)
-            else:
-                B_update[:, 1:] = thres(B_update[:, 1:], tau)
+            B_update[:, 1:] = thres(B_update[:, 1:], tau)
         return B_updates
 
     def conditional_log_prob(self, Y, eta, dispersion):
