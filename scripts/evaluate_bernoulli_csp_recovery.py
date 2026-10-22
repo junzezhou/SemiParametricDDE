@@ -10,7 +10,11 @@ identifiable width:
 The default experiment covers N=(500, 1000, 2000, 4000, 8000), checkpoints
 every completed fit, and records dimension recovery, graph support recovery,
 latent matching, reconstruction diagnostics, convergence, time, and worker
-peak RSS. Re-running the command resumes completed configurations.
+peak RSS. Graph support is reported pooled (``graph_accuracy``) and per layer
+(``layer_graph_accuracy``, ``layer_sensitivity``, ``layer_specificity``,
+``layer_matched_columns``; see ``dde.utils.layer_structure_recovery_metrics``),
+both with the support thresholded at ``tau``. Re-running the command resumes
+completed configurations.
 """
 
 from __future__ import annotations
@@ -38,9 +42,14 @@ from threadpoolctl import threadpool_limits
 from dde import fit
 from dde.algorithms.csp import maximal_identifiable_widths
 from dde.algorithms.dde import DEFAULT_PARAMETRIC_CONVERGENCE_TOL
+from dde.utils import layer_structure_recovery_metrics
 
 
 SAMPLE_SIZES = (500, 1000, 2000, 4000, 8000)
+STRUCTURE_FIELDS = (
+    "layer_graph_accuracy", "layer_sensitivity", "layer_specificity",
+    "layer_matched_columns", "layer_graph_counts", "layer_column_pairs",
+)
 SCENARIO_SPECS = {
     "d2": {
         "name": "D2_Bs_overspecified_J27",
@@ -255,6 +264,10 @@ def calculate_metrics(result, X, A_true, scenario, threshold):
         true_support.append(true_layer.ravel())
     estimated_support = np.concatenate(estimated_support)
     true_support = np.concatenate(true_support)
+    structure = layer_structure_recovery_metrics(
+        result.B_list, scenario["B_true"], result.A_list, A_true,
+        threshold=threshold,
+    )
     tp = int(np.sum(estimated_support & true_support))
     tn = int(np.sum(~estimated_support & ~true_support))
     fp = int(np.sum(estimated_support & ~true_support))
@@ -303,6 +316,9 @@ def calculate_metrics(result, X, A_true, scenario, threshold):
         "true_negative": tn,
         "false_positive": fp,
         "false_negative": fn,
+        "support_threshold": float(threshold),
+        "structure_alignment": structure["alignment"],
+        **{key: json.dumps(structure[key]) for key in STRUCTURE_FIELDS},
         "conditional_log_loss": log_loss,
         "prevalence_log_loss": prevalence_log_loss,
         "oracle_conditional_log_loss": oracle_log_loss,
@@ -504,6 +520,13 @@ def _mean(rows, field):
     return float(np.mean(values)) if values else float("nan")
 
 
+def _layer_mean(rows, field):
+    values = [json.loads(row[field]) for row in rows if row.get(field, "") != ""]
+    if not values:
+        return ""
+    return json.dumps(np.nanmean(np.asarray(values, dtype=float), axis=0).tolist())
+
+
 def summarize(rows):
     groups = defaultdict(list)
     for row in rows:
@@ -544,6 +567,8 @@ def summarize(rows):
             "worker_peak_rss_mib",
         ):
             record[f"{field}_mean"] = _mean(successful, field)
+        for field in ("layer_latent_accuracy",) + STRUCTURE_FIELDS[:4]:
+            record[f"{field}_mean"] = _layer_mean(successful, field)
         width_counts = defaultdict(int)
         for row in successful:
             width_counts[row["K_fit"]] += 1
