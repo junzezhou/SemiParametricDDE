@@ -294,15 +294,15 @@ def test_mcem_backend_is_rejected_and_copula_initializer_still_available():
     assert result.diagnostics["initialization"] == "data_copula"
 
 
-def test_copula_backend_rejects_poisson_family():
+def test_copula_backend_accepts_poisson_family():
     rng = np.random.default_rng(0)
     Y = rng.poisson(2.0, size=(60, 18)).astype(float)
-    with pytest.raises(NotImplementedError):
-        fit(
-            Y, method="DDE", family="Poisson", D=2, dimension_method="csp",
-            t_spike=0.02, temp=0.9, tau=0.3, C=1, max_iter=1,
-            csp_backend="copula", verbose=False,
-        )
+    res = fit(
+        Y, method="DDE", family="Poisson", D=2, dimension_method="csp",
+        t_spike=0.02, temp=0.9, tau=0.3, C=1, max_iter=1,
+        csp_backend="copula", verbose=False,
+    )
+    assert res.diagnostics["backend"] == "copula"
 
 
 def test_standardized_copula_backend_is_affine_equivariant():

@@ -60,6 +60,7 @@ from .get_SAEM_RL_CSP_D import (
 from .parametric_csp_mcem import (
     _canonicalize_csp_layer_order,
     _solve_logistic_weighted_l1,
+    _solve_poisson_weighted_l1,
 )
 from .normal_init_cop import _binary_init_matlab
 from .normal_init_semi import initialize_binary_parent
@@ -256,10 +257,11 @@ def fit_parametric_csp_copula(
     """Fit a maximal-width parametric DDE with the CopDDE CSP algorithm.
 
     ``family`` selects the observed layer: ``"normal"`` (the CopDDE Gaussian
-    layer, with ``gamma_in`` the conditional variances) or ``"bernoulli"``
-    (a logistic observed layer identical in form to the latent layers;
-    ``gamma_in`` must be ``None``).  Everything below the observed layer is
-    family independent.
+    layer, with ``gamma_in`` the conditional variances), ``"bernoulli"``
+    (a logistic observed layer identical in form to the latent layers) or
+    ``"poisson"`` (log-link counts, solved by backtracking FISTA); for the
+    last two ``gamma_in`` must be ``None``.  Everything below the observed
+    layer is family independent.
 
     Parameters
     ----------
@@ -377,11 +379,12 @@ def fit_parametric_csp_copula(
     ``active_masks``, ``num_active``, ``iterations`` and diagnostics.
     """
     family = resolve_parametric_family(family)
-    if family.key not in ("normal", "bernoulli"):
+    if family.key not in ("normal", "bernoulli", "poisson"):
         raise NotImplementedError(
-            "The copula CSP kernel supports the Normal and Bernoulli families."
+            "The copula CSP kernel supports the Normal, Bernoulli and Poisson families."
         )
     is_normal = family.key == "normal"
+    is_poisson = family.key == "poisson"
     X = family.validate_y(X)
     if X.ndim != 2:
         raise ValueError("X must be a two-dimensional matrix.")
@@ -469,6 +472,11 @@ def fit_parametric_csp_copula(
     if fista_maxiter < 1:
         raise ValueError("fista_maxiter must be a positive integer.")
     observed_fista = layer_solvers[0] == "fista"
+    if is_poisson and not observed_fista:
+        raise ValueError(
+            "The Poisson observed layer is solved by FISTA; use an mstep_solver "
+            "whose first layer is 'fista'."
+        )
     slab_shape = float(slab_shape)
     slab_rate = float(slab_rate)
     penalty_scaling_power = np.asarray(penalty_scaling_power, dtype=float).reshape(-1)
@@ -563,7 +571,10 @@ def fit_parametric_csp_copula(
             ub.append(np.asarray([pair[1] for pair in pairs], dtype=float))
         # Bernoulli observed layer: the data are the "child sample" of the
         # logistic M-step, with an intercept column and one copy per draw.
-        X_child = np.concatenate((np.ones((N, 1)), X), axis=1)[:, :, None]
+        X_child = (
+            None if is_poisson
+            else np.concatenate((np.ones((N, 1)), X), axis=1)[:, :, None]
+        )
 
     def mean_field_probabilities(A_state, B_state, gamma_state, prop_state, temperature):
         if is_normal:
@@ -739,7 +750,13 @@ def fit_parametric_csp_copula(
         # 5) Observed layer: Gaussian (with conditional variances) or logistic.
         B_update = [None] * D
         gamma_update = None
-        if not is_normal:
+        if is_poisson:
+            B_update[0] = _solve_poisson_weighted_l1(
+                X, A_mstep[0], B_list[0], theta_mstep[0], temp,
+                max_iter=fista_maxiter, tol=optimizer_tol,
+                bound=bound_val, bounds=list(zip(lb[0], ub[0])),
+            )
+        elif not is_normal:
             if not observed_fista:
                 C_mstep = A_mstep[0].shape[2]
                 B_update[0] = _optimize_logistic_layer(

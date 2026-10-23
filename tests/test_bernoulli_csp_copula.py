@@ -72,11 +72,6 @@ def test_bernoulli_kernel_rejects_gamma_and_normal_only_options():
             inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
             observed_noise_scale=0.5, **base,
         )
-    with pytest.raises(NotImplementedError):
-        fit_parametric_csp_copula(
-            inputs["X"], inputs["prop"], None, _copy(inputs["B_list"]),
-            _copy(inputs["A_list"]), family="poisson", **base,
-        )
 
 
 def test_bernoulli_gibbs_transition_runs():
@@ -119,21 +114,13 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
     assert default.diagnostics["backend"] == "mcem"
 
 
-def test_bernoulli_copula_backend_rejects_standardize_and_poisson():
+def test_bernoulli_copula_backend_rejects_standardize():
     X, _ = _simulate(6, N=120)
     with pytest.raises(ValueError, match="standardize"):
         fit(
             X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=0.03, temp=0.9, tau=0.3, C=1, max_iter=1, verbose=False,
             csp_backend="copula", standardize=True,
-        )
-    rng = np.random.default_rng(0)
-    Y = rng.poisson(2.0, size=(60, 18)).astype(float)
-    with pytest.raises(NotImplementedError):
-        fit(
-            Y, method="DDE", family="Poisson", D=2, dimension_method="csp",
-            t_spike=0.03, temp=0.9, tau=0.3, C=1, max_iter=1, verbose=False,
-            csp_backend="copula",
         )
 
 

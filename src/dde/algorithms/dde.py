@@ -535,10 +535,11 @@ def fit_parametric_dde(
     if method == "csp" and backend == "copula" and family_adapter.key not in (
         "normal",
         "bernoulli",
+        "poisson",
     ):
         raise NotImplementedError(
-            "csp_backend='copula' is implemented for the Normal and Bernoulli "
-            "families only."
+            "csp_backend='copula' is implemented for the Normal, Bernoulli and "
+            "Poisson families only."
         )
     if method == "csp" and family_adapter.key == "normal" and backend != "copula":
         raise ValueError(
@@ -763,7 +764,7 @@ def fit_parametric_dde(
         if csp_shrinkage_burn is None:
             csp_shrinkage_burn = (
                 _BERNOULLI_CSP_SHRINKAGE_BURN
-                if family_adapter.key == "bernoulli"
+                if family_adapter.key in ("bernoulli", "poisson")
                 and D >= 3
                 and max_it >= 2 * _BERNOULLI_CSP_SHRINKAGE_BURN
                 else 0
