@@ -19,24 +19,39 @@ def _right_inverse_xtx(X):
     return np.linalg.pinv(X.T @ X)
 
 
-def _varimax(Phi, gamma=1.0, q=1000, tol=1e-6):
+def _varimax(Phi, gamma=1.0, q=1000, tol=None):
+    """MATLAB ``rotatefactors(Phi, 'method', 'varimax', 'Maxit', q)``.
+
+    Orthomax (``gamma = 1``) with MATLAB's defaults: Kaiser row normalization
+    before the rotation (rows rescaled afterwards) and the relative-change
+    stopping rule ``|D - D_old| / D < sqrt(eps)``.  Without the normalization
+    the rotation, and with it the initial latent structure, differs from
+    ``Normal_init_D.m`` on the CopDDE simulation designs.
+    """
     Phi = np.asarray(Phi, dtype=float)
     if Phi.ndim == 1:
         Phi = Phi.reshape(-1, 1)
+    reltol = np.sqrt(np.finfo(float).eps) if tol is None else float(tol)
 
     p, k = Phi.shape
-    R = np.eye(k)
+    h = np.sqrt(np.sum(Phi ** 2, axis=1))
+    h[h == 0.0] = 1.0
+    A = Phi / h[:, None]
+    T = np.eye(k)
+    B = A @ T
     d_old = 0.0
-    for _ in range(q):
-        Lambda = Phi @ R
-        tmp = Phi.T @ (Lambda ** 3 - (gamma / p) * Lambda @ np.diag(np.sum(Lambda ** 2, axis=0)))
-        U, s, Vt = np.linalg.svd(tmp, full_matrices=False)
-        R = U @ Vt
+    for _ in range(int(q)):
+        U, s, Vt = np.linalg.svd(
+            A.T @ (p * B ** 3 - gamma * B @ np.diag(np.sum(B ** 2, axis=0))),
+            full_matrices=False,
+        )
+        T = U @ Vt
         d_new = np.sum(s)
-        if d_old != 0.0 and d_new / d_old < 1.0 + tol:
+        B = A @ T
+        if abs(d_new - d_old) / d_new < reltol:
             break
         d_old = d_new
-    return Phi @ R
+    return B * h[:, None]
 
 
 def _matlab_sign_flip(B):

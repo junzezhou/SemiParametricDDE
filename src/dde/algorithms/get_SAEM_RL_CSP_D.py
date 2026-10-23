@@ -287,6 +287,7 @@ def _optimize_gaussian_layer(
     n_jobs,
     penalty_kind,
     tau,
+    observed_scale="declared",
 ):
     N, K1_plus_1, C = A_sample.shape
     X_design = np.transpose(A_sample, (0, 2, 1)).reshape(N * C, K1_plus_1)
@@ -294,7 +295,13 @@ def _optimize_gaussian_layer(
 
     def solve_row(j):
         y = np.repeat(Z[:, j], C)
-        scale = temp / (gamma[j] * C)
+        if observed_scale == "matlab":
+            # get_SAEM_RL_CSP_D.m calls F_1_SAEM_cop(..., temp, gamma(j)) although
+            # F_1_SAEM_cop is declared (..., gamma, temp), so the MATLAB objective
+            # weights the Gaussian log-likelihood by gamma_j / temp.
+            scale = gamma[j] / (temp * C)
+        else:
+            scale = temp / (gamma[j] * C)
         if penalty_kind == "weighted_l1":
             weights = np.concatenate(([0.0], 1.0 / np.asarray(theta_or_penalty[j], dtype=float)))
             return _bounded_minimize_value_grad(
@@ -389,13 +396,21 @@ def get_SAEM_RL_CSP_D(
     convergence_std: float = 0.005,
     burn: int = 5,
     trace_callback=None,
+    observed_scale: str = "declared",
 ):
     """MATLAB-architecture D-layer rank-likelihood SAEM with CSP shrinkage.
 
     Parameters use the package list convention.  The only deliberate departure
     from the MATLAB D-layer routine is thresholding: only the first two layers
     are thresholded, regardless of total depth.
+
+    ``observed_scale`` sets the weight of the layer-1 Gaussian log-likelihood in
+    the M-step: ``"declared"`` uses temp / gamma_j (the argument order that
+    ``F_1_SAEM_cop.m`` declares); ``"matlab"`` uses gamma_j / temp, which is what
+    the MATLAB routines actually compute because they pass (temp, gamma(j)).
     """
+    if observed_scale not in {"declared", "matlab"}:
+        raise ValueError("observed_scale must be 'declared' or 'matlab'.")
     X = np.asarray(X)
     Z = np.asarray(Z, dtype=float).copy()
     R = np.asarray(R, dtype=float)
@@ -456,6 +471,7 @@ def get_SAEM_RL_CSP_D(
             n_jobs,
             "weighted_l1",
             tau,
+            observed_scale=observed_scale,
         )
         for d in range(1, D):
             B_update[d] = _optimize_logistic_layer(
