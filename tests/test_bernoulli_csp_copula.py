@@ -231,3 +231,76 @@ def test_bernoulli_copula_defaults_burn_in_for_three_layers():
     assert short.diagnostics["shrinkage_burn"] == 0
     explicit = fit(X, max_iter=12, csp_shrinkage_burn=4, **common)
     assert explicit.diagnostics["shrinkage_burn"] == 4
+
+
+def test_sequential_transition_matches_synchronous_when_layer_one_is_unchanged():
+    # Near-deterministic observed layer started at the true layer-1 state: the
+    # fresh layer-1 draw reproduces the previous state, so the layer-2
+    # probabilities (and with the same stream, every draw) coincide.
+    rng = np.random.default_rng(5)
+    N, widths = 60, (6, 2)
+    A1 = rng.integers(0, 2, size=(N, widths[0])).astype(float)
+    B1 = np.zeros((18, widths[0] + 1))
+    B1[:, 0] = -15.0
+    for k in range(widths[0]):
+        B1[[k, k + 6, k + 12], k + 1] = 30.0
+    X = (B1[:, 0] + A1 @ B1[:, 1:].T > 0).astype(float)
+    B2 = rng.normal(scale=1.0, size=(widths[0], widths[1] + 1))
+    A2 = rng.integers(0, 2, size=(N, widths[1])).astype(float)
+    raws = {}
+    for transition in ("synchronous_mean_field", "sequential_mean_field"):
+        raws[transition] = fit_bernoulli_csp(
+            X, np.full(widths[1], 0.5), [B1.copy(), B2.copy()], [A1.copy(), A2.copy()],
+            C=1, it=1, t_spike=[0.03, 0.05], temp=0.9, tau=0.3, verbose=False,
+            latent_transition=transition, random_state=3,
+        )
+    sync, seq = raws["synchronous_mean_field"], raws["sequential_mean_field"]
+    np.testing.assert_array_equal(seq["A_list"][0], A1.astype(np.uint8))
+    for d in range(2):
+        np.testing.assert_array_equal(seq["A_list"][d], sync["A_list"][d])
+        np.testing.assert_allclose(seq["B_list"][d], sync["B_list"][d])
+    np.testing.assert_allclose(seq["prop"], sync["prop"])
+    assert seq["latent_transition"] == "sequential_mean_field"
+
+
+def test_sequential_transition_differs_from_synchronous_on_uncertain_layers():
+    inputs = _inputs()
+    raws = {}
+    for transition in ("synchronous_mean_field", "sequential_mean_field"):
+        raws[transition] = fit_bernoulli_csp(
+            inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+            C=1, it=2, t_spike=[0.03, 0.05], temp=0.9, tau=0.3, verbose=False,
+            latent_transition=transition, random_state=4,
+        )
+    # Same random stream and same first-layer probabilities in the first sweep.
+    assert raws["sequential_mean_field"]["iterations"] == 2
+    assert not all(
+        np.array_equal(a, b)
+        for a, b in zip(raws["sequential_mean_field"]["A_list"], raws["synchronous_mean_field"]["A_list"])
+    )
+
+
+def test_threshold_rule_all_thresholds_the_deepest_layer():
+    rng = np.random.default_rng(13)
+    N, J, widths = 80, 18, (6, 3, 2)
+    inputs = {
+        "X": rng.integers(0, 2, size=(N, J)).astype(float),
+        "B_list": [
+            rng.normal(scale=0.3, size=(J, widths[0] + 1)),
+            rng.normal(scale=0.3, size=(widths[0], widths[1] + 1)),
+            rng.normal(scale=0.3, size=(widths[1], widths[2] + 1)),
+        ],
+        "A_list": [rng.integers(0, 2, size=(N, w)).astype(float) for w in widths],
+    }
+    tops = {}
+    for rule in ("first_two", "all"):
+        raw = fit_bernoulli_csp(
+            inputs["X"], np.full(widths[-1], 0.5), _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+            C=1, it=1, t_spike=[0.03, 0.05, 0.001], temp=0.9, tau=0.3, verbose=False,
+            threshold_rule=rule, random_state=6,
+        )
+        assert raw["threshold_rule"] == rule
+        tops[rule] = raw["B_list"][2][:, 1:]
+    small = (tops["first_two"] != 0) & (np.abs(tops["first_two"]) < 0.3)
+    assert small.any()
+    assert np.all((tops["all"] == 0) | (np.abs(tops["all"]) >= 0.3))

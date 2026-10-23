@@ -48,6 +48,7 @@ shape ``(K_d, K_{d+1} + 1)``.
 from __future__ import annotations
 
 import numpy as np
+from scipy.special import expit
 
 from .csp import _canonicalize_csp_layer_order, csp_active_mask, update_csp_layer
 from .csp_solvers import _solve_logistic_weighted_l1, _solve_poisson_weighted_l1
@@ -62,6 +63,7 @@ from .normal_init_cop import _binary_init_matlab
 from .normal_init_semi import initialize_binary_parent
 from .parametric_families import (
     NORMAL_FAMILY,
+    _binary_child_conditional_logit,
     _solve_gaussian_weighted_l1,
     resolve_parametric_family,
 )
@@ -71,11 +73,15 @@ from .semi_saem import (
 )
 
 
-_THRESHOLD_RULES = ("first_two", "all_but_last", "none")
+_THRESHOLD_RULES = ("first_two", "all_but_last", "all", "none")
 _MSTEP_SOLVERS = ("lbfgsb", "fista", "hybrid", "fista_lower")
 _MSTEP_LATENTS = ("draw", "mean_field")
 _PENALTY_SCALING_LAYERS = ("all", "deep", "lower")
-_LATENT_TRANSITIONS = ("synchronous_mean_field", "systematic_coordinate_gibbs")
+_LATENT_TRANSITIONS = (
+    "synchronous_mean_field",
+    "sequential_mean_field",
+    "systematic_coordinate_gibbs",
+)
 _MC_STATE_UPDATES = ("draw_majority", "last_draw")
 _REINIT_TOP_RULES = ("family", "copula")
 _REINIT_TOP_SOURCES = ("state", "probability")
@@ -274,7 +280,10 @@ def fit_parametric_csp_copula(
     optimizer_maxiter : L-BFGS-B iteration budget per coefficient row
         (``15`` reproduces the MATLAB ``fmincon`` budget).
     threshold_rule : ``"first_two"`` (package CopDDE rule), ``"all_but_last"``
-        (MATLAB D-layer rule), or ``"none"``.
+        (MATLAB D-layer rule), ``"all"`` (every layer, the deepest included:
+        the inexact L-BFGS-B step there otherwise leaves small nonzero
+        coefficients that keep unused top columns in the slab), or
+        ``"none"``.
     mstep_solver : ``"fista_lower"`` (default: exact proximal FISTA
         weighted-lasso solves in layers 1..D-1 and the CopDDE L-BFGS-B step
         in the deepest layer), ``"hybrid"`` (FISTA for the observed Gaussian
@@ -322,7 +331,12 @@ def fit_parametric_csp_copula(
         consecutive systematic coordinate-Gibbs sweeps of the exact full
         conditionals, observed layer first, each coordinate conditioning on
         the freshly updated state; the persistent chain of the parametric
-        MCEM kernel).  The Gibbs transition requires ``mstep_latent="draw"``.
+        MCEM kernel) or ``"sequential_mean_field"`` (the mean-field draws
+        taken layer by layer from the data upward: each layer's conditional
+        probabilities use the freshly committed draw of the layer below and
+        the previous state of the layer above, so consecutive layers are
+        drawn jointly instead of independently).  The Gibbs transition
+        requires ``mstep_latent="draw"``.
     mc_state_update : ``"draw_majority"`` (CopDDE: the committed latent state
         is the majority vote of the ``C`` draws) or ``"last_draw"`` (the last
         draw, the persistent-chain rule).  ``None`` selects the majority vote
@@ -516,6 +530,7 @@ def fit_parametric_csp_copula(
             "latent_transition must be one of " + ", ".join(_LATENT_TRANSITIONS) + "."
         )
     gibbs = latent_transition == "systematic_coordinate_gibbs"
+    sequential = latent_transition == "sequential_mean_field"
     if gibbs and mstep_latent != "draw":
         raise ValueError(
             "mstep_latent='mean_field' requires the synchronous mean-field "
@@ -595,10 +610,30 @@ def fit_parametric_csp_copula(
             X, prop_state, B_state, gamma_state, A_state, family=family,
             row_chunk_size=estep_row_chunk_size, temperature=temperature,
         )
+
+    def deep_layer_probabilities(d, A_state, B_state, prop_state, temperature):
+        """Mean-field conditional probabilities of latent layer ``d >= 1``."""
+        if d == D - 1:
+            eps = 1e-12 if is_normal else 1e-15
+            prop_clipped = np.clip(prop_state, eps, 1.0 - eps)
+            prior_logit = np.log(prop_clipped / (1.0 - prop_clipped))[None, :]
+        else:
+            prior_logit = (
+                B_state[d + 1][:, 0][None, :]
+                + A_state[d + 1] @ B_state[d + 1][:, 1:].T
+            )
+        like_logit = _binary_child_conditional_logit(
+            A_state[d - 1], B_state[d], A_state[d], parent_width=K[d],
+            row_chunk_size=estep_row_chunk_size, sparse="auto",
+        )
+        return expit(temperature * (like_logit + prior_logit))
+
     if threshold_rule == "first_two":
         thresholded_layers = min(2, D)
     elif threshold_rule == "all_but_last":
         thresholded_layers = D - 1
+    elif threshold_rule == "all":
+        thresholded_layers = D
     else:
         thresholded_layers = 0
 
@@ -692,8 +727,9 @@ def fit_parametric_csp_copula(
                     prop = np.clip(np.mean(A_list[d], axis=0), 1e-8, 1.0 - 1e-8)
 
         # 1) E-step: synchronous mean-field draws from the previous point
-        #    estimates (CopDDE), or persistent systematic coordinate-Gibbs
-        #    sweeps of the exact full conditionals.
+        #    estimates (CopDDE), the same draws taken layer by layer from the
+        #    data upward, or persistent systematic coordinate-Gibbs sweeps of
+        #    the exact full conditionals.
         if gibbs:
             ber = None
             samples, ber_top = _sample_latent_layers_parametric(
@@ -703,6 +739,16 @@ def fit_parametric_csp_copula(
                 rng=random, sparse_bernoulli=not is_normal, temperature=temp,
             )
             A_sample_long = [sample.astype(float) for sample in samples]
+        elif sequential:
+            ber = mean_field_probabilities(A_list, B_list, gamma, prop, temp)
+            A_work = list(A_list)
+            A_sample_long = [None] * D
+            for d in range(D):
+                if d > 0:
+                    ber[d] = deep_layer_probabilities(d, A_work, B_list, prop, temp)
+                A_sample_long[d] = _sample_latent_layers([ber[d]], C, random)[0]
+                A_work[d] = (np.mean(A_sample_long[d][:, 1:, :], axis=2) > 0.5).astype(float)
+            ber_top = ber[-1]
         else:
             ber = mean_field_probabilities(A_list, B_list, gamma, prop, temp)
             ber_top = ber[-1]

@@ -41,10 +41,44 @@ import numpy as np
 
 FAMILY_KERNELS = {
     "normal": ("copdde", "dde_csp"),
-    "bernoulli": ("copdde", "dde_csp", "dde_csp_cop"),
-    "poisson": ("copdde", "dde_csp", "dde_csp_cop"),
+    "bernoulli": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05"),
+    "poisson": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05"),
     "semidde": ("copdde", "semi_csp", "semi_csp_cop"),
 }
+
+
+# Copula-engine settings for the discrete families (Normal CSP style unless noted).
+_MF = dict(csp_latent_transition="synchronous_mean_field", csp_shrinkage_burn=0)
+ENGINE_VARIANTS = {
+    "cop_mf": dict(_MF, csp_penalty_scaling_power=0.5),
+    "cop_mf_p1": dict(_MF, csp_penalty_scaling_power=1.0),
+    "cop_mf_p0": dict(_MF, csp_penalty_scaling_power=0.0),
+    # N-scaling on the observed layer only (callables get D)
+    "cop_mf_l1": lambda D: dict(_MF, csp_penalty_scaling_power=[0.5] + [0.0] * (D - 1), csp_penalty_scaling_layers="all"),
+    "cop_mf_l1p1": lambda D: dict(_MF, csp_penalty_scaling_power=[1.0] + [0.0] * (D - 1), csp_penalty_scaling_layers="all"),
+    # family default transition (Gibbs) with merging of near-parallel split columns
+    "cop_gibbs_merge": dict(csp_merge_cosine=0.9, csp_merge_layers="logistic", csp_merge_after=10),
+    "cop_gibbs_merge_top": dict(csp_merge_cosine=0.9, csp_merge_layers="top", csp_merge_after=10),
+    # mean-field draws taken layer by layer from the data upward (N-scaling on the observed layer only)
+    "cop_seq": lambda D: dict(_MF, csp_latent_transition="sequential_mean_field",
+                              csp_penalty_scaling_power=[0.5] + [0.0] * (D - 1), csp_penalty_scaling_layers="all"),
+    "cop_seq_thr": lambda D: dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                                  csp_penalty_scaling_power=[0.5] + [0.0] * (D - 1), csp_penalty_scaling_layers="all"),
+    # family defaults with the deepest layer thresholded too
+    "cop_gibbs_thr": dict(csp_threshold_rule="all"),
+    # ... plus the sqrt(N)-scaled penalty extended to the deep layers
+    "cop_seq_thr_s05": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                            csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all"),
+    "cop_seq_thr_s05top": lambda D: dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                                         csp_penalty_scaling_power=[0.5] + [0.0] * (D - 2) + [0.5],
+                                         csp_penalty_scaling_layers="all"),
+    "cop_gibbs_thr_s05": dict(csp_threshold_rule="all", csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all"),
+}
+
+
+def _variant(kernel, D):
+    spec = ENGINE_VARIANTS[kernel]
+    return spec(D) if callable(spec) else spec
 
 
 def family_layer1(truth, family):
@@ -100,6 +134,9 @@ def run_kernel(kernel, family, Y, truth, N, seed):
     elif kernel == "dde_csp_cop":
         res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False,
                   csp_backend="copula", **common)
+    elif kernel in ENGINE_VARIANTS:
+        res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False,
+                  csp_backend="copula", **_variant(kernel, D), **common)
     elif kernel == "semi_csp_cop":
         res = fit(Y, model="SemiDDE", D=D, max_it=50, random_state=seed, verbose=False, csp_backend="copula", **common)
     elif kernel == "semi_csp":
@@ -126,6 +163,24 @@ def fitted_full_B(res, truth):
     return out
 
 
+def latent_recovery(A_true, A_fit):
+    """Per layer: Hungarian-matched |corr| between true and fitted latent columns, averaged over the true columns."""
+    from scipy.optimize import linear_sum_assignment
+
+    out = []
+    for At, Af in zip(A_true, A_fit):
+        At = np.asarray(At, dtype=float)
+        Af = np.asarray(Af, dtype=float)
+        Af = Af[:, Af.std(axis=0) > 0]
+        if Af.shape[1] == 0:
+            out.append(0.0)
+            continue
+        corr = np.abs(np.corrcoef(At.T, Af.T)[: At.shape[1], At.shape[1]:])
+        rows, cols = linear_sum_assignment(-corr)
+        out.append(float(corr[rows, cols].sum() / At.shape[1]))
+    return out
+
+
 def run_task(task):
     settings_dir, scenario, family, kernel, N, rep = task
     import sys
@@ -141,7 +196,9 @@ def run_task(task):
         res = run_kernel(kernel, family, Y, truth, N, seed)
         widths = [int(k) for k in res.K_list]
         B_full = fitted_full_B(res, truth)
+        A_fit = getattr(res, "A_list", None)
         row.update(status="ok", widths=widths, accG=paper_graph_accuracy(truth, B_full),
+                   latent_corr=None if A_fit is None else latent_recovery(A_true, A_fit),
                    iterations=int(res.diagnostics.get("iterations", -1)) if isinstance(res.diagnostics, dict) else -1)
     except Exception as exc:
         row.update(status="error", error=f"{type(exc).__name__}: {exc}", trace=traceback.format_exc()[-1500:])
@@ -186,7 +243,9 @@ def main():
             fh.flush()
             if row["status"] == "ok":
                 print(f"{row['scenario']} {row['family']:9s} {row['kernel']:8s} N={row['N']} rep={row['rep']}: "
-                      f"K={row['widths']} accG={np.round(row['accG'], 3).tolist()} {row['seconds']:.0f}s", flush=True)
+                      f"K={row['widths']} accG={np.round(row['accG'], 3).tolist()} "
+                      f"latent={None if row['latent_corr'] is None else np.round(row['latent_corr'], 2).tolist()} "
+                      f"{row['seconds']:.0f}s", flush=True)
             else:
                 print(f"ERROR {row['scenario']} {row['family']} {row['kernel']} N={row['N']} rep={row['rep']}: {row['error']}",
                       flush=True)
