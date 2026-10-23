@@ -308,3 +308,28 @@ def test_semidde_csp_rejects_incompatible_path_arguments(overrides, message):
     args.update(overrides)
     with pytest.raises(ValueError, match=message):
         fit(Y, **args)
+
+
+def test_semidde_csp_copula_backend_updates_g_every_iteration():
+    rng = np.random.default_rng(5)
+    N, J = 240, 18
+    A2 = rng.binomial(1, 0.5, (N, 2))
+    A1 = rng.binomial(1, 1 / (1 + np.exp(-(-2.0 + A2 @ np.repeat(np.eye(2), 3, axis=0).T * 4.0))))
+    B1 = np.zeros((J, 6))
+    for k in range(6):
+        B1[[k, 6 + k, 12 + k], k] = 2.0
+    Z = A1 @ B1.T + rng.normal(scale=0.7, size=(N, J))
+    Y = np.exp(Z)
+    from dde import fit
+
+    res = fit(
+        Y, model="SemiDDE", D=2, dimension_method="csp", csp_backend="copula",
+        t_spike=(0.02, 0.04), temp=0.7, tau=0.4, C=1, max_it=8, random_state=3, verbose=False,
+    )
+    assert res.diagnostics["backend"] == "copula"
+    assert len(res.diagnostics["g_relative_history"]) >= 1
+    assert res.transformed.shape == Y.shape
+    assert np.all(np.isfinite(res.transformed))
+    with pytest.raises(ValueError, match="csp_backend"):
+        fit(Y, model="SemiDDE", D=2, dimension_method="csp", csp_backend="bogus",
+            t_spike=(0.02, 0.04), temp=0.7, tau=0.4, C=1, max_it=2, verbose=False)

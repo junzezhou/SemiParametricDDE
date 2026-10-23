@@ -253,6 +253,8 @@ def fit_parametric_csp_copula(
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
+    observed_update=None,
+    observed_update_every: int = 1,
 ):
     """Fit a maximal-width parametric DDE with the CopDDE CSP algorithm.
 
@@ -371,6 +373,12 @@ def fit_parametric_csp_copula(
         once the burn-in ends (the model is permutation invariant, the
         ordered CUSP prior is not), as the MCEM kernel does.
     random_state : ``None`` for the legacy global RNG, else a seed/Generator.
+    observed_update : optional callable ``f(X, state) -> X_new`` (Normal family
+        only) applied after every ``observed_update_every``-th committed
+        iteration; ``state`` holds ``prop``, ``B_list``, ``gamma``, ``A_list``,
+        ``active_masks`` and ``iteration``.  This is the slot of the CopDDE
+        rank-likelihood resampling of ``Z``; the SemiDDE CSP uses it for its
+        semiparametric transformation (g) step.  ``None`` keeps ``X`` fixed.
 
     Returns
     -------
@@ -468,6 +476,12 @@ def fit_parametric_csp_copula(
         raise ValueError("observed_noise_scale must be finite and nonnegative.")
     if observed_noise_scale > 0 and not is_normal:
         raise ValueError("observed_noise_scale applies to the Normal family only.")
+    if observed_update is not None and not is_normal:
+        raise ValueError("observed_update applies to the Normal family only.")
+    observed_update_every = int(observed_update_every)
+    if observed_update_every < 1:
+        raise ValueError("observed_update_every must be a positive integer.")
+    observed_update_count = 0
     fista_maxiter = _DEFAULT_FISTA_MAXITER if fista_maxiter is None else int(fista_maxiter)
     if fista_maxiter < 1:
         raise ValueError("fista_maxiter must be a positive integer.")
@@ -868,6 +882,32 @@ def fit_parametric_csp_copula(
         gamma = None if gamma_update is None else gamma_update.copy()
         prop = prop_update.copy()
 
+        # 11) Optional observed-layer update (SemiDDE g step), from the
+        #     committed state and the current CSP allocation.
+        if (
+            observed_update is not None
+            and shrinkage_active
+            and it_num % observed_update_every == 0
+            and not stop_now
+        ):
+            X = np.asarray(
+                observed_update(
+                    X,
+                    {
+                        "prop": prop,
+                        "B_list": B_list,
+                        "gamma": gamma,
+                        "A_list": A_list,
+                        "active_masks": [csp_active_mask(value) for value in z_cusp],
+                        "iteration": it_num,
+                    },
+                ),
+                dtype=float,
+            )
+            if x_sq_sum is not None:
+                x_sq_sum = np.sum(X**2, axis=0)
+            observed_update_count += 1
+
         if verbose:
             print(
                 f"{family.name} CSP (copula kernel) iteration {it_num}, "
@@ -933,6 +973,8 @@ def fit_parametric_csp_copula(
         "burn_permutations": burn_permutations,
         "relative_history": [tuple(values) for values in rel_hist],
         "trace": trace,
+        "X": X,
+        "observed_update_count": observed_update_count,
     }
 
 

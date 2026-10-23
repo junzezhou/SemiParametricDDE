@@ -18,6 +18,7 @@ tau = max(.3, 3 N^-.3), 50 iterations, C = 1, maximal widths J/3, J/9, J/27):
              Poisson: MCEM backend)
   dde_csp_cop  Bernoulli/Poisson on the copula-structured engine (csp_backend='copula')
   semi_csp   fit(model='SemiDDE', dimension_method='csp')
+  semi_csp_cop SemiDDE on the copula-structured engine with a g step every iteration
 
 Scores: final widths and the paper's graph accuracy (copdde_paper_metrics), which
 needs only the fitted support and the alignment, so it applies to every family.
@@ -42,7 +43,7 @@ FAMILY_KERNELS = {
     "normal": ("copdde", "dde_csp"),
     "bernoulli": ("copdde", "dde_csp", "dde_csp_cop"),
     "poisson": ("copdde", "dde_csp", "dde_csp_cop"),
-    "semidde": ("copdde", "semi_csp"),
+    "semidde": ("copdde", "semi_csp", "semi_csp_cop"),
 }
 
 
@@ -99,6 +100,8 @@ def run_kernel(kernel, family, Y, truth, N, seed):
     elif kernel == "dde_csp_cop":
         res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False,
                   csp_backend="copula", **common)
+    elif kernel == "semi_csp_cop":
+        res = fit(Y, model="SemiDDE", D=D, max_it=50, random_state=seed, verbose=False, csp_backend="copula", **common)
     elif kernel == "semi_csp":
         res = fit(Y, model="SemiDDE", D=D, max_it=50, random_state=seed, verbose=False, **common)
     else:

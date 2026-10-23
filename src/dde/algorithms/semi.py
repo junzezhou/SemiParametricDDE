@@ -12,7 +12,7 @@ from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
 from .normal_init_semi import Normal_init_semi, rank_gaussianize_columns
-from .semi_csp import get_SAEM_semiparametric_csp
+from .semi_csp import get_SAEM_semiparametric_csp, get_SAEM_semiparametric_csp_copula
 from .semi_em import get_EM_est
 from .semi_saem import get_SAEM_normal, get_SAEM_semiparametricv1
 
@@ -225,6 +225,11 @@ def _fit_semidde_csp(Y, K_max, kwargs, *, initialization):
         )
 
     max_inner_iter = _pop_inner_iterations(kwargs)
+    backend = str(kwargs.pop("csp_backend", "mcem")).strip().lower()
+    if backend == "copula":
+        return _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, initialization=initialization)
+    if backend != "mcem":
+        raise ValueError("SemiDDE csp_backend must be 'mcem' or 'copula'.")
     accepted = {
         "X_in",
         "prop_in",
@@ -299,6 +304,58 @@ def _fit_semidde_csp(Y, K_max, kwargs, *, initialization):
         A_list=raw["A_list"],
         diagnostics=diagnostics,
         raw=raw,
+        min_active=True,
+    )
+    return DDEResult(
+        model="semi",
+        K_list=list(compressed["diagnostics"]["K_list"]),
+        prop=compressed["prop"],
+        B_list=compressed["B_list"],
+        gamma=raw["gamma"],
+        A_list=compressed["A_list"],
+        transformed=raw["X"],
+        diagnostics=compressed["diagnostics"],
+        raw=compressed["raw"],
+    )
+
+
+def _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, *, initialization):
+    accepted = {
+        "X_in", "prop_in", "B_list_in", "gamma_in", "A_list_in", "C", "t_spike", "temp", "tau", "tol",
+        "g_update_every", "g_estimator", "g_mode", "max_enum_bits", "mc_samples", "delta", "random_state",
+        "optimizer_maxiter", "keep_trace", "verbose",
+    }
+    engine = {key: kwargs.pop(key) for key in list(kwargs) if key.startswith("csp_")}
+    unknown = sorted(set(kwargs) - accepted)
+    if unknown:
+        raise TypeError("Unexpected SemiDDE CSP argument(s): " + ", ".join(unknown) + ".")
+    engine = {key[len("csp_"):]: value for key, value in engine.items()}
+    raw = get_SAEM_semiparametric_csp_copula(Y=Y, max_iter=max_inner_iter, **kwargs, **engine)
+    diagnostics = {
+        "iterations": raw["iterations"],
+        "D": len(K_max),
+        "K_list": tuple(raw["num_active"].tolist()),
+        "K_max_list": tuple(K_max),
+        "original_K_list": tuple(K_max),
+        "dimension_method": "csp",
+        "initialization": initialization,
+        "backend": "copula",
+        "kernel": "semiparametric_pseudo_observation_copula_csp",
+        "pseudo_observation_update": "semiparametric_g_every_iteration",
+        "g_estimator": raw["g_estimator"],
+        "threshold_rule": raw["threshold_rule"],
+        "num_active": raw["num_active"].copy(),
+        "allocation": [value.copy() for value in raw["allocation"]],
+        "omega": [value.copy() for value in raw["omega"]],
+        "slab_scale": [value.copy() for value in raw["slab_scale"]],
+        "relative_history": raw["relative_history"],
+        "g_relative_history": raw["g_relative_history"],
+        "temperature": raw["temperature"],
+        "latent_transition": raw["latent_transition"],
+        "mc_state_update": raw["mc_state_update"],
+    }
+    compressed = compress_csp_result_components(
+        prop=raw["prop"], B_list=raw["B_list"], A_list=raw["A_list"], diagnostics=diagnostics, raw=raw,
         min_active=True,
     )
     return DDEResult(
