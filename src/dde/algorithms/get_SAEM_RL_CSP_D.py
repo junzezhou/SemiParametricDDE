@@ -17,7 +17,9 @@ For ``d >= 1``, ``B_list[d]`` maps parent layer ``A_list[d]`` to child layer
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from statistics import NormalDist
 from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -35,6 +37,16 @@ except Exception:  # pragma: no cover
 
 
 _EPS_PROB = 1e-12
+_STD_NORMAL = NormalDist()
+_SQRT2 = math.sqrt(2.0)
+
+
+def _scalar_norm_cdf(x, mu, sd):
+    if x == np.inf:
+        return 1.0
+    if x == -np.inf:
+        return 0.0
+    return 0.5 * math.erfc(-(x - mu) / (sd * _SQRT2))
 
 
 @dataclass(frozen=True)
@@ -124,6 +136,21 @@ def _sample_rank_likelihood_Z(
                     continue
                 lb = -np.inf if rr == 0 or group_max[rr - 1] == -np.inf else group_max[rr - 1]
                 ub = np.inf if rr == n_levels - 1 or group_min[rr + 1] == np.inf else group_min[rr + 1]
+                if idx.size == 1:
+                    # Scalar fast path (continuous margins have one observation per
+                    # rank level); same draw, same order, math-library cdf/ppf.
+                    i = int(idx[0])
+                    m = float(mu_j[i])
+                    pl = min(max(_scalar_norm_cdf(lb, m, sd_j), _EPS_PROB), 1.0 - _EPS_PROB)
+                    pu = min(max(_scalar_norm_cdf(ub, m, sd_j), _EPS_PROB), 1.0 - _EPS_PROB)
+                    if pu <= pl:
+                        pl = pu = 0.5 * (pl + pu)
+                    u = pl + (pu - pl) * float(np.random.rand(1)[0])
+                    z = m + sd_j * _STD_NORMAL.inv_cdf(min(max(u, 1e-300), 1.0 - 1e-16))
+                    Zj[i] = z
+                    group_min[rr] = z
+                    group_max[rr] = z
+                    continue
                 pL = norm.cdf(lb, loc=mu_j[idx], scale=sd_j)
                 pU = norm.cdf(ub, loc=mu_j[idx], scale=sd_j)
                 pL = np.clip(pL, _EPS_PROB, 1.0 - _EPS_PROB)
