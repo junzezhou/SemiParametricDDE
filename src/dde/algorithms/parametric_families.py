@@ -1219,7 +1219,7 @@ class PoissonFamilyAdapter:
         coordinate_chunk_size,
     ):
         del dispersion, response_cache
-        from .parametric_csp_mcem import _solve_poisson_weighted_l1
+        from .csp_solvers import _solve_poisson_weighted_l1
 
         return (
             _solve_poisson_weighted_l1(
@@ -1459,7 +1459,7 @@ class BernoulliFamilyAdapter:
         coordinate_chunk_size,
     ):
         del dispersion, response_cache
-        from .parametric_csp_mcem import _solve_logistic_weighted_l1
+        from .csp_solvers import _solve_logistic_weighted_l1
 
         return (
             _solve_logistic_weighted_l1(

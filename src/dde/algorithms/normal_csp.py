@@ -49,18 +49,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from .csp import csp_active_mask, update_csp_layer
+from .csp import _canonicalize_csp_layer_order, csp_active_mask, update_csp_layer
+from .csp_solvers import _solve_logistic_weighted_l1, _solve_poisson_weighted_l1
 from .get_SAEM_RL_CSP_D import (
     _make_bounds,
     _optimize_gaussian_layer,
     _optimize_logistic_layer,
     _threshold,
     _update_bernoulli_probabilities_D,
-)
-from .parametric_csp_mcem import (
-    _canonicalize_csp_layer_order,
-    _solve_logistic_weighted_l1,
-    _solve_poisson_weighted_l1,
 )
 from .normal_init_cop import _binary_init_matlab
 from .normal_init_semi import initialize_binary_parent

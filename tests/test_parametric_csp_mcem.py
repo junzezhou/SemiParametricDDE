@@ -3,12 +3,12 @@ from scipy.special import expit
 
 from dde import fit
 from dde.utils import logistic
+from dde.algorithms.csp import _canonicalize_csp_layer_order
+from dde.algorithms.csp_solvers import _solve_logistic_weighted_l1
 from dde.algorithms.parametric_csp_mcem import (
     _apply_staged_parent_cap_only,
-    _canonicalize_csp_layer_order,
     _solve_gaussian_weighted_l1,
     _solve_gaussian_weighted_l1_from_statistics,
-    _solve_logistic_weighted_l1,
     _spectral_parent_width,
     fit_parametric_csp_mcem,
 )

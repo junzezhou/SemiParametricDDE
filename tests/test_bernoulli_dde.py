@@ -13,13 +13,13 @@ from dde.algorithms.bernoulli_init import (
     Bernoulli_init,
     _bernoulli_working_response,
 )
-from dde.algorithms.parametric_csp_mcem import (
-    _canonicalize_csp_layer_order,
+from dde.algorithms.csp import _canonicalize_csp_layer_order
+from dde.algorithms.csp_solvers import (
     _logistic_mc_design_and_response_statistic,
     _logistic_mc_value_and_grad,
     _solve_logistic_weighted_l1,
-    fit_bernoulli_csp_mcem,
 )
+from dde.algorithms.parametric_csp_mcem import fit_bernoulli_csp_mcem
 from dde.algorithms.parametric_families import (
     BERNOULLI_FAMILY,
     _binary_child_conditional_logit,

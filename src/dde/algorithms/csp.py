@@ -154,6 +154,32 @@ def update_csp_layer(
     return allocation, penalty_scale, slab_scale, omega_update
 
 
+def _canonicalize_csp_layer_order(prop, B_list, A_list):
+    """Order latent coordinates by loading strength without changing the model.
+
+    The cumulative-shrinkage prior is ordered, whereas spectral/varimax
+    initialization is permutation invariant.  A simultaneous permutation of
+    a layer's incoming columns, persistent states, and outgoing rows preserves
+    every model probability while placing the strongest coordinates first.
+    """
+    prop = np.asarray(prop, dtype=float).copy()
+    B_list = [np.asarray(B, dtype=float).copy() for B in B_list]
+    A_list = [np.asarray(A).copy() for A in A_list]
+    permutations = []
+    D = len(B_list)
+    for d in range(D):
+        strength = np.sum(np.abs(B_list[d][:, 1:]), axis=0)
+        permutation = np.argsort(-strength, kind="stable")
+        permutations.append(permutation)
+        B_list[d][:, 1:] = B_list[d][:, permutation + 1]
+        A_list[d] = A_list[d][:, permutation]
+        if d + 1 < D:
+            B_list[d + 1] = B_list[d + 1][permutation, :]
+        else:
+            prop = prop[permutation]
+    return prop, B_list, A_list, permutations
+
+
 __all__ = [
     "csp_active_mask",
     "maximal_identifiable_widths",
