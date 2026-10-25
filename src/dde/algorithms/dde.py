@@ -28,6 +28,8 @@ DEFAULT_PARAMETRIC_CONVERGENCE_TOL = 0.005
 _BERNOULLI_CSP_PENALTY_REFERENCE_N = 1000.0
 _BERNOULLI_CSP_PENALTY_POWER = 2.0 / 3.0
 _BERNOULLI_CSP_SHRINKAGE_BURN = 10
+# Copula-backend Bernoulli/Poisson CSP: full iteration budget, no early stop.
+_DISCRETE_COPULA_CSP_MAX_IT = 100
 
 
 def _resolve_mcem_shrinkage_defaults(
@@ -240,8 +242,8 @@ def fit_parametric_dde(
     temp=None,
     tau: float,
     C: int,
-    tol: float = DEFAULT_PARAMETRIC_CONVERGENCE_TOL,
-    max_it: int = 50,
+    tol=None,
+    max_it=None,
     initialize: str = "data",
     epsilon: float = 1e-4,
     prop_in=None,
@@ -265,7 +267,7 @@ def fit_parametric_dde(
     mcem_stage_spectral_gap_threshold=None,
     csp_backend=None,
     csp_initializer=None,
-    csp_threshold_rule: str = "first_two",
+    csp_threshold_rule=None,
     csp_mstep_solver: str = "fista_lower",
     csp_mstep_latent: str = "draw",
     csp_observed_noise_scale: float = 0.0,
@@ -274,7 +276,7 @@ def fit_parametric_dde(
     csp_slab_rate: float = 5.0,
     csp_penalty_scaling_power=None,
     csp_penalty_scaling_reference: float = 500.0,
-    csp_penalty_scaling_layers: str = "lower",
+    csp_penalty_scaling_layers=None,
     csp_penalty_scaling_allocation: bool = False,
     csp_latent_transition=None,
     csp_mc_state_update=None,
@@ -286,7 +288,7 @@ def fit_parametric_dde(
     csp_merge_layers: str = "top",
     csp_shrinkage_burn=None,
     csp_reorder_after_shrinkage_burn: bool = True,
-    csp_top_prune: str = "none",
+    csp_top_prune=None,
     csp_top_prune_after: int = 10,
     csp_top_prune_every: int = 5,
     csp_top_prune_em_iter: int = 20,
@@ -319,6 +321,9 @@ def fit_parametric_dde(
 
     For fixed-width fits, ``tol`` is the postprocessed parameter-update RMSE.
     Its default is ``0.005`` for a dimension-independent convergence scale.
+    ``tol=None`` and ``max_it=None`` select ``0.005`` and 50 iterations,
+    except for the copula-backend Bernoulli/Poisson CSP (their default CSP
+    path), which runs 100 iterations with ``tol=0`` (no early stop).
 
     Normal CSP has a single kernel, ``csp_backend="copula"``: the CopDDE
     D-layer CSP algorithm with the rank-likelihood resampling removed because
@@ -340,19 +345,22 @@ def fit_parametric_dde(
     ``csp_penalty_scaling_power=0`` restores the CopDDE M-step in every
     layer; ``csp_slab_shape`` and ``csp_slab_rate`` change the CUSP slab
     hyperprior (CopDDE 1 and 5).
-    Bernoulli and Poisson CSP use the simultaneous ``"mcem"`` path by default.
-    The explicit ``"mcem_reinitialize"`` backend performs staged parent
-    rebuilding, while ``"mcem_cap_only"`` applies staged child-implied caps
-    and preserves eligible parent state.  ``mcem_*`` controls apply to those
-    backends only.  ``csp_backend="copula"`` is also available for
-    ``family="Bernoulli"`` (logistic observed layer); there it defaults to
-    the persistent coordinate-Gibbs transition
-    (``csp_latent_transition="systematic_coordinate_gibbs"``), because a
-    single mean-field draw attenuates the deep layers of binary data to the
-    spike, and to a ``sqrt(N)`` penalty (``csp_penalty_scaling_power=0.5``)
-    with a slab-start burn-in for ``D >= 3``: binary data under-select true
-    columns at small ``N``, and the N-proportional Normal penalty makes
-    that worse.
+    Bernoulli and Poisson CSP also default to the copula kernel
+    (``csp_backend="copula"``), with a logistic or log-link observed layer
+    and these family defaults: the sequential mean-field transition
+    (``csp_latent_transition="sequential_mean_field"``; the synchronous
+    CopDDE draws attenuate the deep coefficients of discrete data until
+    weak layers die), a ``sqrt(N)`` penalty in every layer
+    (``csp_penalty_scaling_power=0.5``, ``csp_penalty_scaling_layers="all"``),
+    hard thresholding of every layer (``csp_threshold_rule="all"``), the
+    dense marginal-likelihood deletion test for the deepest layer
+    (``csp_top_prune="bic_dense"``), no slab burn-in, and 100 iterations
+    without early stop.  The former default, the simultaneous ``"mcem"``
+    path, stays available with ``csp_backend="mcem"``; the
+    ``"mcem_reinitialize"`` backend performs staged parent rebuilding, while
+    ``"mcem_cap_only"`` applies staged child-implied caps and preserves
+    eligible parent state.  ``mcem_*`` controls apply to those backends
+    only.
     ``csp_shrinkage_burn`` holds every column in the CUSP slab (no
     allocation, thresholding or convergence check) for that many initial
     iterations before the CUSP updates start, the slab-start warm-up of
@@ -364,11 +372,10 @@ def fit_parametric_dde(
     ``csp_convergence_width_window`` makes its stopping rule wait for
     unchanged active widths, and ``csp_staged_shrinkage_window`` starts the
     CUSP updates layer by layer from the data upward; see
-    :func:`fit_parametric_csp_copula`.  ``None`` selects the Bernoulli copula
-    defaults of ``Results/bernoulli_dde_csp_copula_kernel/REPORT.md``: a
-    burn-in of 10 iterations when ``D >= 3`` and ``max_it >= 20`` together
-    with ``csp_penalty_scaling_power=0.5``, and no burn-in otherwise (the
-    Normal family never burns in).
+    :func:`fit_parametric_csp_copula`.  ``None`` for the copula options
+    selects the family defaults above (Normal: synchronous transition,
+    N-proportional penalty on layers 1..D-1, ``csp_threshold_rule=
+    "first_two"``, no deletion test, no burn-in).
 
     Fixed-width fits take three further controls, with Poisson defaults
     chosen by the D=2..5 recovery study of ``Results/dde_poisson_fixed_*``,
@@ -468,6 +475,20 @@ def fit_parametric_dde(
         K_tuple = maximal_identifiable_widths(X.shape[1], D)
         penalties = None
 
+    # The copula-backend Bernoulli/Poisson CSP (the default CSP backend of
+    # those families) runs its full iteration budget: column pruning pauses
+    # for 15-25 iterations while the relative coefficient change is already
+    # small, and the relative-change rule stops earlier at larger N, leaving
+    # over-selected layers.  ``tol=0`` disables that rule.
+    discrete_copula_csp = (
+        method == "csp"
+        and family_adapter.key in ("bernoulli", "poisson")
+        and (csp_backend is None or str(csp_backend).strip().lower() == "copula")
+    )
+    if max_it is None:
+        max_it = _DISCRETE_COPULA_CSP_MAX_IT if discrete_copula_csp else 50
+    if tol is None:
+        tol = 0.0 if discrete_copula_csp else DEFAULT_PARAMETRIC_CONVERGENCE_TOL
     tau = float(tau)
     tol = float(tol)
     epsilon = float(epsilon)
@@ -511,12 +532,7 @@ def fit_parametric_dde(
         )
     # The anchor initializers are opt-in for the copula-backend Bernoulli and
     # Poisson CSP (the maximal-width start of that kernel).
-    anchor_csp = (
-        method == "csp"
-        and csp_backend is not None
-        and str(csp_backend).strip().lower() == "copula"
-        and (is_bernoulli or is_poisson)
-    )
+    anchor_csp = discrete_copula_csp
     if fixed_init_binarize == "anchor_mixture" and (
         not (is_poisson or is_normal) or (method != "fixed" and not anchor_csp)
     ):
@@ -552,11 +568,7 @@ def fit_parametric_dde(
         )
 
     if csp_backend is None:
-        backend = (
-            "copula"
-            if method == "csp" and family_adapter.key == "normal"
-            else "mcem"
-        )
+        backend = "copula" if method == "csp" else "mcem"
     else:
         backend = str(csp_backend).strip().lower()
     if method == "csp" and backend == "copula" and family_adapter.key not in (
@@ -573,6 +585,25 @@ def fit_parametric_dde(
             "Normal CSP uses the copula kernel only; the MCEM backends "
             "('mcem', 'mcem_reinitialize', 'mcem_cap_only') were removed for "
             "family='Normal'.  Omit csp_backend or pass csp_backend='copula'."
+        )
+    mcem_overrides = [
+        name
+        for name, value, default in (
+            ("mcem_stage_min_iter", mcem_stage_min_iter, 20),
+            ("mcem_stage_width_window", mcem_stage_width_window, 10),
+            ("mcem_stage_freeze_deeper", mcem_stage_freeze_deeper, True),
+            ("mcem_penalty_strength", mcem_penalty_strength, None),
+            ("mcem_shrinkage_burn", mcem_shrinkage_burn, None),
+            ("mcem_reorder_after_shrinkage_burn", mcem_reorder_after_shrinkage_burn, True),
+            ("mcem_stage_spectral_gap_threshold", mcem_stage_spectral_gap_threshold, None),
+        )
+        if value != default
+    ]
+    if method == "csp" and backend == "copula" and mcem_overrides:
+        raise ValueError(
+            ", ".join(mcem_overrides) + " apply to the MCEM CSP backends only; the "
+            "default CSP backend is 'copula'.  Pass csp_backend='mcem' (or "
+            "'mcem_reinitialize', 'mcem_cap_only') to use them."
         )
     if csp_initializer is None:
         csp_initializer = "family"
@@ -774,28 +805,33 @@ def fit_parametric_dde(
         )
 
     if backend == "copula":
-        # Family defaults for the copula kernel: the Gaussian observed layer
+        # Family defaults for the copula kernel.  The Gaussian observed layer
         # identifies the latent states well enough for the CopDDE single
-        # mean-field draw and benefits from the N-scaled lower-layer penalty;
-        # the Bernoulli observed layer needs the persistent coordinate-Gibbs
-        # transition (a mean-field draw attenuates the deep layers to the
-        # spike) and under-selects when the penalty grows with N.
+        # synchronous mean-field draw and benefits from the N-scaled
+        # lower-layer penalty.  On Bernoulli/Poisson data the synchronous
+        # draws of consecutive layers are independent given the previous
+        # state, which attenuates the deep coefficients every iteration (weak
+        # deep layers die); the sequential transition draws each layer given
+        # the fresh draw below.  The deepest layer is thresholded and tested
+        # by the dense BIC deletion test (the CUSP allocation keeps any column
+        # above a fixed coefficient scale at every N), and the sqrt(N)
+        # penalty applies to every layer
+        # (Results/csp_redesign/bench_v2, arm cop_seqPD100).
+        discrete = family_adapter.key in ("bernoulli", "poisson")
         if csp_latent_transition is None:
             csp_latent_transition = (
-                "synchronous_mean_field"
-                if family_adapter.key == "normal"
-                else "systematic_coordinate_gibbs"
+                "sequential_mean_field" if discrete else "synchronous_mean_field"
             )
         if csp_penalty_scaling_power is None:
-            csp_penalty_scaling_power = 1.0 if family_adapter.key == "normal" else 0.5
+            csp_penalty_scaling_power = 0.5 if discrete else 1.0
+        if csp_penalty_scaling_layers is None:
+            csp_penalty_scaling_layers = "all" if discrete else "lower"
+        if csp_threshold_rule is None:
+            csp_threshold_rule = "all" if discrete else "first_two"
+        if csp_top_prune is None:
+            csp_top_prune = "bic_dense" if discrete else "none"
         if csp_shrinkage_burn is None:
-            csp_shrinkage_burn = (
-                _BERNOULLI_CSP_SHRINKAGE_BURN
-                if family_adapter.key in ("bernoulli", "poisson")
-                and D >= 3
-                and max_it >= 2 * _BERNOULLI_CSP_SHRINKAGE_BURN
-                else 0
-            )
+            csp_shrinkage_burn = 0
         raw = fit_parametric_csp_copula(
             X,
             prop,

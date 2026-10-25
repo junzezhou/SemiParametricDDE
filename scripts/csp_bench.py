@@ -17,8 +17,14 @@ tau = max(.3, 3 N^-.3), 50 iterations, C = 1, maximal widths J/3, J/9, J/27):
              own defaults otherwise (Normal: copula-derived kernel; Bernoulli and
              Poisson: MCEM backend)
   dde_csp_cop  Bernoulli/Poisson on the copula-structured engine (csp_backend='copula')
-  semi_csp   fit(model='SemiDDE', dimension_method='csp')
+  dde_csp_mcem Bernoulli/Poisson on the MCEM backend (the default until the CSP default switch)
+  semi_csp   fit(model='SemiDDE', dimension_method='csp') with the kernel's defaults
+  semi_csp_mcem SemiDDE on the MCEM backend (the default until the CSP default switch)
   semi_csp_cop SemiDDE on the copula-structured engine with a g step every iteration
+  semi_csp_cop100 the same with 100 iterations and no early stop
+
+  bench_v1 rows labelled dde_csp / semi_csp were fitted before the default switch
+  (MCEM backend for Bernoulli, Poisson and SemiDDE).
 
 Scores: final widths and the paper's graph accuracy (copdde_paper_metrics), which
 needs only the fitted support and the alignment, so it applies to every family.
@@ -40,10 +46,10 @@ from pathlib import Path
 import numpy as np
 
 FAMILY_KERNELS = {
-    "normal": ("copdde", "dde_csp"),
-    "bernoulli": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100"),
-    "poisson": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100"),
-    "semidde": ("copdde", "semi_csp", "semi_csp_cop"),
+    "normal": ("copdde", "dde_csp", "cop_norm100"),
+    "bernoulli": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100", "dde_csp_mcem"),
+    "poisson": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100", "dde_csp_mcem"),
+    "semidde": ("copdde", "semi_csp", "semi_csp_mcem", "semi_csp_cop", "semi_csp_cop100"),
 }
 
 
@@ -93,6 +99,8 @@ ENGINE_VARIANTS = {
     "cop_seqPD100": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
                          csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all",
                          csp_top_prune="bic_dense", tol=0.0, max_it=100),
+    # Normal default engine with 100 iterations and no early stop
+    "cop_norm100": dict(tol=0.0, max_it=100),
     "cop_seqPDA100": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
                           csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all",
                           csp_top_prune="bic_dense", tol=0.0, max_it=100, anchor_init=True),
@@ -153,7 +161,8 @@ def run_kernel(kernel, family, Y, truth, N, seed):
         np.random.seed(seed % (2 ** 32))
         res = fit(Y, method="CopDDE", K_list=truth["K_max"].tolist(), it=50, random_state=seed, verbose=False, **common)
     elif kernel == "dde_csp":
-        res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False, **common)
+        # the kernel's own defaults, iteration budget included (Bernoulli/Poisson: 100, no early stop)
+        res = fit(Y, method="DDE", family=family.capitalize(), D=D, random_state=seed, verbose=False, **common)
     elif kernel == "dde_csp_cop":
         res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False,
                   csp_backend="copula", **common)
@@ -164,6 +173,14 @@ def run_kernel(kernel, family, Y, truth, N, seed):
             variant["fixed_init_binarize"] = "anchor_lca" if family == "bernoulli" else "anchor_mixture"
         res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=max_it, random_state=seed, verbose=False,
                   csp_backend="copula", **variant, **common)
+    elif kernel == "dde_csp_mcem":
+        res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False,
+                  csp_backend="mcem", **common)
+    elif kernel == "semi_csp_mcem":
+        res = fit(Y, model="SemiDDE", D=D, max_it=50, random_state=seed, verbose=False, csp_backend="mcem", **common)
+    elif kernel == "semi_csp_cop100":
+        res = fit(Y, model="SemiDDE", D=D, max_it=100, random_state=seed, verbose=False, csp_backend="copula",
+                  tol=0.0, **common)
     elif kernel == "semi_csp_cop":
         res = fit(Y, model="SemiDDE", D=D, max_it=50, random_state=seed, verbose=False, csp_backend="copula", **common)
     elif kernel == "semi_csp":

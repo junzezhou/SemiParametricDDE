@@ -1260,7 +1260,7 @@ def test_public_fixed_bernoulli_supports_three_latent_layers():
     assert all(np.all(np.isfinite(B)) for B in result.B_list)
 
 
-def test_public_bernoulli_csp_defaults_to_mcem_reproducibly():
+def test_public_bernoulli_csp_mcem_backend_is_reproducible():
     X, prop, B_list, A_list = _bernoulli_state(921)
     arguments = dict(
         method="DDE",
@@ -1281,6 +1281,7 @@ def test_public_bernoulli_csp_defaults_to_mcem_reproducibly():
         mcem_stage_width_window=1,
         random_state=922,
         verbose=False,
+        csp_backend="mcem",
     )
 
     first = fit(X, **arguments)
@@ -1369,7 +1370,7 @@ def test_public_bernoulli_csp_uses_data_initialization():
     _assert_result_equal(result, repeated)
     assert result.gamma is None
     assert result.diagnostics["family"] == "Bernoulli"
-    assert result.diagnostics["backend"] == "mcem"
+    assert result.diagnostics["backend"] == "copula"
     assert result.diagnostics["initialization"] == "data"
     assert result.diagnostics["K_max_list"] == (3, 1)
 
@@ -1393,6 +1394,7 @@ def test_public_bernoulli_csp_shrinkage_burn_delays_allocation():
         max_it=4,
         optimizer_maxiter=5,
         mcem_shrinkage_burn=2,
+        csp_backend="mcem",
         random_state=930,
         keep_trace=True,
         verbose=False,
@@ -1480,6 +1482,7 @@ def test_bernoulli_csp_d2_automatic_defaults_are_bitwise_legacy():
         optimizer_maxiter=10,
         random_state=932,
         verbose=False,
+        csp_backend="mcem",
     )
     automatic = fit(X, **arguments)
     legacy = fit(

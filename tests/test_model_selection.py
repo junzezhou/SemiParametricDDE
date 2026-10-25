@@ -378,8 +378,8 @@ def test_selection_connects_every_supported_method_and_refits(method, path, fami
         if path == "fixed":
             candidates[0]["temp"] = 0.7
     base = {"max_iter": 1, "verbose": False}
-    if method == "SemiDDE":
-        base["max_outer_iter"] = 1
+    if method == "SemiDDE" and path == "fixed":
+        base["max_outer_iter"] = 1  # the default (copula) CSP path has no outer loop
     if method == "CopDDE":
         base["optimizer_maxiter"] = 1
     result = select_hyperparameters(
@@ -398,8 +398,6 @@ def test_selection_connects_every_supported_method_and_refits(method, path, fami
 def test_three_layer_default_csp_search_evaluates_all_spike_combinations(method):
     Y = np.random.default_rng(13).normal(size=(36, 27))
     base = {"max_iter": 1, "verbose": False}
-    if method == "SemiDDE":
-        base["max_outer_iter"] = 1
     if method == "CopDDE":
         base["optimizer_maxiter"] = 1
     result = select_hyperparameters(
@@ -536,7 +534,7 @@ def test_select_hyperparameters_semidde_csp_smoke():
     result = select_hyperparameters(
         Y, D=1, model="semi", dimension_method="csp", criterion="ebic",
         candidates={"t_spike": {"per_layer": [[0.02, 0.03]]}, "temp": [0.7], "tau": [0.3]},
-        base_fit_kwargs={"max_outer_iter": 1, "max_iter": 1, "verbose": False},
+        base_fit_kwargs={"max_iter": 1, "verbose": False},
         random_state=3,
     )
     assert len(result.diagnostics["cv_table"]) == 2

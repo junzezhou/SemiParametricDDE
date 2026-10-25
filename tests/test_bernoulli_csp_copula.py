@@ -98,9 +98,12 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
     assert d["standardized"] is False
     assert d["initializer"] == "family"
     assert d["mstep_solver"] == "fista_lower"
-    assert d["latent_transition"] == "systematic_coordinate_gibbs"
+    assert d["latent_transition"] == "sequential_mean_field"
     assert d["penalty_scaling_power"] == (0.5, 0.5)
-    assert d["shrinkage_burn"] == 0  # D=2: no automatic burn-in
+    assert d["penalty_scaling_layers"] == "all"
+    assert d["threshold_rule"] == "all"
+    assert d["top_prune"] == "bic_dense"
+    assert d["shrinkage_burn"] == 0
     assert result.gamma is None
     assert tuple(d["K_max_list"]) == (9, 3)
     K1, K2 = result.K_list
@@ -111,7 +114,17 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
         t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
         random_state=7, verbose=False,
     )
-    assert default.diagnostics["backend"] == "mcem"
+    assert default.diagnostics["backend"] == "copula"
+    mcem = fit(
+        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
+        random_state=7, verbose=False, csp_backend="mcem",
+    )
+    assert mcem.diagnostics["backend"] == "mcem"
+    with pytest.raises(ValueError, match="mcem_shrinkage_burn"):
+        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+            t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
+            verbose=False, mcem_shrinkage_burn=2)
 
 
 def test_bernoulli_copula_backend_rejects_standardize():
@@ -213,7 +226,7 @@ def test_fit_passes_shrinkage_burn_to_copula_backend():
     assert d["iterations"] == 6
 
 
-def test_bernoulli_copula_defaults_burn_in_for_three_layers():
+def test_bernoulli_copula_defaults_and_explicit_burn_in_for_three_layers():
     rng = np.random.default_rng(3)
     X = rng.integers(0, 2, size=(120, 27)).astype(float)
     common = dict(
@@ -222,15 +235,14 @@ def test_bernoulli_copula_defaults_burn_in_for_three_layers():
         verbose=False, csp_backend="copula", keep_trace=True,
     )
     auto = fit(X, max_iter=20, **common)
-    assert auto.diagnostics["shrinkage_burn"] == 10
+    assert auto.diagnostics["shrinkage_burn"] == 0
     assert auto.diagnostics["penalty_scaling_power"] == (0.5, 0.5, 0.5)
-    assert all(
-        tuple(e["num_active"]) == (9, 3, 1) for e in auto.diagnostics["trace"][:10]
-    )
-    short = fit(X, max_iter=12, **common)
-    assert short.diagnostics["shrinkage_burn"] == 0
+    assert auto.diagnostics["iterations"] == 20  # tol=0 by default: no early stop
     explicit = fit(X, max_iter=12, csp_shrinkage_burn=4, **common)
     assert explicit.diagnostics["shrinkage_burn"] == 4
+    assert all(
+        tuple(e["num_active"]) == (9, 3, 1) for e in explicit.diagnostics["trace"][:4]
+    )
 
 
 def test_sequential_transition_matches_synchronous_when_layer_one_is_unchanged():
@@ -399,7 +411,7 @@ def test_anchor_init_is_an_opt_in_for_the_copula_csp_only():
     assert res.diagnostics["init_binarize"] == "anchor_lca"
     assert fit(X, csp_backend="copula", **common).diagnostics["init_binarize"] == "projection"
     with pytest.raises(ValueError, match="anchor_lca"):
-        fit(X, fixed_init_binarize="anchor_lca", **common)
+        fit(X, csp_backend="mcem", fixed_init_binarize="anchor_lca", **common)
     with pytest.raises(ValueError, match="anchor_mixture"):
         fit(X, csp_backend="copula", fixed_init_binarize="anchor_mixture", **common)
 
@@ -422,3 +434,52 @@ def test_dense_bic_prune_removes_a_redundant_column_and_returns_the_refit():
     assert _bic_prune_top_column(
         children, B_true, np.full(2, 0.5), np.array([True, True]), np.ones(6, bool), N, 20, dense=True
     ) is None
+
+
+def _poisson_counts(seed, N=200, J=27, K=6):
+    rng = np.random.default_rng(seed)
+    A = rng.binomial(1, 0.5, size=(N, K)).astype(float)
+    B = np.zeros((J, K))
+    for k in range(K):
+        B[[k, k + K, k + 2 * K], k] = 1.5
+    return rng.poisson(np.exp(A @ B.T)).astype(float)
+
+
+@pytest.mark.parametrize("family", ["Bernoulli", "Poisson"])
+def test_discrete_csp_defaults_are_the_copula_engine_settings(family):
+    X = _simulate(51)[0] if family == "Bernoulli" else _poisson_counts(51)
+    common = dict(method="DDE", family=family, D=2, dimension_method="csp",
+                  t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, random_state=4, verbose=False)
+    default = fit(X, **common)
+    d = default.diagnostics
+    assert d["backend"] == "copula"
+    assert d["latent_transition"] == "sequential_mean_field"
+    assert d["threshold_rule"] == "all"
+    assert d["top_prune"] == "bic_dense"
+    assert d["penalty_scaling_power"] == (0.5, 0.5)
+    assert d["penalty_scaling_layers"] == "all"
+    assert d["shrinkage_burn"] == 0
+    assert d["iterations"] == 100  # max_it=100, tol=0: no early stop
+    explicit = fit(
+        X, **common, max_it=100, tol=0.0, csp_backend="copula",
+        csp_latent_transition="sequential_mean_field", csp_shrinkage_burn=0,
+        csp_threshold_rule="all", csp_penalty_scaling_power=0.5,
+        csp_penalty_scaling_layers="all", csp_top_prune="bic_dense",
+    )
+    assert default.K_list == explicit.K_list
+    np.testing.assert_array_equal(default.prop, explicit.prop)
+    for a, b in zip(default.B_list, explicit.B_list):
+        np.testing.assert_array_equal(a, b)
+    for a, b in zip(default.A_list, explicit.A_list):
+        np.testing.assert_array_equal(a, b)
+    # an explicit budget and tolerance still apply
+    short = fit(X, **common, max_it=7)
+    assert short.diagnostics["iterations"] == 7
+
+
+def test_poisson_copula_csp_runs_with_one_latent_layer():
+    X = _poisson_counts(52)
+    res = fit(X, method="DDE", family="Poisson", D=1, dimension_method="csp",
+              t_spike=[0.03], temp=0.9, tau=0.3, C=1, max_it=5, random_state=2, verbose=False)
+    assert res.diagnostics["backend"] == "copula"  # the single (observed) layer is solved by FISTA
+    assert len(res.K_list) == 1

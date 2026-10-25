@@ -225,7 +225,10 @@ def _fit_semidde_csp(Y, K_max, kwargs, *, initialization):
         )
 
     max_inner_iter = _pop_inner_iterations(kwargs)
-    backend = str(kwargs.pop("csp_backend", "mcem")).strip().lower()
+    # The copula kernel is the default: on the CopDDE paper designs its
+    # deep-layer width error falls with N, the MCEM path's grows
+    # (Results/csp_redesign/bench_v1).
+    backend = str(kwargs.pop("csp_backend", "copula")).strip().lower()
     if backend == "copula":
         return _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, initialization=initialization)
     if backend != "mcem":
@@ -328,7 +331,16 @@ def _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, *, initialization)
     engine = {key: kwargs.pop(key) for key in list(kwargs) if key.startswith("csp_")}
     unknown = sorted(set(kwargs) - accepted)
     if unknown:
-        raise TypeError("Unexpected SemiDDE CSP argument(s): " + ", ".join(unknown) + ".")
+        mcem_only = sorted(set(unknown) & {
+            "max_outer_iter", "g_update_rho", "optimizer_tol", "convergence_window",
+            "convergence_mean_tol", "burn", "bound_val", "estep_row_chunk_size",
+            "estep_coordinate_chunk_size",
+        })
+        hint = (
+            "; " + ", ".join(mcem_only) + " belong to the MCEM path (csp_backend='mcem')"
+            if mcem_only else ""
+        )
+        raise TypeError("Unexpected SemiDDE CSP argument(s): " + ", ".join(unknown) + hint + ".")
     engine = {key[len("csp_"):]: value for key, value in engine.items()}
     raw = get_SAEM_semiparametric_csp_copula(Y=Y, max_iter=max_inner_iter, **kwargs, **engine)
     diagnostics = {
@@ -383,7 +395,10 @@ def fit_semidde(
 
     Fixed mode uses the supplied ``K_list``.  CSP mode requires ``D``, rejects
     ``K_list``, and initializes the recursive maximum identifiable widths
-    ``floor(J/3), floor(floor(J/3)/3), ...`` before shrinking them.
+    ``floor(J/3), floor(floor(J/3)/3), ...`` before shrinking them.  CSP mode
+    runs on the copula kernel by default (``csp_backend="copula"``: the
+    Normal-family engine with a ``g`` step after every committed
+    iteration); ``csp_backend="mcem"`` selects the former MCEM path.
     """
     Y = np.asarray(Y, dtype=float)
     if Y.ndim != 2 or Y.shape[0] < 1 or Y.shape[1] < 1:

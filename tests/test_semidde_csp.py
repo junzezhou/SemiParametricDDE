@@ -44,6 +44,7 @@ def test_semidde_csp_public_path_uses_maximal_width_and_compresses_result():
         tol=0.0,
         max_it=1,
         max_outer_iter=1,
+        csp_backend="mcem",
         optimizer_maxiter=2,
         random_state=731,
         verbose=False,
@@ -96,6 +97,7 @@ def test_semidde_csp_is_reproducible_from_supplied_initial_state():
         tol=0.0,
         max_inner_iter=2,
         max_outer_iter=2,
+        csp_backend="mcem",
         optimizer_maxiter=3,
         random_state=732,
         verbose=False,
@@ -168,6 +170,7 @@ def test_semidde_csp_compresses_a_known_inactive_coefficient_graph(monkeypatch):
         C=1,
         max_it=1,
         max_outer_iter=1,
+        csp_backend="mcem",
         verbose=False,
     )
 
@@ -219,6 +222,7 @@ def test_semidde_csp_does_not_cap_overspecified_parent_width(monkeypatch):
         C=1,
         max_it=1,
         max_outer_iter=1,
+        csp_backend="mcem",
         verbose=False,
     )
 
@@ -273,6 +277,7 @@ def test_semidde_csp_carries_copula_state_across_outer_updates(monkeypatch):
         C=1,
         max_it=1,
         max_outer_iter=2,
+        csp_backend="mcem",
         verbose=False,
     )
 
@@ -333,3 +338,14 @@ def test_semidde_csp_copula_backend_updates_g_every_iteration():
     with pytest.raises(ValueError, match="csp_backend"):
         fit(Y, model="SemiDDE", D=2, dimension_method="csp", csp_backend="bogus",
             t_spike=(0.02, 0.04), temp=0.7, tau=0.4, C=1, max_it=2, verbose=False)
+
+
+def test_semidde_csp_defaults_to_the_copula_engine():
+    Y = _semidde_sample()
+    args = dict(model="SemiDDE", D=2, dimension_method="csp", t_spike=[0.03, 0.05],
+                temp=0.9, tau=0.3, C=1, max_it=2, random_state=3, verbose=False)
+    result = fit(Y, **args)
+    assert result.diagnostics["backend"] == "copula"
+    assert fit(Y, csp_backend="mcem", max_outer_iter=1, **args).diagnostics["backend"] == "mcem"
+    with pytest.raises(TypeError, match="max_outer_iter belong to the MCEM path"):
+        fit(Y, max_outer_iter=1, **args)

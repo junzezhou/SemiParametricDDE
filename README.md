@@ -73,8 +73,11 @@ CopDDE paper designs; `Results/normal_dde_csp_copula_kernel/` holds the
 studies behind these defaults.
 
 SemiDDE supports the same maximum-width CSP initialization while retaining
-its semiparametric pseudo-observation update.  `D` fixes the hierarchy depth;
-the fitted active widths are returned in `result.K_list`:
+its semiparametric pseudo-observation update.  SemiDDE CSP runs on the same
+copula kernel (`csp_backend="copula"`, the default), with the Normal-family
+engine defaults and the precision-weighted `g` step after every committed
+iteration; `csp_backend="mcem"` selects the former MCEM path.  `D` fixes the
+hierarchy depth; the fitted active widths are returned in `result.K_list`:
 
 ```python
 result = fit(
@@ -97,13 +100,20 @@ experiments under nonlinear continuous margins. Its primary summary columns
 are the exact dimension-shrinkage recovery rate and the mean L1 distance
 between fitted and true width vectors.
 
-Normal CSP has the copula kernel only.  Bernoulli and Poisson CSP provide
-three MCEM backends.  ``"mcem"`` retains the original simultaneous MCEM updates,
+Normal CSP has the copula kernel only.  Bernoulli and Poisson CSP also
+default to the copula kernel (`csp_backend="copula"`) with a logistic or
+log-link observed layer and their own defaults: the sequential mean-field
+transition (`csp_latent_transition="sequential_mean_field"`), a sqrt(N)
+penalty in every layer (`csp_penalty_scaling_power=0.5`,
+`csp_penalty_scaling_layers="all"`), hard thresholding of every layer
+(`csp_threshold_rule="all"`), the dense marginal-likelihood deletion test for
+the deepest layer (`csp_top_prune="bic_dense"`), and 100 iterations without
+early stop (`max_it=100`, `tol=0`); `Results/csp_redesign/bench_v2` holds the
+20-replicate N-trend study behind these defaults.  The former MCEM backends
+stay available: ``"mcem"`` retains the original simultaneous MCEM updates,
 ``"mcem_reinitialize"`` activates CSP layer by layer and rebuilds each waiting
 parent, and ``"mcem_cap_only"`` uses the same staged schedule while preserving
 eligible parent states and only enforcing the child-implied structural cap.
-Bernoulli and Poisson CSP select ``"mcem"`` by default when ``csp_backend``
-is omitted; the staged backends remain explicit options.
 
 Bernoulli DDE uses the same fixed and CSP interfaces, requires a binary 0/1
 matrix, and has no `gamma` dispersion parameter. For fixed-width parametric

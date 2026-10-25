@@ -223,12 +223,15 @@ def _resolve_dde_defaults(
     k_estimator_kwargs: Optional[Mapping[str, Any]] = None,
     estimate_K: bool = True,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    # CSP fits keep each kernel's own iteration budget and stopping rule (the
+    # copula-backend Bernoulli/Poisson CSP runs 100 iterations without early
+    # stop); fixed-width fits use 50 iterations and tol 0.005.
     defaults: Dict[str, Any] = {
-        "C": 1, "max_it": 50, "tol": 0.005, "initialize": "data", "verbose": False,
-        "tau": 0.3,
+        "C": 1, "initialize": "data", "verbose": False, "tau": 0.3,
     }
     diagnostics: Dict[str, Any] = {}
     if dimension_method == "fixed":
+        defaults.update(max_it=50, tol=0.005)
         if "K_list" in fixed_hp:
             K_list = list(validate_K_list_identifiability(fixed_hp["K_list"], D=D, J=Y.shape[1]))
             diagnostics["K_list_source"] = "fixed_hp"
@@ -247,8 +250,11 @@ def _resolve_dde_defaults(
 
 def _resolve_semidde_csp_defaults(Y: np.ndarray, D: int) -> tuple[Dict[str, Any], Dict[str, Any]]:
     return {
-        "C": 1, "max_outer_iter": 10, "max_inner_iter": 50,
-        "max_enum_bits": 12, "mc_samples": 50_000, "g_update_rho": 1.0,
+        # max_outer_iter and g_update_rho of the MCEM path are left at that
+        # path's own defaults (10 and 1.0); the default copula path updates g
+        # after every iteration.
+        "C": 1, "max_inner_iter": 50,
+        "max_enum_bits": 12, "mc_samples": 50_000,
         "initialize": "data", "verbose": False, "tol": 0.005,
         "tau": 0.3, "temp": 0.7 if D <= 2 else 0.9,
     }, {"K_list_source": "maximal_identifiable_widths"}

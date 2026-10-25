@@ -594,6 +594,9 @@ def fit_parametric_csp_copula(
             layer_solvers = ("lbfgsb",) * D
         elif mstep_solver == "fista_lower":
             layer_solvers = ("fista",) * (D - 1) + ("lbfgsb",)
+            if D == 1 and is_poisson:
+                # the single layer is the observed one, solved by FISTA
+                layer_solvers = ("fista",)
         else:
             layer_solvers = ("fista",) + ("lbfgsb",) * (D - 1)
     else:

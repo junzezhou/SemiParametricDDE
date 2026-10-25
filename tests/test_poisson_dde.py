@@ -891,6 +891,7 @@ def test_public_poisson_csp_uses_maximum_width_and_is_reproducible():
         optimizer_maxiter=20,
         random_state=53,
         verbose=False,
+        csp_backend="mcem",
     )
     first = fit(X, **arguments)
     second = fit(X, **arguments)
@@ -998,6 +999,7 @@ def test_poisson_csp_recovers_matlab_dimensions_from_maximum_width():
         optimizer_maxiter=20,
         mcem_penalty_strength=1.0,
         mcem_shrinkage_burn=0,
+        csp_backend="mcem",
         random_state=fit_seed,
         verbose=False,
     )
