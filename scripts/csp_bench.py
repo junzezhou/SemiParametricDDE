@@ -41,8 +41,8 @@ import numpy as np
 
 FAMILY_KERNELS = {
     "normal": ("copdde", "dde_csp"),
-    "bernoulli": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05"),
-    "poisson": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05"),
+    "bernoulli": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100"),
+    "poisson": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100"),
     "semidde": ("copdde", "semi_csp", "semi_csp_cop"),
 }
 
@@ -73,6 +73,29 @@ ENGINE_VARIANTS = {
                                          csp_penalty_scaling_power=[0.5] + [0.0] * (D - 2) + [0.5],
                                          csp_penalty_scaling_layers="all"),
     "cop_gibbs_thr_s05": dict(csp_threshold_rule="all", csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all"),
+    # longer budget, stopping only once the active widths are stable for 20 iterations ("max_it" is a bench key)
+    "cop_seqL": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                     csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all",
+                     csp_convergence_width_window=20, max_it=100),
+    # ... plus the marginal-likelihood (BIC) deletion test for the deepest layer
+    "cop_seqP": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                     csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all",
+                     csp_convergence_width_window=20, csp_top_prune="bic", max_it=100),
+    "cop_gibbsP": dict(csp_threshold_rule="all", csp_convergence_width_window=20, csp_top_prune="bic", max_it=150),
+    # no early stop (tol=0: always max_it iterations); "anchor_init" (bench key) starts from the family's anchor initializer
+    "cop_seqP100": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                        csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all",
+                        csp_top_prune="bic", tol=0.0, max_it=100),
+    "cop_seqPA100": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                         csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all",
+                         csp_top_prune="bic", tol=0.0, max_it=100, anchor_init=True),
+    # dense BIC deletion test (the reduced refit is adopted)
+    "cop_seqPD100": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                         csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all",
+                         csp_top_prune="bic_dense", tol=0.0, max_it=100),
+    "cop_seqPDA100": dict(_MF, csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                          csp_penalty_scaling_power=0.5, csp_penalty_scaling_layers="all",
+                          csp_top_prune="bic_dense", tol=0.0, max_it=100, anchor_init=True),
 }
 
 
@@ -135,8 +158,12 @@ def run_kernel(kernel, family, Y, truth, N, seed):
         res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False,
                   csp_backend="copula", **common)
     elif kernel in ENGINE_VARIANTS:
-        res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False,
-                  csp_backend="copula", **_variant(kernel, D), **common)
+        variant = dict(_variant(kernel, D))
+        max_it = variant.pop("max_it", 50)
+        if variant.pop("anchor_init", False):
+            variant["fixed_init_binarize"] = "anchor_lca" if family == "bernoulli" else "anchor_mixture"
+        res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=max_it, random_state=seed, verbose=False,
+                  csp_backend="copula", **variant, **common)
     elif kernel == "semi_csp_cop":
         res = fit(Y, model="SemiDDE", D=D, max_it=50, random_state=seed, verbose=False, csp_backend="copula", **common)
     elif kernel == "semi_csp":

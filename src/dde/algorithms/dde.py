@@ -286,6 +286,12 @@ def fit_parametric_dde(
     csp_merge_layers: str = "top",
     csp_shrinkage_burn=None,
     csp_reorder_after_shrinkage_burn: bool = True,
+    csp_top_prune: str = "none",
+    csp_top_prune_after: int = 10,
+    csp_top_prune_every: int = 5,
+    csp_top_prune_em_iter: int = 20,
+    csp_convergence_width_window: int = 0,
+    csp_staged_shrinkage_window: int = 0,
     n_jobs: int = 1,
     standardize=None,
     burn: int = 5,
@@ -351,7 +357,14 @@ def fit_parametric_dde(
     allocation, thresholding or convergence check) for that many initial
     iterations before the CUSP updates start, the slab-start warm-up of
     the MCEM backend; ``csp_reorder_after_shrinkage_burn`` then orders the
-    columns by strength once.  ``None`` selects the Bernoulli copula
+    columns by strength once.  ``csp_top_prune="bic"`` (or
+    ``"bic_dense"``) adds the copula kernel's marginal-likelihood deletion
+    test for the deepest layer (``csp_top_prune_after``,
+    ``csp_top_prune_every``, ``csp_top_prune_em_iter``),
+    ``csp_convergence_width_window`` makes its stopping rule wait for
+    unchanged active widths, and ``csp_staged_shrinkage_window`` starts the
+    CUSP updates layer by layer from the data upward; see
+    :func:`fit_parametric_csp_copula`.  ``None`` selects the Bernoulli copula
     defaults of ``Results/bernoulli_dde_csp_copula_kernel/REPORT.md``: a
     burn-in of 10 iterations when ``D >= 3`` and ``max_it >= 20`` together
     with ``csp_penalty_scaling_power=0.5``, and no burn-in otherwise (the
@@ -372,7 +385,9 @@ def fit_parametric_dde(
     binary anchors in the deeper Normal layers and for Bernoulli) instead of
     thresholding the projected working response at zero, which otherwise
     assigns about half of the observations to every latent column and
-    starts rare columns at the wrong prevalence;
+    starts rare columns at the wrong prevalence (the copula-backend
+    Bernoulli and Poisson CSP accept the anchor rules as an opt-in for
+    their maximal-width start; every CSP default stays ``"projection"``);
     ``fixed_warm_start`` (default ``"layerwise"`` for Poisson and Normal
     with ``D >= 2``, ``"none"`` otherwise) estimates the observed layer
     first with a flat latent prior, then the deeper layers as a Bernoulli
@@ -494,15 +509,27 @@ def fit_parametric_dde(
         raise ValueError(
             "fixed_init_binarize must be 'projection', 'anchor_mixture' (Poisson, Normal) or 'anchor_lca' (Bernoulli)."
         )
+    # The anchor initializers are opt-in for the copula-backend Bernoulli and
+    # Poisson CSP (the maximal-width start of that kernel).
+    anchor_csp = (
+        method == "csp"
+        and csp_backend is not None
+        and str(csp_backend).strip().lower() == "copula"
+        and (is_bernoulli or is_poisson)
+    )
     if fixed_init_binarize == "anchor_mixture" and (
-        not (is_poisson or is_normal) or method != "fixed"
+        not (is_poisson or is_normal) or (method != "fixed" and not anchor_csp)
     ):
         raise ValueError(
-            "fixed_init_binarize='anchor_mixture' is implemented for fixed-width Poisson and Normal fits only."
+            "fixed_init_binarize='anchor_mixture' is implemented for fixed-width Poisson and Normal fits "
+            "and the copula-backend Poisson CSP only."
         )
-    if fixed_init_binarize == "anchor_lca" and (not is_bernoulli or method != "fixed"):
+    if fixed_init_binarize == "anchor_lca" and (
+        not is_bernoulli or (method != "fixed" and not anchor_csp)
+    ):
         raise ValueError(
-            "fixed_init_binarize='anchor_lca' is implemented for fixed-width Bernoulli fits only."
+            "fixed_init_binarize='anchor_lca' is implemented for fixed-width Bernoulli fits "
+            "and the copula-backend Bernoulli CSP only."
         )
     if fixed_observed_solver is not None:
         fixed_observed_solver = str(fixed_observed_solver).strip().lower()
@@ -810,6 +837,12 @@ def fit_parametric_dde(
             merge_layers=csp_merge_layers,
             shrinkage_burn=csp_shrinkage_burn,
             reorder_after_shrinkage_burn=csp_reorder_after_shrinkage_burn,
+            top_prune=csp_top_prune,
+            top_prune_after=csp_top_prune_after,
+            top_prune_every=csp_top_prune_every,
+            top_prune_em_iter=csp_top_prune_em_iter,
+            convergence_width_window=csp_convergence_width_window,
+            staged_shrinkage_window=csp_staged_shrinkage_window,
             random_state=random_state,
             keep_trace=keep_trace,
             verbose=bool(verbose),
@@ -829,6 +862,7 @@ def fit_parametric_dde(
             "dimension_method": "csp",
             "initialization": initialization,
             "initializer": csp_initializer,
+            "init_binarize": fixed_init_binarize,
             "standardized": standardize,
             "column_mean": None if column_mean is None else column_mean.copy(),
             "column_sd": None if column_sd is None else column_sd.copy(),
@@ -856,6 +890,11 @@ def fit_parametric_dde(
             "merge_after": raw["merge_after"],
             "merge_layers": raw["merge_layers"],
             "merge_events": raw["merge_events"],
+            "top_prune": raw["top_prune"],
+            "prune_events": raw["prune_events"],
+            "convergence_width_window": raw["convergence_width_window"],
+            "staged_shrinkage_window": raw["staged_shrinkage_window"],
+            "stage_iterations": raw["stage_iterations"],
             "top_reinit": raw["top_reinit"],
             "shrinkage_burn": raw["shrinkage_burn"],
             "reorder_after_shrinkage_burn": raw["reorder_after_shrinkage_burn"],

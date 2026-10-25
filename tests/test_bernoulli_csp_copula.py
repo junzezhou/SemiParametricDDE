@@ -304,3 +304,121 @@ def test_threshold_rule_all_thresholds_the_deepest_layer():
     small = (tops["first_two"] != 0) & (np.abs(tops["first_two"]) < 0.3)
     assert small.any()
     assert np.all((tops["all"] == 0) | (np.abs(tops["all"]) >= 0.3))
+
+
+def _binary_factor_children(seed, N=3000):
+    rng = np.random.default_rng(seed)
+    A_top = rng.binomial(1, 0.5, size=(N, 2)).astype(float)
+    B = np.array([[-2.0, 4.0, 0.0]] * 3 + [[-2.0, 0.0, 4.0]] * 3)
+    children = rng.binomial(1, expit(B[:, 0] + A_top @ B[:, 1:].T)).astype(float)
+    return children, B
+
+
+def test_binary_factor_em_is_monotone_and_recovers_the_layer():
+    from dde.algorithms.normal_csp import _binary_factor_em
+
+    children, B_true = _binary_factor_children(1)
+    start = B_true + np.random.default_rng(2).normal(scale=0.5, size=B_true.shape)
+    support = B_true[:, 1:] != 0
+    lls = [_binary_factor_em(children, start, np.full(2, 0.5), support, it)[0] for it in (0, 1, 5, 20)]
+    assert all(b >= a - 1e-6 for a, b in zip(lls, lls[1:]))
+    _, B_fit, prop_fit = _binary_factor_em(children, start, np.full(2, 0.5), support, 40)
+    np.testing.assert_allclose(B_fit, B_true, atol=0.4)
+    np.testing.assert_allclose(prop_fit, 0.5, atol=0.05)
+
+
+def test_bic_prune_removes_a_spurious_top_column_and_keeps_true_ones():
+    from dde.algorithms.normal_csp import _bic_prune_top_column
+
+    children, B_true = _binary_factor_children(3)
+    N = children.shape[0]
+    assert _bic_prune_top_column(
+        children, B_true, np.full(2, 0.5), np.array([True, True]), np.ones(6, bool), N, 20
+    ) is None
+    rng = np.random.default_rng(4)
+    B_extra = np.column_stack((B_true, rng.normal(scale=0.4, size=6)))
+    removed = _bic_prune_top_column(
+        children, B_extra, np.full(3, 0.5), np.array([True, True, True]), np.ones(6, bool), N, 20
+    )
+    assert removed is not None and removed["column"] == 2
+    assert 2.0 * removed["loglik_gain"] < removed["n_params"] * np.log(N)
+
+
+def test_fit_runs_top_prune_and_width_window_and_validates():
+    X, _ = _simulate(21, N=400)
+    res = fit(
+        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=15, random_state=5,
+        verbose=False, csp_backend="copula", csp_top_prune="bic", csp_top_prune_after=3,
+        csp_top_prune_every=2, csp_convergence_width_window=4,
+    )
+    diag = res.diagnostics
+    assert diag["top_prune"] == "bic" and diag["convergence_width_window"] == 4
+    assert all(event["iteration"] >= 3 for event in diag["prune_events"])
+    with pytest.raises(ValueError, match="top_prune"):
+        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+            t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=5, verbose=False,
+            csp_backend="copula", csp_top_prune="aic")
+    with pytest.raises(ValueError, match="convergence_width_window"):
+        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+            t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=5, verbose=False,
+            csp_backend="copula", csp_convergence_width_window=-1)
+
+
+def test_staged_shrinkage_holds_upper_layer_until_lower_width_is_stable():
+    X, _ = _simulate(31, N=400)
+    window = 3
+    res = fit(
+        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=25, random_state=8,
+        verbose=False, csp_backend="copula", csp_staged_shrinkage_window=window,
+        keep_trace=True,
+    )
+    diag = res.diagnostics
+    trace = diag["trace"]
+    opened = diag["stage_iterations"][1]
+    assert diag["staged_shrinkage_window"] == window
+    assert opened is not None and opened >= window
+    K_top = diag["K_max_list"][1]
+    for record in trace:
+        if record["iteration"] <= opened:
+            assert record["num_active"][1] == K_top
+    widths = [record["num_active"][0] for record in trace if record["iteration"] <= opened]
+    assert len(set(widths[-window:])) == 1
+    with pytest.raises(ValueError, match="staged_shrinkage_window"):
+        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+            t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=5, verbose=False,
+            csp_backend="copula", csp_staged_shrinkage_window=-2)
+
+
+def test_anchor_init_is_an_opt_in_for_the_copula_csp_only():
+    X, _ = _simulate(41, N=300)
+    common = dict(method="DDE", family="Bernoulli", D=2, dimension_method="csp", t_spike=[0.03, 0.05],
+                  temp=0.9, tau=0.3, C=1, max_it=3, random_state=2, verbose=False)
+    res = fit(X, csp_backend="copula", fixed_init_binarize="anchor_lca", **common)
+    assert res.diagnostics["init_binarize"] == "anchor_lca"
+    assert fit(X, csp_backend="copula", **common).diagnostics["init_binarize"] == "projection"
+    with pytest.raises(ValueError, match="anchor_lca"):
+        fit(X, fixed_init_binarize="anchor_lca", **common)
+    with pytest.raises(ValueError, match="anchor_mixture"):
+        fit(X, csp_backend="copula", fixed_init_binarize="anchor_mixture", **common)
+
+
+def test_dense_bic_prune_removes_a_redundant_column_and_returns_the_refit():
+    from dde.algorithms.normal_csp import _bic_prune_top_column
+
+    children, B_true = _binary_factor_children(5)
+    N = children.shape[0]
+    # a third column that mixes the two factors: redundant, not noise
+    B_red = np.column_stack((B_true, 0.5 * (B_true[:, 1] + B_true[:, 2])))
+    removed = _bic_prune_top_column(
+        children, B_red, np.full(3, 0.5), np.array([True, True, True]), np.ones(6, bool), N, 20, dense=True
+    )
+    assert removed is not None
+    assert removed["n_params"] == 7
+    assert removed["B_rows"].shape == (6, 3) and removed["prop_kept"].shape == (2,)
+    assert set(removed["kept_columns"].tolist()) | {removed["column"]} == {0, 1, 2}
+    # two true factors: neither can be dropped
+    assert _bic_prune_top_column(
+        children, B_true, np.full(2, 0.5), np.array([True, True]), np.ones(6, bool), N, 20, dense=True
+    ) is None

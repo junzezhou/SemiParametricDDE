@@ -47,8 +47,10 @@ shape ``(K_d, K_{d+1} + 1)``.
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
-from scipy.special import expit
+from scipy.special import expit, logsumexp
 
 from .csp import _canonicalize_csp_layer_order, csp_active_mask, update_csp_layer
 from .csp_solvers import _solve_logistic_weighted_l1, _solve_poisson_weighted_l1
@@ -86,6 +88,7 @@ _MC_STATE_UPDATES = ("draw_majority", "last_draw")
 _REINIT_TOP_RULES = ("family", "copula")
 _REINIT_TOP_SOURCES = ("state", "probability")
 _MERGE_LAYERS = ("top", "logistic")
+_TOP_PRUNE_RULES = ("none", "bic", "bic_dense")
 _DEFAULT_OPTIMIZER_MAXITER = 15
 _DEFAULT_FISTA_MAXITER = 300
 
@@ -184,6 +187,104 @@ def _parallel_column_groups(B, allocation, cosine):
     return groups
 
 
+def _binary_factor_em(children, B, prop, support, em_iter, ridge=1e-3):
+    """EM for a deepest binary layer given its binary child states.
+
+    The parent configurations are enumerated, so the returned log-likelihood
+    is the exact marginal ``sum_n log sum_a p(a) p(children_n | a)``.  ``B``
+    (children by parents + 1) is refit by damped Newton steps on its
+    ``support`` (a boolean mask of the slopes; intercepts are always free).
+    Returns ``(loglik, B, prop)`` after ``em_iter`` EM updates.
+    """
+    Y = np.asarray(children, dtype=float)
+    B = np.asarray(B, dtype=float).copy()
+    prop = np.clip(np.asarray(prop, dtype=float).copy(), 1e-6, 1.0 - 1e-6)
+    N, J = Y.shape
+    K = B.shape[1] - 1
+    configs = np.array(list(itertools.product((0.0, 1.0), repeat=K)), dtype=float).reshape(-1, K)
+    design = np.column_stack((np.ones(configs.shape[0]), configs))
+    free = np.column_stack((np.ones((J, 1), dtype=bool), np.asarray(support, dtype=bool)))
+    B[~free] = 0.0
+    loglik = -np.inf
+    for step in range(em_iter + 1):
+        eta = design @ B.T
+        log_child = Y @ eta.T - np.sum(np.logaddexp(0.0, eta), axis=1)[None, :]
+        log_prior = configs @ np.log(prop) + (1.0 - configs) @ np.log1p(-prop)
+        joint = log_child + log_prior[None, :]
+        norm = logsumexp(joint, axis=1, keepdims=True)
+        loglik = float(np.sum(norm))
+        if step == em_iter:
+            break
+        weights = np.exp(joint - norm)
+        count = weights.sum(axis=0)
+        success = weights.T @ Y
+        prop = np.clip((count @ configs) / N, 1e-6, 1.0 - 1e-6)
+        for j in range(J):
+            idx = np.flatnonzero(free[j])
+            X_j = design[:, idx]
+            b = B[j, idx]
+            for _ in range(3):
+                p = expit(X_j @ b)
+                grad = X_j.T @ (success[:, j] - count * p) - ridge * b
+                hess = (X_j * (count * p * (1.0 - p))[:, None]).T @ X_j + ridge * np.eye(idx.size)
+                b = np.clip(b + np.linalg.solve(hess, grad), -10.0, 10.0)
+            B[j, idx] = b
+    return loglik, B, prop
+
+
+def _bic_prune_top_column(children, B_top, prop, active, child_active, N, em_iter, dense=False):
+    """Marginal-likelihood (BIC) deletion test for one deepest-layer column.
+
+    Columns are tested from the weakest (smallest coefficient L1 norm) up;
+    the first whose removal costs less than ``n_params log(N) / 2`` in the
+    marginal log-likelihood of the child states is returned with its
+    statistics.  ``None`` when every column passes or fewer than two are
+    active.
+
+    With ``dense=False`` both models are refit by ``em_iter`` EM updates on
+    the current support and ``n_params`` is the column's nonzero count plus
+    one.  The frozen support keeps the other columns from taking over the
+    tested column's role, which overstates its value when the layer is
+    redundant (more columns than factors).  With ``dense=True`` every active
+    child loads on every active column: the full model is refit first, the
+    reduced model starts from it without the column, ``n_params`` is the
+    number of active children plus one, and the reduced refit (``B_rows``,
+    rows of the active children with the intercept and the remaining
+    columns, and ``prop_kept``) is returned for the caller to adopt.
+    """
+    cols = np.flatnonzero(active)
+    rows = np.flatnonzero(child_active)
+    if cols.size < 2 or rows.size == 0:
+        return None
+    Y = np.asarray(children, dtype=float)[:, rows]
+    B_sub = np.asarray(B_top, dtype=float)[np.ix_(rows, np.concatenate(([0], cols + 1)))]
+    prop_sub = np.asarray(prop, dtype=float)[cols]
+    support = np.ones(B_sub[:, 1:].shape, dtype=bool) if dense else B_sub[:, 1:] != 0.0
+    full_ll, B_full, prop_full = _binary_factor_em(Y, B_sub, prop_sub, support, em_iter)
+    if dense:
+        B_sub, prop_sub = B_full, prop_full
+    strength = np.sum(np.abs(B_sub[:, 1:]), axis=0)
+    for position in np.argsort(strength, kind="stable"):
+        keep = np.delete(np.arange(cols.size), position)
+        reduced_ll, B_reduced, prop_reduced = _binary_factor_em(
+            Y, B_sub[:, np.concatenate(([0], keep + 1))], prop_sub[keep],
+            support[:, keep], em_iter,
+        )
+        n_params = int(np.count_nonzero(support[:, position])) + 1
+        gain = full_ll - reduced_ll
+        if 2.0 * gain < n_params * np.log(N):
+            removed = {
+                "column": int(cols[position]),
+                "loglik_gain": float(gain),
+                "n_params": n_params,
+                "bic_penalty": float(n_params * np.log(N) / 2.0),
+            }
+            if dense:
+                removed.update(rows=rows, kept_columns=cols[keep], B_rows=B_reduced, prop_kept=prop_reduced)
+            return removed
+    return None
+
+
 def _validate(X, prop, gamma, B_list, A_list):
     D = len(B_list)
     if len(A_list) != D or D < 1:
@@ -252,6 +353,12 @@ def fit_parametric_csp_copula(
     merge_layers: str = "top",
     shrinkage_burn: int = 0,
     reorder_after_shrinkage_burn: bool = True,
+    top_prune: str = "none",
+    top_prune_after: int = 10,
+    top_prune_every: int = 5,
+    top_prune_em_iter: int = 20,
+    convergence_width_window: int = 0,
+    staged_shrinkage_window: int = 0,
     random_state=None,
     keep_trace: bool = False,
     verbose: bool = True,
@@ -382,6 +489,38 @@ def fit_parametric_csp_copula(
         permute each layer's columns by decreasing coefficient L1 norm
         once the burn-in ends (the model is permutation invariant, the
         ordered CUSP prior is not), as the MCEM kernel does.
+    top_prune : ``"none"`` (default), ``"bic"`` or ``"bic_dense"``.  With
+        ``"bic"``, every
+        ``top_prune_every`` iterations from ``top_prune_after`` on (after
+        the slab burn-in), the deepest layer's active columns are tested
+        from the weakest up: the parent configurations are enumerated, the
+        model with and without the column is refit by ``top_prune_em_iter``
+        EM updates on the committed child states (current support kept),
+        and the first column whose marginal log-likelihood gain is below
+        ``(nnz + 1) log(N) / 2`` is removed (coefficients and state zeroed,
+        so it falls into the CUSP spike).  At most one column per test.
+        The CUSP allocation compares the prior densities at the point
+        estimate with a fixed coefficient scale, so a column that fits
+        residual dependence with coefficients of order one stays in the
+        slab at every ``N``; the likelihood test removes it consistently.
+        ``"bic_dense"`` refits both models with every active child loading
+        on every active column (penalty: active children plus one) and
+        adopts the reduced refit for the remaining columns; with a frozen
+        support the remaining columns cannot take over a redundant
+        column's role, so ``"bic"`` overstates its value and keeps it.
+    convergence_width_window : when positive, the stopping rule also
+        requires the active widths to be unchanged over the last this many
+        iterations (column pruning can pause for many iterations while the
+        coefficient changes are already small).
+    staged_shrinkage_window : when positive, the CUSP updates start layer by
+        layer from the data upward: layer ``d + 1`` stays in the slab (as in
+        the slab burn-in: no allocation, thresholding or deletion test)
+        until layer ``d``'s active width has been unchanged for this many
+        iterations.  Pruning a split lower layer zeroes the rows of its
+        removed columns in the layer above (gating), so a parent fitted to
+        a removed copy loses its support; holding the parent in the slab
+        lets it re-fit to the surviving children first.  The stopping rule
+        waits until every layer has started.
     random_state : ``None`` for the legacy global RNG, else a seed/Generator.
     observed_update : optional callable ``f(X, state) -> X_new`` (Normal family
         only) applied after every ``observed_update_every``-th committed
@@ -576,6 +715,23 @@ def fit_parametric_csp_copula(
     if shrinkage_burn >= it:
         raise ValueError("shrinkage_burn must be smaller than it.")
     reorder_after_shrinkage_burn = bool(reorder_after_shrinkage_burn)
+    top_prune = str(top_prune).strip().lower()
+    if top_prune not in _TOP_PRUNE_RULES:
+        raise ValueError("top_prune must be one of " + ", ".join(_TOP_PRUNE_RULES) + ".")
+    top_prune_after = int(top_prune_after)
+    top_prune_every = int(top_prune_every)
+    top_prune_em_iter = int(top_prune_em_iter)
+    if top_prune_after < 0 or top_prune_every < 1 or top_prune_em_iter < 1:
+        raise ValueError(
+            "top_prune_after must be nonnegative and top_prune_every, "
+            "top_prune_em_iter positive."
+        )
+    convergence_width_window = int(convergence_width_window)
+    if convergence_width_window < 0:
+        raise ValueError("convergence_width_window must be a nonnegative integer.")
+    staged_shrinkage_window = int(staged_shrinkage_window)
+    if staged_shrinkage_window < 0:
+        raise ValueError("staged_shrinkage_window must be a nonnegative integer.")
 
     t_spike = np.asarray(t_spike, dtype=float).reshape(-1)
     if t_spike.size == 1:
@@ -660,6 +816,10 @@ def fit_parametric_csp_copula(
     x_sq_sum = np.sum(X**2, axis=0) if (observed_fista and is_normal) else None
     top_reinit = None
     merge_events = []
+    prune_events = []
+    width_hist = []
+    stage_open = [True] + [not staged_shrinkage_window] * (D - 1)
+    stage_iterations = [0] + [None] * (D - 1)
     burn_permutations = None
 
     it_num = 0
@@ -726,6 +886,37 @@ def fit_parametric_csp_copula(
                 if groups and d == D - 1:
                     prop = np.clip(np.mean(A_list[d], axis=0), 1e-8, 1.0 - 1e-8)
 
+        # 0c) Optional marginal-likelihood (BIC) deletion test for one
+        #     column of the deepest layer, on the committed child states.
+        if (
+            top_prune != "none"
+            and D >= 2
+            and shrinkage_active
+            and stage_open[D - 1]
+            and it_num >= top_prune_after
+            and (it_num - top_prune_after) % top_prune_every == 0
+        ):
+            removed = _bic_prune_top_column(
+                A_list[D - 2], B_list[D - 1], prop,
+                csp_active_mask(z_cusp[D - 1]), csp_active_mask(z_cusp[D - 2]),
+                N, top_prune_em_iter, dense=(top_prune == "bic_dense"),
+            )
+            if removed is not None:
+                column = removed["column"]
+                if "B_rows" in removed:
+                    # adopt the reduced dense refit for the remaining columns
+                    rows, kept = removed.pop("rows"), removed.pop("kept_columns")
+                    B_list[D - 1][np.ix_(rows, np.concatenate(([0], kept + 1)))] = removed.pop("B_rows")
+                    prop = prop.copy()
+                    prop[kept] = removed.pop("prop_kept")
+                B_list[D - 1][:, column + 1] = 0.0
+                A_list[D - 1][:, column] = 0.0
+                z_cusp[D - 1][column] = 1
+                theta[D - 1][:, column] = t_spike[D - 1]
+                theta_mstep[D - 1][:, column] = t_spike[D - 1] / penalty_factor[D - 1]
+                removed["iteration"] = it_num
+                prune_events.append(removed)
+
         # 1) E-step: synchronous mean-field draws from the previous point
         #    estimates (CopDDE), the same draws taken layer by layer from the
         #    data upward, or persistent systematic coordinate-Gibbs sweeps of
@@ -776,9 +967,10 @@ def fit_parametric_csp_copula(
         #    M-step prior is Laplace(0, scale / c_N); the allocation either
         #    sees c_N * B (the matching densities) or the raw B (power prior).
         for d in range(D - 1, -1, -1):
-            if not shrinkage_active:
-                # Slab-start burn-in: every column in the slab at the
-                # current slab scale, as in the MCEM kernel's warm-up.
+            if not shrinkage_active or not stage_open[d]:
+                # Slab-start burn-in (or a layer whose stage has not
+                # started): every column in the slab at the current slab
+                # scale, as in the MCEM kernel's warm-up.
                 z_cusp[d] = np.full(K[d], K[d] + 1, dtype=int)
                 theta[d] = np.broadcast_to(
                     theta_slab[d][None, :], theta[d].shape
@@ -868,7 +1060,8 @@ def fit_parametric_csp_copula(
             num_act[d] = K[d] - inactive.size
         if shrinkage_active:
             for d in range(thresholded_layers):
-                B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
+                if stage_open[d]:
+                    B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
         for d in range(D - 1):
             if ind_inact[d].size:
                 B_update[d + 1][ind_inact[d], :] = 0.0
@@ -879,7 +1072,7 @@ def fit_parametric_csp_copula(
 
         # 9) Rolling relative-change stopping rule (never during the
         #    slab-start burn-in).
-        stop_now = shrinkage_active
+        stop_now = shrinkage_active and all(stage_open)
         current_rel = []
         for d in range(D):
             rel = np.linalg.norm(B_update[d][:, 1:] - B_list[d][:, 1:], ord="fro") / (
@@ -892,6 +1085,25 @@ def fit_parametric_csp_copula(
                 or np.std(rel_hist[d][-convergence_window:]) >= convergence_std
             ):
                 stop_now = False
+        width_hist.append(tuple(int(value) for value in num_act))
+        if staged_shrinkage_window and shrinkage_active:
+            for d in range(1, D):
+                if stage_open[d]:
+                    continue
+                recent = [widths[d - 1] for widths in width_hist[-staged_shrinkage_window:]]
+                if (
+                    stage_open[d - 1]
+                    and it_num - stage_iterations[d - 1] >= staged_shrinkage_window
+                    and len(set(recent)) == 1
+                ):
+                    stage_open[d] = True
+                    stage_iterations[d] = it_num
+                break
+        if convergence_width_window and (
+            len(width_hist) < convergence_width_window
+            or len(set(width_hist[-convergence_width_window:])) > 1
+        ):
+            stop_now = False
 
         if keep_trace:
             trace.append(
@@ -1010,6 +1222,11 @@ def fit_parametric_csp_copula(
         "merge_after": merge_after,
         "merge_layers": merge_layers,
         "merge_events": merge_events,
+        "top_prune": top_prune,
+        "prune_events": prune_events,
+        "convergence_width_window": convergence_width_window,
+        "staged_shrinkage_window": staged_shrinkage_window,
+        "stage_iterations": tuple(stage_iterations),
         "shrinkage_burn": shrinkage_burn,
         "reorder_after_shrinkage_burn": reorder_after_shrinkage_burn,
         "burn_permutations": burn_permutations,
