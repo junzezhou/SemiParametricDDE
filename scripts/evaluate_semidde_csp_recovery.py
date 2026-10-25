@@ -7,6 +7,11 @@ The primary endpoints are
 
 Each replicate is appended to ``fits.csv`` immediately so interrupted runs can
 be resumed with ``--resume``.
+
+Fits use the SemiDDE CSP defaults of ``fit`` (the copula kernel with a ``g``
+step after every committed iteration); ``--max-inner-iter``, ``--tol`` and
+``--optimizer-maxiter`` override the kernel's budget when given.  The MCEM
+results of earlier runs are reproducible from the git tag ``csp-mcem-last``.
 """
 
 from __future__ import annotations
@@ -119,13 +124,18 @@ def _fit_one(scenario, *, N, replicate, seed, args):
             temp=scenario["temp"],
             tau=args.tau,
             C=args.mc_draws,
-            tol=args.tol,
-            max_it=args.max_inner_iter,
-            max_outer_iter=args.max_outer_iter,
             max_enum_bits=args.max_enum_bits,
-            optimizer_maxiter=args.optimizer_maxiter,
             random_state=replicate_seed,
             verbose=False,
+            **{
+                name: value
+                for name, value in (
+                    ("tol", args.tol),
+                    ("max_it", args.max_inner_iter),
+                    ("optimizer_maxiter", args.optimizer_maxiter),
+                )
+                if value is not None
+            },
         )
         widths = tuple(int(value) for value in result.K_list)
         metrics = dimension_recovery_metrics(widths, scenario["K_true"])
@@ -137,7 +147,7 @@ def _fit_one(scenario, *, N, replicate, seed, args):
             "max_widths": json.dumps(scenario["K_max"]),
             "fitted_widths": json.dumps(widths),
             **metrics,
-            "outer_iterations": result.diagnostics["outer_iterations"],
+            "g_updates": len(result.diagnostics["g_relative_history"]),
             "inner_iterations": result.diagnostics["iterations"],
             "elapsed_seconds": time.perf_counter() - started,
             "error": "",
@@ -152,7 +162,7 @@ def _fit_one(scenario, *, N, replicate, seed, args):
             "fitted_widths": "",
             "exact_dimension_recovery": "",
             "dimension_l1_error": "",
-            "outer_iterations": "",
+            "g_updates": "",
             "inner_iterations": "",
             "elapsed_seconds": time.perf_counter() - started,
             "error": f"{type(exc).__name__}: {exc}",
@@ -211,9 +221,8 @@ def main():
     parser.add_argument("--replicates", type=int, default=100)
     parser.add_argument("--sample-size", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=20260916)
-    parser.add_argument("--max-outer-iter", type=int, default=5)
-    parser.add_argument("--max-inner-iter", type=int, default=50)
-    parser.add_argument("--optimizer-maxiter", type=int, default=100)
+    parser.add_argument("--max-inner-iter", type=int, default=None, help="kernel default when omitted (50)")
+    parser.add_argument("--optimizer-maxiter", type=int, default=None, help="kernel default when omitted (15)")
     parser.add_argument("--mc-draws", type=int, default=1)
     parser.add_argument("--max-enum-bits", type=int, default=20)
     parser.add_argument(
@@ -225,7 +234,7 @@ def main():
     )
     parser.add_argument("--temp", type=float, default=None)
     parser.add_argument("--tau", type=float, default=0.3)
-    parser.add_argument("--tol", type=float, default=0.005)
+    parser.add_argument("--tol", type=float, default=None, help="kernel default when omitted (0.005)")
     parser.add_argument(
         "--output",
         type=Path,
@@ -260,7 +269,7 @@ def main():
         "seed": args.seed,
         "t_spike": scenario["t_spike"],
         "temperature": scenario["temp"],
-        "max_outer_iter": args.max_outer_iter,
+        "backend": "copula",
         "max_inner_iter": args.max_inner_iter,
         "optimizer_maxiter": args.optimizer_maxiter,
         "mc_draws": args.mc_draws,

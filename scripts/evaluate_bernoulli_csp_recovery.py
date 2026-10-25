@@ -11,6 +11,13 @@ The default experiment covers N=(500, 1000, 2000, 4000, 8000), checkpoints
 every completed fit, and records dimension recovery, graph support recovery,
 latent matching, reconstruction diagnostics, convergence, time, and worker
 peak RSS. Re-running the command resumes completed configurations.
+
+Fits use the Bernoulli CSP defaults of ``fit`` (the copula kernel: sequential
+mean-field transition, sqrt(N) penalty in every layer, every layer
+thresholded, dense BIC deletion test for the deepest layer, 100 iterations
+without early stop).  ``--max-iter``, ``--tol`` and ``--optimizer-maxiter``
+override the kernel's budget when given.  The MCEM results of earlier runs
+are reproducible from the git tag ``csp-mcem-last``.
 """
 
 from __future__ import annotations
@@ -37,10 +44,10 @@ from threadpoolctl import threadpool_limits
 
 from dde import fit
 from dde.algorithms.csp import maximal_identifiable_widths
-from dde.algorithms.dde import DEFAULT_PARAMETRIC_CONVERGENCE_TOL
 
 
 SAMPLE_SIZES = (500, 1000, 2000, 4000, 8000)
+TRACE_WINDOW = 7  # the kernel's rolling convergence window
 SCENARIO_SPECS = {
     "d2": {
         "name": "D2_Bs_overspecified_J27",
@@ -338,12 +345,6 @@ def run_one(task):
     data_seed, fit_seed = _seed_pair(
         settings["base_seed"], scenario_key, N, replicate
     )
-    penalty_strength = max(
-        settings["penalty_min_strength"],
-        (N / settings["penalty_reference_n"]) ** settings[
-            "penalty_n_power"
-        ],
-    )
     common = {
         "scenario": scenario["name"],
         "D": scenario["D"],
@@ -354,7 +355,7 @@ def run_one(task):
         "replicate": int(replicate),
         "data_seed": data_seed,
         "fit_seed": fit_seed,
-        "backend": settings["backend"],
+        "backend": "copula",
         "t_spike": json.dumps(
             (
                 np.asarray(scenario["t_spike"], dtype=float)
@@ -364,11 +365,6 @@ def run_one(task):
         "t_spike_multiplier": settings["t_spike_multiplier"],
         "temperature": scenario["temperature"],
         "tau": settings["tau"],
-        "penalty_strength": penalty_strength,
-        "penalty_n_power": settings["penalty_n_power"],
-        "penalty_reference_n": settings["penalty_reference_n"],
-        "penalty_min_strength": settings["penalty_min_strength"],
-        "shrinkage_burn": settings["shrinkage_burn"],
         "C": settings["C"],
         "tol": settings["tol"],
         "max_iter": settings["max_iter"],
@@ -392,6 +388,11 @@ def run_one(task):
                 "B_list_in": B_start,
                 "A_list_in": A_start,
             }
+        overrides = {
+            name: settings[key]
+            for name, key in (("max_it", "max_iter"), ("tol", "tol"), ("optimizer_maxiter", "optimizer_maxiter"))
+            if settings[key] is not None
+        }
         with threadpool_limits(limits=1):
             result = fit(
                 X,
@@ -403,19 +404,10 @@ def run_one(task):
                 temp=scenario["temperature"],
                 tau=settings["tau"],
                 C=settings["C"],
-                tol=settings["tol"],
-                max_it=settings["max_iter"],
-                optimizer_maxiter=settings["optimizer_maxiter"],
-                optimizer_tol=settings["optimizer_tol"],
-                convergence_window=settings["convergence_window"],
-                convergence_mean_tol=settings["convergence_mean_tol"],
-                burn=settings["burn"],
-                mcem_penalty_strength=penalty_strength,
-                mcem_shrinkage_burn=settings["shrinkage_burn"],
                 random_state=fit_seed,
-                csp_backend=settings["backend"],
                 keep_trace=settings["keep_trace"],
                 verbose=False,
+                **overrides,
                 **initialization_arguments,
             )
         metrics = calculate_metrics(result, X, A_true, scenario, settings["tau"])
@@ -432,16 +424,13 @@ def run_one(task):
             "finite": finite,
             "iterations": int(result.diagnostics["iterations"]),
             "hit_iteration_limit": int(
-                result.diagnostics["iterations"] >= settings["max_iter"]
+                result.diagnostics["iterations"] >= result.diagnostics["max_iterations"]
             ),
             "stopped_by_convergence": int(
                 result.diagnostics.get("stopped_by_convergence", False)
             ),
             "seconds": time.perf_counter() - started,
             "worker_peak_rss_mib": _peak_rss_mib(),
-            "num_stage_transitions": len(
-                result.diagnostics.get("stage_transitions", ())
-            ),
             "K_trace": json.dumps(
                 [entry["num_active"].astype(int).tolist() for entry in trace]
             ),
@@ -456,7 +445,7 @@ def run_one(task):
                     np.mean(
                         [
                             max(entry["relative_change"])
-                            for entry in trace[-settings["convergence_window"] :]
+                            for entry in trace[-TRACE_WINDOW:]
                         ]
                     )
                 )
@@ -626,20 +615,11 @@ def parse_args():
     parser.add_argument("--sample-sizes", nargs="+", type=int, default=list(SAMPLE_SIZES))
     parser.add_argument("--replicates", type=int, default=3)
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
-    parser.add_argument("--backend", choices=("mcem", "mcem_reinitialize", "mcem_cap_only"), default="mcem")
     parser.add_argument("--C", type=int, default=1)
-    parser.add_argument("--max-iter", type=int, default=50)
-    parser.add_argument("--optimizer-maxiter", type=int, default=100)
-    parser.add_argument("--optimizer-tol", type=float, default=1e-6)
-    parser.add_argument("--tol", type=float, default=DEFAULT_PARAMETRIC_CONVERGENCE_TOL)
-    parser.add_argument("--convergence-window", type=int, default=7)
-    parser.add_argument("--convergence-mean-tol", type=float, default=0.01)
-    parser.add_argument("--burn", type=int, default=5)
+    parser.add_argument("--max-iter", type=int, default=None, help="kernel default when omitted (100)")
+    parser.add_argument("--optimizer-maxiter", type=int, default=None, help="kernel default when omitted (15)")
+    parser.add_argument("--tol", type=float, default=None, help="kernel default when omitted (0: no early stop)")
     parser.add_argument("--tau", type=float, default=0.3)
-    parser.add_argument("--penalty-n-power", type=float, default=0.0)
-    parser.add_argument("--penalty-reference-n", type=float, default=500.0)
-    parser.add_argument("--penalty-min-strength", type=float, default=1.0)
-    parser.add_argument("--shrinkage-burn", type=int, default=0)
     parser.add_argument("--t-spike-multiplier", type=float, default=1.0)
     parser.add_argument(
         "--initialization", choices=("data", "truth"), default="data"
@@ -659,10 +639,8 @@ def main():
     args = parse_args()
     if args.replicates < 1 or args.workers < 1 or args.C < 1:
         raise ValueError("replicates, workers, and C must be positive.")
-    if args.max_iter < 1 or args.optimizer_maxiter < 1:
+    if any(value is not None and value < 1 for value in (args.max_iter, args.optimizer_maxiter)):
         raise ValueError("iteration budgets must be positive.")
-    if args.shrinkage_burn < 0 or args.shrinkage_burn >= args.max_iter:
-        raise ValueError("shrinkage_burn must lie in [0, max_iter).")
     if any(N < 1 for N in args.sample_sizes):
         raise ValueError("sample sizes must be positive.")
     if (
@@ -670,38 +648,18 @@ def main():
         or args.t_spike_multiplier <= 0
     ):
         raise ValueError("t_spike_multiplier must be finite and positive.")
-    if not np.isfinite(args.penalty_n_power):
-        raise ValueError("penalty_n_power must be finite.")
-    if (
-        not np.isfinite(args.penalty_reference_n)
-        or args.penalty_reference_n <= 0
-    ):
-        raise ValueError("penalty_reference_n must be finite and positive.")
-    if (
-        not np.isfinite(args.penalty_min_strength)
-        or args.penalty_min_strength <= 0
-    ):
-        raise ValueError("penalty_min_strength must be finite and positive.")
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     fits_path = output_dir / "fits.csv"
     rows = _read_csv(fits_path) if args.resume else []
 
     settings = {
-        "backend": args.backend,
+        "backend": "copula",
         "C": args.C,
         "max_iter": args.max_iter,
         "optimizer_maxiter": args.optimizer_maxiter,
-        "optimizer_tol": args.optimizer_tol,
         "tol": args.tol,
-        "convergence_window": args.convergence_window,
-        "convergence_mean_tol": args.convergence_mean_tol,
-        "burn": args.burn,
         "tau": args.tau,
-        "penalty_n_power": args.penalty_n_power,
-        "penalty_reference_n": args.penalty_reference_n,
-        "penalty_min_strength": args.penalty_min_strength,
-        "shrinkage_burn": args.shrinkage_burn,
         "t_spike_multiplier": args.t_spike_multiplier,
         "initialization": args.initialization,
         "base_seed": args.base_seed,

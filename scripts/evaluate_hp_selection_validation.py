@@ -187,19 +187,18 @@ def _aligned_mse(result, truth: dict, tau: float, *, copula: bool) -> tuple[floa
 
 def _fit_kwargs(kernel: str, args) -> dict:
     common = {"C": 1, "verbose": False}
+    csp = kernel.endswith("csp")
     if kernel.startswith("dde_"):
-        common.update(max_iter=args.dde_iterations)
-        if kernel != "dde_normal_csp":
-            # Normal CSP resolves its own validated optimizer budget (15
-            # L-BFGS-B steps on the deepest layer); the MCEM kernels and the
-            # fixed paths take the explicit budget.
-            common["optimizer_maxiter"] = args.optimizer_iterations
+        # The CSP kernels (all on the copula engine) keep their own validated
+        # iteration and optimizer budgets (Bernoulli/Poisson: 100 iterations
+        # without early stop); the fixed paths take the explicit budgets.
+        if not csp:
+            common.update(max_iter=args.dde_iterations, optimizer_maxiter=args.optimizer_iterations)
     elif kernel.startswith("semidde"):
-        common.update(max_iter=args.semi_inner_iterations,
-                      max_outer_iter=args.semi_outer_iterations,
-                      max_enum_bits=12, mc_samples=args.score_mc_samples)
-        if kernel.endswith("csp"):
-            common["optimizer_maxiter"] = args.optimizer_iterations
+        common.update(max_enum_bits=12, mc_samples=args.score_mc_samples)
+        if not csp:
+            common.update(max_iter=args.semi_inner_iterations,
+                          max_outer_iter=args.semi_outer_iterations)
     else:
         common.update(max_iter=args.copula_iterations,
                       optimizer_maxiter=args.copula_optimizer_iterations)

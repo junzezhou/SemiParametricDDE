@@ -81,15 +81,16 @@ def _fit_kwargs(X: np.ndarray, kernel: str, depth: int, hp: dict, seed: int,
                 *, dde_iterations: int, semi_outer_iterations: int,
                 semi_inner_iterations: int, copula_iterations: int,
                 optimizer_iterations: int, score_mc_samples: int) -> dict:
+    # The DDE and SemiDDE CSP kernels keep their own iteration and optimizer
+    # budgets, so dde_iterations, semi_outer_iterations and
+    # semi_inner_iterations are unused (kept for the CLI); copula_iterations
+    # and optimizer_iterations still set the CopDDE budget.
     if kernel.startswith("dde_"):
         defaults, _ = _resolve_dde_defaults(X, depth, {}, dimension_method="csp")
-        controls = {"max_it": dde_iterations, "optimizer_maxiter": optimizer_iterations}
+        controls = {}
     elif kernel == "semidde_csp":
         defaults, _ = _resolve_semidde_csp_defaults(X, depth)
-        controls = {"max_outer_iter": semi_outer_iterations,
-                    "max_inner_iter": semi_inner_iterations,
-                    "max_enum_bits": 12, "mc_samples": score_mc_samples,
-                    "optimizer_maxiter": optimizer_iterations}
+        controls = {"max_enum_bits": 12, "mc_samples": score_mc_samples}
     else:
         defaults, _ = _resolve_copula_defaults(X, depth, {})
         controls = {"it": copula_iterations, "optimizer_maxiter": optimizer_iterations}

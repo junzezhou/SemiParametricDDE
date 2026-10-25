@@ -2,9 +2,10 @@
 
 Scenarios, data generation, seeds, and metrics come from
 ``evaluate_bernoulli_csp_recovery.py`` (D=2: J=27, truth (6, 2), maximal
-(9, 3); D=3: J=64, truth (18, 6, 2), maximal (21, 7, 2)), so the ``mcem``
-arm reproduces the stored MCEM baselines for the same replicates.  The
-``copula`` arm runs the CopDDE-derived kernel with a logistic observed layer.
+(9, 3); D=3: J=64, truth (18, 6, 2), maximal (21, 7, 2)).  The ``copula``
+arm runs the CopDDE-derived kernel with a logistic observed layer.  The MCEM
+backend was removed after the CSP default switch; its arm and the stored MCEM
+baselines are reproducible from the git tag ``csp-mcem-last``.
 The headline summary is the mean fitted width per layer by N.
 """
 
@@ -34,7 +35,7 @@ def _parse_args():
     parser.add_argument("--sample-sizes", type=int, nargs="+", default=[500, 2000, 8000])
     parser.add_argument("--replicates", type=int, default=10)
     parser.add_argument("--replicate-start", type=int, default=0)
-    parser.add_argument("--backends", default="copula,mcem")
+    parser.add_argument("--backends", default="copula")
     parser.add_argument("--max-iter", type=int, default=50)
     parser.add_argument("--mc-samples", type=int, default=1)
     parser.add_argument("--tau", type=float, default=0.3)

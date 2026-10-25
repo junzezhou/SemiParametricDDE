@@ -899,6 +899,8 @@ def fit_parametric_dde(
             "initialization": initialization,
             "initializer": csp_initializer,
             "init_binarize": fixed_init_binarize,
+            "max_iterations": max_it,
+            "tol": tol,
             "standardized": standardize,
             "column_mean": None if column_mean is None else column_mean.copy(),
             "column_sd": None if column_sd is None else column_sd.copy(),

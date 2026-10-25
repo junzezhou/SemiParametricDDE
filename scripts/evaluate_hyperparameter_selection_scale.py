@@ -112,20 +112,21 @@ def _kernel_spec(kernel: str):
 
 def _base_fit_kwargs(kernel: str, args):
     common = {"C": 1, "verbose": False}
+    csp = kernel.endswith("csp")
     if kernel.startswith("dde_"):
-        common.update(
-            max_iter=args.dde_iterations,
-            optimizer_maxiter=args.optimizer_iterations,
-        )
+        # CSP kernels keep their own iteration and optimizer budgets.
+        if not csp:
+            common.update(
+                max_iter=args.dde_iterations,
+                optimizer_maxiter=args.optimizer_iterations,
+            )
     elif kernel.startswith("semidde"):
-        common.update(
-            max_iter=args.semi_inner_iterations,
-            max_outer_iter=args.semi_outer_iterations,
-            max_enum_bits=12,
-            mc_samples=args.score_mc_samples,
-        )
-        if kernel.endswith("csp"):
-            common["optimizer_maxiter"] = args.optimizer_iterations
+        common.update(max_enum_bits=12, mc_samples=args.score_mc_samples)
+        if not csp:
+            common.update(
+                max_iter=args.semi_inner_iterations,
+                max_outer_iter=args.semi_outer_iterations,
+            )
     else:
         common.update(
             max_iter=args.copula_iterations,

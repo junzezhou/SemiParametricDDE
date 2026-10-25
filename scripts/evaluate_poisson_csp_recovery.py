@@ -11,6 +11,13 @@ identifiable CSP initialization genuinely wider than the true hierarchy:
 The primary outputs are the exact dimension-shrinkage recovery rate and the
 mean L1 distance between fitted and true width vectors. Fits are checkpointed
 after completion, and rerunning the command resumes unfinished cells.
+
+Fits use the Poisson CSP defaults of ``fit`` (the copula kernel: sequential
+mean-field transition, sqrt(N) penalty in every layer, every layer
+thresholded, dense BIC deletion test for the deepest layer, 100 iterations
+without early stop).  ``--max-iter``, ``--tol`` and ``--optimizer-maxiter``
+override the kernel's budget when given.  The MCEM results of earlier runs
+are reproducible from the git tag ``csp-mcem-last``.
 """
 
 from __future__ import annotations
@@ -35,7 +42,6 @@ from threadpoolctl import threadpool_limits
 
 from dde import fit
 from dde.algorithms.csp import maximal_identifiable_widths
-from dde.algorithms.dde import DEFAULT_PARAMETRIC_CONVERGENCE_TOL
 
 
 SAMPLE_SIZES = (500, 1000, 2000, 4000, 8000)
@@ -280,6 +286,11 @@ def run_one(task):
                 "B_list_in": B_list,
                 "A_list_in": A_list,
             }
+        overrides = {
+            name: settings[key]
+            for name, key in (("max_it", "max_iter"), ("tol", "tol"), ("optimizer_maxiter", "optimizer_maxiter"))
+            if settings[key] is not None
+        }
         with threadpool_limits(limits=1):
             result = fit(
                 X,
@@ -294,18 +305,9 @@ def run_one(task):
                 temp=scenario["temperature"],
                 tau=settings["tau"],
                 C=settings["C"],
-                tol=settings["tol"],
-                max_it=settings["max_iter"],
-                optimizer_maxiter=settings["optimizer_maxiter"],
-                optimizer_tol=settings["optimizer_tol"],
-                convergence_window=settings["convergence_window"],
-                convergence_mean_tol=settings["convergence_mean_tol"],
-                burn=settings["burn"],
-                mcem_penalty_strength=settings["penalty_strength"],
-                mcem_shrinkage_burn=settings["shrinkage_burn"],
                 random_state=fit_seed,
-                csp_backend=settings["backend"],
                 verbose=False,
+                **overrides,
                 **initialization_arguments,
             )
         metrics = _poisson_fit_metrics(result, X, A_true, scenario)
@@ -321,7 +323,7 @@ def run_one(task):
             "finite": finite,
             "iterations": int(result.diagnostics["iterations"]),
             "hit_iteration_limit": int(
-                result.diagnostics["iterations"] >= settings["max_iter"]
+                result.diagnostics["iterations"] >= result.diagnostics["max_iterations"]
             ),
             "stopped_by_convergence": int(
                 result.diagnostics["stopped_by_convergence"]
@@ -473,26 +475,11 @@ def parse_args():
     parser.add_argument(
         "--workers", type=int, default=min(4, os.cpu_count() or 1)
     )
-    parser.add_argument(
-        "--backend",
-        choices=("mcem", "mcem_reinitialize", "mcem_cap_only"),
-        default="mcem",
-    )
     parser.add_argument("--C", type=int, default=1)
-    parser.add_argument("--max-iter", type=int, default=100)
-    parser.add_argument("--optimizer-maxiter", type=int, default=100)
-    parser.add_argument("--optimizer-tol", type=float, default=1e-6)
-    parser.add_argument(
-        "--tol", type=float, default=DEFAULT_PARAMETRIC_CONVERGENCE_TOL
-    )
-    parser.add_argument("--convergence-window", type=int, default=7)
-    parser.add_argument("--convergence-mean-tol", type=float, default=0.01)
-    parser.add_argument("--burn", type=int, default=5)
+    parser.add_argument("--max-iter", type=int, default=None, help="kernel default when omitted (100)")
+    parser.add_argument("--optimizer-maxiter", type=int, default=None, help="kernel default when omitted (15)")
+    parser.add_argument("--tol", type=float, default=None, help="kernel default when omitted (0: no early stop)")
     parser.add_argument("--tau", type=float, default=0.3)
-    parser.add_argument(
-        "--penalty-strength", nargs="+", type=float, default=[1.0]
-    )
-    parser.add_argument("--shrinkage-burn", type=int, default=0)
     parser.add_argument("--t-spike-multiplier", type=float, default=1.0)
     parser.add_argument(
         "--initialization", choices=("data", "truth"), default="data"
@@ -513,37 +500,20 @@ def main():
     args = parse_args()
     if args.replicates < 1 or args.workers < 1 or args.C < 1:
         raise ValueError("replicates, workers, and C must be positive.")
-    if args.max_iter < 1 or args.optimizer_maxiter < 1:
+    if any(value is not None and value < 1 for value in (args.max_iter, args.optimizer_maxiter)):
         raise ValueError("iteration budgets must be positive.")
-    if not 0 <= args.shrinkage_burn < args.max_iter:
-        raise ValueError("shrinkage_burn must lie in [0, max_iter).")
     if any(N < 1 for N in args.sample_sizes):
         raise ValueError("sample sizes must be positive.")
-    penalty_strength = np.asarray(args.penalty_strength, dtype=float)
-    if not np.all(np.isfinite(penalty_strength)) or np.any(
-        penalty_strength <= 0.0
-    ):
-        raise ValueError("penalty_strength entries must be finite and positive.")
     if not np.isfinite(args.t_spike_multiplier) or args.t_spike_multiplier <= 0:
         raise ValueError("t_spike_multiplier must be finite and positive.")
 
     settings = {
-        "backend": args.backend,
+        "backend": "copula",
         "C": args.C,
         "max_iter": args.max_iter,
         "optimizer_maxiter": args.optimizer_maxiter,
-        "optimizer_tol": args.optimizer_tol,
         "tol": args.tol,
-        "convergence_window": args.convergence_window,
-        "convergence_mean_tol": args.convergence_mean_tol,
-        "burn": args.burn,
         "tau": args.tau,
-        "penalty_strength": (
-            float(penalty_strength[0])
-            if penalty_strength.size == 1
-            else penalty_strength.tolist()
-        ),
-        "shrinkage_burn": args.shrinkage_burn,
         "t_spike_multiplier": args.t_spike_multiplier,
         "initialization": args.initialization,
         "base_seed": args.base_seed,
