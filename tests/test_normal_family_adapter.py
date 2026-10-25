@@ -1,10 +1,6 @@
 import numpy as np
 
-import dde.algorithms.parametric_csp_mcem as normal_csp_module
 from dde.algorithms.dde import fit_dde_normal, fit_parametric_dde
-from dde.algorithms.parametric_csp_mcem import (
-    fit_parametric_csp_mcem,
-)
 from dde.algorithms.parametric_families import (
     NORMAL_FAMILY,
     resolve_parametric_family,
@@ -104,41 +100,6 @@ def test_fixed_normal_compatibility_runner_is_bitwise_equivalent():
         **common,
     )
     _assert_nested_equal(actual, expected)
-
-
-def test_semidde_inner_mcem_kernel_keeps_the_legacy_latent_transition(monkeypatch):
-    """The MCEM kernel with the Normal family only serves the SemiDDE inner loop."""
-    X, prop, B_list, gamma, A_list = _normal_state(20260903)
-
-    def reject_systematic_sampler(*args, **kwargs):
-        raise AssertionError(
-            "Normal CSP must not silently switch to systematic Gibbs."
-        )
-
-    monkeypatch.setattr(
-        normal_csp_module,
-        "_sample_latent_layers_parametric",
-        reject_systematic_sampler,
-    )
-    raw = fit_parametric_csp_mcem(
-        X,
-        prop,
-        B_list,
-        gamma,
-        A_list,
-        family=NORMAL_FAMILY,
-        C=2,
-        max_iter=1,
-        t_spike=[0.03, 0.05],
-        temperature=0.9,
-        threshold=0.04,
-        optimizer_maxiter=2,
-        random_state=9918,
-        verbose=False,
-    )
-
-    assert raw["latent_transition"] == "legacy_synchronous"
-    assert raw["mc_state_update"] == "draw_majority"
 
 
 def test_public_normal_wrapper_is_bitwise_equivalent_to_parametric_dispatch():

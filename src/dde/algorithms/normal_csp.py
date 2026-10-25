@@ -437,8 +437,8 @@ def fit_parametric_csp_copula(
         or ``"systematic_coordinate_gibbs"`` (the ``C`` draws are
         consecutive systematic coordinate-Gibbs sweeps of the exact full
         conditionals, observed layer first, each coordinate conditioning on
-        the freshly updated state; the persistent chain of the parametric
-        MCEM kernel) or ``"sequential_mean_field"`` (the mean-field draws
+        the freshly updated state; a persistent chain) or
+        ``"sequential_mean_field"`` (the mean-field draws
         taken layer by layer from the data upward: each layer's conditional
         probabilities use the freshly committed draw of the layer below and
         the previous state of the layer above, so consecutive layers are
@@ -483,12 +483,11 @@ def fit_parametric_csp_copula(
         latent states and coefficients can settle before any column can
         fall into the spike; the CUSP updates start at iteration
         ``shrinkage_burn + 1``.  Zero (the CopDDE behaviour) starts the
-        CUSP updates at iteration 1.  This is the slab-start warm-up of
-        the parametric MCEM kernel (``shrinkage_burn`` there).
+        CUSP updates at iteration 1.
     reorder_after_shrinkage_burn : when ``shrinkage_burn`` is positive,
         permute each layer's columns by decreasing coefficient L1 norm
         once the burn-in ends (the model is permutation invariant, the
-        ordered CUSP prior is not), as the MCEM kernel does.
+        ordered CUSP prior is not).
     top_prune : ``"none"`` (default), ``"bic"`` or ``"bic_dense"``.  With
         ``"bic"``, every
         ``top_prune_every`` iterations from ``top_prune_after`` on (after
@@ -973,7 +972,7 @@ def fit_parametric_csp_copula(
             if not shrinkage_active or not stage_open[d]:
                 # Slab-start burn-in (or a layer whose stage has not
                 # started): every column in the slab at the current slab
-                # scale, as in the MCEM kernel's warm-up.
+                # scale.
                 z_cusp[d] = np.full(K[d], K[d] + 1, dtype=int)
                 theta[d] = np.broadcast_to(
                     theta_slab[d][None, :], theta[d].shape

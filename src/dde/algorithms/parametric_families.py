@@ -5,8 +5,8 @@ this module own only observed-layer behavior: data validation and
 initialization, the observed contribution to latent conditional log-odds,
 observed-layer M-steps, dispersion semantics, scoring, and simulation.
 
-Normal, Bernoulli, and Poisson adapters share the fixed-width SAEM and
-CSP-MCEM control paths.
+Normal, Bernoulli, and Poisson adapters share the fixed-width SAEM and the
+copula CSP control paths.
 """
 
 from __future__ import annotations

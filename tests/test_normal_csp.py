@@ -278,7 +278,7 @@ def test_copula_backend_is_default_for_normal_and_shrinks_overspecified_widths()
 
 def test_mcem_backend_is_rejected_and_copula_initializer_still_available():
     X = _simulate_two_layer(12, N=120)
-    with pytest.raises(ValueError, match="copula kernel only"):
+    with pytest.raises(ValueError, match="were removed"):
         fit(
             X, method="DDE", family="Normal", D=2, dimension_method="csp",
             t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=2,

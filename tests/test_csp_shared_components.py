@@ -1,3 +1,5 @@
+"""Shared CSP components: E-steps, weighted-L1 solvers, parent initializer, column ordering."""
+
 import numpy as np
 from scipy.special import expit
 
@@ -5,12 +7,9 @@ from dde import fit
 from dde.utils import logistic
 from dde.algorithms.csp import _canonicalize_csp_layer_order
 from dde.algorithms.csp_solvers import _solve_logistic_weighted_l1
-from dde.algorithms.parametric_csp_mcem import (
-    _apply_staged_parent_cap_only,
+from dde.algorithms.parametric_families import (
     _solve_gaussian_weighted_l1,
     _solve_gaussian_weighted_l1_from_statistics,
-    _spectral_parent_width,
-    fit_parametric_csp_mcem,
 )
 from dde.algorithms.normal_init_semi import initialize_binary_parent
 from dde.algorithms.semi_saem import (
@@ -309,114 +308,6 @@ def test_binary_parent_reinitializer_returns_finite_aligned_shapes():
     assert A_parent.shape == (80, 3)
     assert np.all(np.isfinite(B_parent))
     assert set(np.unique(A_parent)).issubset({0, 1})
-
-
-def test_spectral_parent_width_uses_only_a_clear_gap():
-    rng = np.random.default_rng(820)
-    factors = rng.integers(0, 2, size=(200, 2), dtype=np.uint8)
-    child = np.column_stack([factors[:, 0]] * 5 + [factors[:, 1]] * 4)
-
-    selected, singular_values, largest_gap = _spectral_parent_width(child, 3, 1.5)
-    conservative, _, no_test_gap = _spectral_parent_width(child, 3, None)
-
-    assert selected == 2
-    assert conservative == 3
-    assert singular_values.shape == (4,)
-    assert largest_gap > 1.5
-    assert no_test_gap is None
-
-
-def test_mcem_staged_reinitialization_enforces_child_implied_cap():
-    rng = np.random.default_rng(818)
-    N, J = 30, 27
-    widths = (9, 4)
-    B1 = np.column_stack([np.zeros(J), np.full((J, widths[0]), 2.0)])
-    raw = fit_parametric_csp_mcem(
-        rng.normal(size=(N, J)),
-        np.full(widths[-1], 0.5),
-        [B1, rng.normal(scale=0.2, size=(widths[0], widths[1] + 1))],
-        np.ones(J),
-        [rng.integers(0, 2, size=(N, width), dtype=np.uint8) for width in widths],
-        family="Normal",
-        C=1,
-        max_iter=2,
-        t_spike=[0.01, 0.01],
-        temperature=0.9,
-        threshold=0.3,
-        convergence_tol=0.0,
-        stagewise=True,
-        stage_min_iter=1,
-        stage_width_window=1,
-        stage_transition_mode="reinitialize",
-        optimizer_maxiter=2,
-        random_state=819,
-        verbose=False,
-    )
-
-    assert raw["stage_caps"] == (9, 3)
-    assert raw["num_active"][1] <= 3
-    np.testing.assert_allclose(raw["B_list"][1][:, 4:], 0.0)
-    np.testing.assert_array_equal(raw["A_list"][1][:, 3:], 0)
-    assert raw["stage_transition_events"][0]["mode"] == "reinitialize"
-
-
-def test_cap_only_transition_preserves_eligible_parent_state():
-    rng = np.random.default_rng(826)
-    N = 12
-    widths = (9, 4)
-    prop = rng.uniform(0.2, 0.8, size=widths[-1])
-    B_list = [
-        rng.normal(size=(27, widths[0] + 1)),
-        rng.normal(size=(widths[0], widths[1] + 1)),
-    ]
-    A_list = [rng.integers(0, 2, size=(N, width), dtype=np.uint8) for width in widths]
-    active_masks = [
-        np.ones(widths[0], dtype=bool),
-        np.ones(widths[1], dtype=bool),
-    ]
-    allocation = [np.full(width, width + 1, dtype=int) for width in widths]
-    penalty_scale = [
-        np.ones((27, widths[0])),
-        np.ones((widths[0], widths[1])),
-    ]
-    slab_scale = [np.ones(width) for width in widths]
-    omega = [np.ones(width + 1) / (width + 1) for width in widths]
-    stage_caps = np.asarray(widths, dtype=int)
-    parent_B_before = B_list[1].copy()
-    parent_A_before = A_list[1].copy()
-    prop_before = prop.copy()
-
-    prop_after, event = _apply_staged_parent_cap_only(
-        1,
-        prop,
-        B_list,
-        A_list,
-        active_masks,
-        allocation,
-        penalty_scale,
-        slab_scale,
-        omega,
-        stage_caps,
-        np.array([0.01, 0.02]),
-        None,
-    )
-
-    np.testing.assert_allclose(B_list[1][:, :4], parent_B_before[:, :4])
-    np.testing.assert_array_equal(A_list[1][:, :3], parent_A_before[:, :3])
-    np.testing.assert_allclose(prop_after[:3], prop_before[:3])
-    np.testing.assert_allclose(B_list[1][:, 4:], 0.0)
-    np.testing.assert_array_equal(A_list[1][:, 3:], 0)
-    np.testing.assert_allclose(prop_after[3:], 0.5)
-    assert stage_caps.tolist() == [9, 3]
-    assert event == {
-        "layer": 2,
-        "mode": "cap_only",
-        "child_active": 9,
-        "structural_cap": 3,
-        "initial_width": 3,
-        "singular_values": (),
-        "largest_gap": None,
-    }
 
 
 def test_csp_layer_ordering_is_likelihood_invariant_and_strength_sorted():

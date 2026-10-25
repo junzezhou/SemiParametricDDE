@@ -250,9 +250,7 @@ def _resolve_dde_defaults(
 
 def _resolve_semidde_csp_defaults(Y: np.ndarray, D: int) -> tuple[Dict[str, Any], Dict[str, Any]]:
     return {
-        # max_outer_iter and g_update_rho of the MCEM path are left at that
-        # path's own defaults (10 and 1.0); the default copula path updates g
-        # after every iteration.
+        # The copula CSP path updates g after every iteration (no outer loop).
         "C": 1, "max_inner_iter": 50,
         "max_enum_bits": 12, "mc_samples": 50_000,
         "initialize": "data", "verbose": False, "tol": 0.005,

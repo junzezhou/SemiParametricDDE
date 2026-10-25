@@ -891,7 +891,6 @@ def test_public_poisson_csp_uses_maximum_width_and_is_reproducible():
         optimizer_maxiter=20,
         random_state=53,
         verbose=False,
-        csp_backend="mcem",
     )
     first = fit(X, **arguments)
     second = fit(X, **arguments)
@@ -900,12 +899,10 @@ def test_public_poisson_csp_uses_maximum_width_and_is_reproducible():
     assert first.diagnostics["K_max_list"] == (3, 1)
     assert first.diagnostics["original_K_list"] == (3, 1)
     assert first.diagnostics["family"] == "Poisson"
-    assert first.diagnostics["kernel"] == "systematic_gibbs_mcem_csp"
-    assert first.diagnostics["latent_transition"] == (
-        "systematic_coordinate_gibbs"
-    )
-    assert first.diagnostics["mc_state_update"] == "last_draw"
-    assert first.diagnostics["canonicalized_initial_order"] is True
+    assert first.diagnostics["backend"] == "copula"
+    assert first.diagnostics["kernel"] == "copdde_csp"
+    assert first.diagnostics["latent_transition"] == "sequential_mean_field"
+    assert first.diagnostics["mc_state_update"] == "draw_majority"
     assert len(first.K_list) == 2
     assert all(
         fitted <= maximum for fitted, maximum in zip(first.K_list, (3, 1))
@@ -994,12 +991,6 @@ def test_poisson_csp_recovers_matlab_dimensions_from_maximum_width():
         temp=0.9,
         tau=0.3,
         C=1,
-        tol=0.005,
-        max_it=10,
-        optimizer_maxiter=20,
-        mcem_penalty_strength=1.0,
-        mcem_shrinkage_burn=0,
-        csp_backend="mcem",
         random_state=fit_seed,
         verbose=False,
     )

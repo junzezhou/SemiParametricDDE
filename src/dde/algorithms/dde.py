@@ -13,7 +13,6 @@ from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
 from .normal_csp import fit_parametric_csp_copula
-from .parametric_csp_mcem import fit_parametric_csp_mcem
 from .normal_init_cop import Normal_init_cop
 from .parametric_families import (
     BERNOULLI_FAMILY,
@@ -25,62 +24,8 @@ from .semi_saem import get_SAEM_parametric
 
 
 DEFAULT_PARAMETRIC_CONVERGENCE_TOL = 0.005
-_BERNOULLI_CSP_PENALTY_REFERENCE_N = 1000.0
-_BERNOULLI_CSP_PENALTY_POWER = 2.0 / 3.0
-_BERNOULLI_CSP_SHRINKAGE_BURN = 10
 # Copula-backend Bernoulli/Poisson CSP: full iteration budget, no early stop.
 _DISCRETE_COPULA_CSP_MAX_IT = 100
-
-
-def _resolve_mcem_shrinkage_defaults(
-    *,
-    family_key: str,
-    D: int,
-    N: int,
-    backend: str,
-    max_iter: int,
-    penalty_strength,
-    shrinkage_burn,
-):
-    """Resolve validated family-specific MCEM shrinkage defaults."""
-    adaptive_bernoulli = (
-        family_key == "bernoulli" and D >= 3 and backend == "mcem"
-    )
-    penalty_was_automatic = penalty_strength is None
-    burn_was_automatic = shrinkage_burn is None
-
-    if penalty_was_automatic:
-        penalty_strength = (
-            max(
-                1.0,
-                (N / _BERNOULLI_CSP_PENALTY_REFERENCE_N)
-                ** _BERNOULLI_CSP_PENALTY_POWER,
-            )
-            if adaptive_bernoulli
-            else 1.0
-        )
-    if burn_was_automatic:
-        shrinkage_burn = (
-            _BERNOULLI_CSP_SHRINKAGE_BURN
-            if adaptive_bernoulli
-            and max_iter >= 2 * _BERNOULLI_CSP_SHRINKAGE_BURN
-            else 0
-        )
-
-    return (
-        penalty_strength,
-        shrinkage_burn,
-        {
-            "name": (
-                "bernoulli_depth_adaptive"
-                if adaptive_bernoulli
-                and (penalty_was_automatic or burn_was_automatic)
-                else "legacy_or_explicit"
-            ),
-            "penalty_strength_was_automatic": penalty_was_automatic,
-            "shrinkage_burn_was_automatic": burn_was_automatic,
-        },
-    )
 
 
 def _standardize_observed_layer(B1, gamma, column_mean, column_sd):
@@ -258,13 +203,6 @@ def fit_parametric_dde(
     optimizer_tol: float = 1e-6,
     convergence_window: int = 7,
     convergence_mean_tol: float = 0.01,
-    mcem_stage_min_iter: int = 20,
-    mcem_stage_width_window: int = 10,
-    mcem_stage_freeze_deeper: bool = True,
-    mcem_penalty_strength=None,
-    mcem_shrinkage_burn=None,
-    mcem_reorder_after_shrinkage_burn: bool = True,
-    mcem_stage_spectral_gap_threshold=None,
     csp_backend=None,
     csp_initializer=None,
     csp_threshold_rule=None,
@@ -311,7 +249,7 @@ def fit_parametric_dde(
 
     The family adapter validates the observed matrix, prepares initialization,
     and supplies observed-layer operations to the fixed-width SAEM kernel or
-    one of the CSP MCEM backends.
+    the copula CSP kernel.
     In contrast, SemiDDE and CopDDE construct latent-Gaussian
     pseudo-observations before using their respective kernels.
 
@@ -327,8 +265,7 @@ def fit_parametric_dde(
 
     Normal CSP has a single kernel, ``csp_backend="copula"``: the CopDDE
     D-layer CSP algorithm with the rank-likelihood resampling removed because
-    the Normal DDE observes its Gaussian layer.  The former MCEM backends are
-    not available for the Normal family.  It initializes with the Normal family's
+    the Normal DDE observes its Gaussian layer.  It initializes with the Normal family's
     own data initializer (``csp_initializer="family"``; the CopDDE
     ``Normal_init_D`` rules remain available as ``csp_initializer="copula"``
     but leave more spurious deep columns active) and uses the CopDDE
@@ -355,16 +292,13 @@ def fit_parametric_dde(
     hard thresholding of every layer (``csp_threshold_rule="all"``), the
     dense marginal-likelihood deletion test for the deepest layer
     (``csp_top_prune="bic_dense"``), no slab burn-in, and 100 iterations
-    without early stop.  The former default, the simultaneous ``"mcem"``
-    path, stays available with ``csp_backend="mcem"``; the
-    ``"mcem_reinitialize"`` backend performs staged parent rebuilding, while
-    ``"mcem_cap_only"`` applies staged child-implied caps and preserves
-    eligible parent state.  ``mcem_*`` controls apply to those backends
-    only.
+    without early stop.  The former MCEM CSP backends (``"mcem"``,
+    ``"mcem_reinitialize"``, ``"mcem_cap_only"``) were removed; the git tag
+    ``csp-mcem-last`` holds the last version with them.
     ``csp_shrinkage_burn`` holds every column in the CUSP slab (no
     allocation, thresholding or convergence check) for that many initial
-    iterations before the CUSP updates start, the slab-start warm-up of
-    the MCEM backend; ``csp_reorder_after_shrinkage_burn`` then orders the
+    iterations before the CUSP updates start (a slab-start warm-up);
+    ``csp_reorder_after_shrinkage_burn`` then orders the
     columns by strength once.  ``csp_top_prune="bic"`` (or
     ``"bic_dense"``) adds the copula kernel's marginal-likelihood deletion
     test for the deepest layer (``csp_top_prune_after``,
@@ -568,42 +502,19 @@ def fit_parametric_dde(
         )
 
     if csp_backend is None:
-        backend = "copula" if method == "csp" else "mcem"
+        backend = "copula" if method == "csp" else None
     else:
         backend = str(csp_backend).strip().lower()
-    if method == "csp" and backend == "copula" and family_adapter.key not in (
-        "normal",
-        "bernoulli",
-        "poisson",
-    ):
+        if backend != "copula":
+            raise ValueError(
+                f"csp_backend={csp_backend!r} is not available: CSP runs on the copula "
+                "kernel (csp_backend='copula', the default).  The MCEM backends "
+                "('mcem', 'mcem_reinitialize', 'mcem_cap_only') were removed; the git "
+                "tag csp-mcem-last holds the last version with them."
+            )
+    if method == "csp" and family_adapter.key not in ("normal", "bernoulli", "poisson"):
         raise NotImplementedError(
-            "csp_backend='copula' is implemented for the Normal, Bernoulli and "
-            "Poisson families only."
-        )
-    if method == "csp" and family_adapter.key == "normal" and backend != "copula":
-        raise ValueError(
-            "Normal CSP uses the copula kernel only; the MCEM backends "
-            "('mcem', 'mcem_reinitialize', 'mcem_cap_only') were removed for "
-            "family='Normal'.  Omit csp_backend or pass csp_backend='copula'."
-        )
-    mcem_overrides = [
-        name
-        for name, value, default in (
-            ("mcem_stage_min_iter", mcem_stage_min_iter, 20),
-            ("mcem_stage_width_window", mcem_stage_width_window, 10),
-            ("mcem_stage_freeze_deeper", mcem_stage_freeze_deeper, True),
-            ("mcem_penalty_strength", mcem_penalty_strength, None),
-            ("mcem_shrinkage_burn", mcem_shrinkage_burn, None),
-            ("mcem_reorder_after_shrinkage_burn", mcem_reorder_after_shrinkage_burn, True),
-            ("mcem_stage_spectral_gap_threshold", mcem_stage_spectral_gap_threshold, None),
-        )
-        if value != default
-    ]
-    if method == "csp" and backend == "copula" and mcem_overrides:
-        raise ValueError(
-            ", ".join(mcem_overrides) + " apply to the MCEM CSP backends only; the "
-            "default CSP backend is 'copula'.  Pass csp_backend='mcem' (or "
-            "'mcem_reinitialize', 'mcem_cap_only') to use them."
+            "CSP is implemented for the Normal, Bernoulli and Poisson families only."
         )
     if csp_initializer is None:
         csp_initializer = "family"
@@ -804,245 +715,89 @@ def fit_parametric_dde(
             raw=(X_result, prop, B_list, gamma, A_list, iterations),
         )
 
-    if backend == "copula":
-        # Family defaults for the copula kernel.  The Gaussian observed layer
-        # identifies the latent states well enough for the CopDDE single
-        # synchronous mean-field draw and benefits from the N-scaled
-        # lower-layer penalty.  On Bernoulli/Poisson data the synchronous
-        # draws of consecutive layers are independent given the previous
-        # state, which attenuates the deep coefficients every iteration (weak
-        # deep layers die); the sequential transition draws each layer given
-        # the fresh draw below.  The deepest layer is thresholded and tested
-        # by the dense BIC deletion test (the CUSP allocation keeps any column
-        # above a fixed coefficient scale at every N), and the sqrt(N)
-        # penalty applies to every layer
-        # (Results/csp_redesign/bench_v2, arm cop_seqPD100).
-        discrete = family_adapter.key in ("bernoulli", "poisson")
-        if csp_latent_transition is None:
-            csp_latent_transition = (
-                "sequential_mean_field" if discrete else "synchronous_mean_field"
-            )
-        if csp_penalty_scaling_power is None:
-            csp_penalty_scaling_power = 0.5 if discrete else 1.0
-        if csp_penalty_scaling_layers is None:
-            csp_penalty_scaling_layers = "all" if discrete else "lower"
-        if csp_threshold_rule is None:
-            csp_threshold_rule = "all" if discrete else "first_two"
-        if csp_top_prune is None:
-            csp_top_prune = "bic_dense" if discrete else "none"
-        if csp_shrinkage_burn is None:
-            csp_shrinkage_burn = 0
-        raw = fit_parametric_csp_copula(
-            X,
-            prop,
-            gamma,
-            B_list,
-            A_list,
-            family=family_adapter,
-            C=C,
-            it=max_it,
-            t_spike=t_spike,
-            temp=temp,
-            tau=tau,
-            optimizer_maxiter=optimizer_maxiter,
-            optimizer_tol=optimizer_tol,
-            bound_val=bound_val,
-            n_jobs=n_jobs,
-            convergence_window=convergence_window,
-            convergence_std=tol,
-            burn=burn,
-            threshold_rule=csp_threshold_rule,
-            mstep_solver=csp_mstep_solver,
-            mstep_latent=csp_mstep_latent,
-            observed_noise_scale=csp_observed_noise_scale,
-            fista_maxiter=csp_fista_maxiter,
-            slab_shape=csp_slab_shape,
-            slab_rate=csp_slab_rate,
-            penalty_scaling_power=csp_penalty_scaling_power,
-            penalty_scaling_reference=csp_penalty_scaling_reference,
-            penalty_scaling_layers=csp_penalty_scaling_layers,
-            penalty_scaling_allocation=csp_penalty_scaling_allocation,
-            latent_transition=csp_latent_transition,
-            mc_state_update=csp_mc_state_update,
-            estep_row_chunk_size=estep_row_chunk_size,
-            reinit_top_after=csp_reinit_top_after,
-            reinit_top_rule=csp_reinit_top_rule,
-            reinit_top_source=csp_reinit_top_source,
-            merge_cosine=csp_merge_cosine,
-            merge_after=csp_merge_after,
-            merge_layers=csp_merge_layers,
-            shrinkage_burn=csp_shrinkage_burn,
-            reorder_after_shrinkage_burn=csp_reorder_after_shrinkage_burn,
-            top_prune=csp_top_prune,
-            top_prune_after=csp_top_prune_after,
-            top_prune_every=csp_top_prune_every,
-            top_prune_em_iter=csp_top_prune_em_iter,
-            convergence_width_window=csp_convergence_width_window,
-            staged_shrinkage_window=csp_staged_shrinkage_window,
-            random_state=random_state,
-            keep_trace=keep_trace,
-            verbose=bool(verbose),
+    # Family defaults for the copula kernel.  The Gaussian observed layer
+    # identifies the latent states well enough for the CopDDE single
+    # synchronous mean-field draw and benefits from the N-scaled
+    # lower-layer penalty.  On Bernoulli/Poisson data the synchronous
+    # draws of consecutive layers are independent given the previous
+    # state, which attenuates the deep coefficients every iteration (weak
+    # deep layers die); the sequential transition draws each layer given
+    # the fresh draw below.  The deepest layer is thresholded and tested
+    # by the dense BIC deletion test (the CUSP allocation keeps any column
+    # above a fixed coefficient scale at every N), and the sqrt(N)
+    # penalty applies to every layer
+    # (Results/csp_redesign/bench_v2, arm cop_seqPD100).
+    discrete = family_adapter.key in ("bernoulli", "poisson")
+    if csp_latent_transition is None:
+        csp_latent_transition = (
+            "sequential_mean_field" if discrete else "synchronous_mean_field"
         )
-        X_result = X_raw.copy()
-        if standardize:
-            raw["B_list"][0], raw["gamma"] = _destandardize_observed_layer(
-                raw["B_list"][0], raw["gamma"], column_mean, column_sd
-            )
-        diagnostics = {
-            "iterations": raw["iterations"],
-            "D": D,
-            "K_list": tuple(raw["num_active"].tolist()),
-            "K_max_list": K_tuple,
-            "original_K_list": K_tuple,
-            "family": family_adapter.name,
-            "dimension_method": "csp",
-            "initialization": initialization,
-            "initializer": csp_initializer,
-            "init_binarize": fixed_init_binarize,
-            "max_iterations": max_it,
-            "tol": tol,
-            "standardized": standardize,
-            "column_mean": None if column_mean is None else column_mean.copy(),
-            "column_sd": None if column_sd is None else column_sd.copy(),
-            "backend": "copula",
-            "kernel": "copdde_csp_mean_field_mcem",
-            "latent_transition": raw["latent_transition"],
-            "mc_state_update": raw["mc_state_update"],
-            "threshold_rule": raw["threshold_rule"],
-            "mstep_solver": raw["mstep_solver"],
-            "mstep_latent": raw["mstep_latent"],
-            "observed_noise_scale": raw["observed_noise_scale"],
-            "optimizer_maxiter": raw["optimizer_maxiter"],
-            "fista_maxiter": raw["fista_maxiter"],
-            "slab_shape": raw["slab_shape"],
-            "slab_rate": raw["slab_rate"],
-            "penalty_scaling_power": raw["penalty_scaling_power"],
-            "penalty_scaling_reference": raw["penalty_scaling_reference"],
-            "penalty_scaling_layers": raw["penalty_scaling_layers"],
-            "penalty_scaling_allocation": raw["penalty_scaling_allocation"],
-            "penalty_factor": raw["penalty_factor"],
-            "reinit_top_after": raw["reinit_top_after"],
-            "reinit_top_rule": raw["reinit_top_rule"],
-            "reinit_top_source": raw["reinit_top_source"],
-            "merge_cosine": raw["merge_cosine"],
-            "merge_after": raw["merge_after"],
-            "merge_layers": raw["merge_layers"],
-            "merge_events": raw["merge_events"],
-            "top_prune": raw["top_prune"],
-            "prune_events": raw["prune_events"],
-            "convergence_width_window": raw["convergence_width_window"],
-            "staged_shrinkage_window": raw["staged_shrinkage_window"],
-            "stage_iterations": raw["stage_iterations"],
-            "top_reinit": raw["top_reinit"],
-            "shrinkage_burn": raw["shrinkage_burn"],
-            "reorder_after_shrinkage_burn": raw["reorder_after_shrinkage_burn"],
-            "burn_permutations": raw["burn_permutations"],
-            "convergence_metric": "rolling_relative_frobenius_std",
-            "convergence_tol": tol,
-            "convergence_window": int(convergence_window),
-            "num_active": raw["num_active"].copy(),
-            "allocation": [value.copy() for value in raw["allocation"]],
-            "omega": [value.copy() for value in raw["omega"]],
-            "slab_scale": [value.copy() for value in raw["slab_scale"]],
-            "relative_history": raw["relative_history"],
-            "temperature": raw["temperature"],
-            "stopped_by_convergence": raw["stopped_by_convergence"],
-        }
-        if keep_trace:
-            diagnostics["trace"] = raw["trace"]
-        compressed = compress_csp_result_components(
-            prop=raw["prop"],
-            B_list=raw["B_list"],
-            A_list=raw["A_list"],
-            diagnostics=diagnostics,
-            raw=raw,
-            active_masks=raw["active_masks"],
-            min_active=False,
-        )
-        return DDEResult(
-            model="DDE",
-            K_list=list(compressed["diagnostics"]["K_list"]),
-            prop=compressed["prop"],
-            B_list=compressed["B_list"],
-            gamma=raw["gamma"],
-            A_list=compressed["A_list"],
-            transformed=X_result,
-            diagnostics=compressed["diagnostics"],
-            raw=compressed["raw"],
-        )
-
-    backend_configuration = {
-        "mcem": (False, "none"),
-        "mcem_reinitialize": (True, "reinitialize"),
-        "mcem_cap_only": (True, "cap_only"),
-    }
-    if backend not in backend_configuration:
-        raise ValueError(
-            "csp_backend must be 'copula', 'mcem', 'mcem_reinitialize', or "
-            "'mcem_cap_only'."
-        )
-    stagewise, stage_transition_mode = backend_configuration[backend]
-    if backend != "mcem_reinitialize" and mcem_stage_spectral_gap_threshold is not None:
-        raise ValueError(
-            "mcem_stage_spectral_gap_threshold is only valid when "
-            "csp_backend='mcem_reinitialize'."
-        )
-    (
-        resolved_penalty_strength,
-        resolved_shrinkage_burn,
-        shrinkage_default_policy,
-    ) = _resolve_mcem_shrinkage_defaults(
-        family_key=family_adapter.key,
-        D=D,
-        N=X.shape[0],
-        backend=backend,
-        max_iter=max_it,
-        penalty_strength=mcem_penalty_strength,
-        shrinkage_burn=mcem_shrinkage_burn,
-    )
-    raw = fit_parametric_csp_mcem(
+    if csp_penalty_scaling_power is None:
+        csp_penalty_scaling_power = 0.5 if discrete else 1.0
+    if csp_penalty_scaling_layers is None:
+        csp_penalty_scaling_layers = "all" if discrete else "lower"
+    if csp_threshold_rule is None:
+        csp_threshold_rule = "all" if discrete else "first_two"
+    if csp_top_prune is None:
+        csp_top_prune = "bic_dense" if discrete else "none"
+    if csp_shrinkage_burn is None:
+        csp_shrinkage_burn = 0
+    raw = fit_parametric_csp_copula(
         X,
         prop,
-        B_list,
         gamma,
+        B_list,
         A_list,
+        family=family_adapter,
         C=C,
-        max_iter=max_it,
+        it=max_it,
         t_spike=t_spike,
-        temperature=temp,
-        threshold=tau,
-        convergence_tol=tol,
-        convergence_window=convergence_window,
-        burn=burn,
+        temp=temp,
+        tau=tau,
         optimizer_maxiter=optimizer_maxiter,
         optimizer_tol=optimizer_tol,
         bound_val=bound_val,
+        n_jobs=n_jobs,
+        convergence_window=convergence_window,
+        convergence_std=tol,
+        burn=burn,
+        threshold_rule=csp_threshold_rule,
+        mstep_solver=csp_mstep_solver,
+        mstep_latent=csp_mstep_latent,
+        observed_noise_scale=csp_observed_noise_scale,
+        fista_maxiter=csp_fista_maxiter,
+        slab_shape=csp_slab_shape,
+        slab_rate=csp_slab_rate,
+        penalty_scaling_power=csp_penalty_scaling_power,
+        penalty_scaling_reference=csp_penalty_scaling_reference,
+        penalty_scaling_layers=csp_penalty_scaling_layers,
+        penalty_scaling_allocation=csp_penalty_scaling_allocation,
+        latent_transition=csp_latent_transition,
+        mc_state_update=csp_mc_state_update,
         estep_row_chunk_size=estep_row_chunk_size,
-        estep_coordinate_chunk_size=estep_coordinate_chunk_size,
+        reinit_top_after=csp_reinit_top_after,
+        reinit_top_rule=csp_reinit_top_rule,
+        reinit_top_source=csp_reinit_top_source,
+        merge_cosine=csp_merge_cosine,
+        merge_after=csp_merge_after,
+        merge_layers=csp_merge_layers,
+        shrinkage_burn=csp_shrinkage_burn,
+        reorder_after_shrinkage_burn=csp_reorder_after_shrinkage_burn,
+        top_prune=csp_top_prune,
+        top_prune_after=csp_top_prune_after,
+        top_prune_every=csp_top_prune_every,
+        top_prune_em_iter=csp_top_prune_em_iter,
+        convergence_width_window=csp_convergence_width_window,
+        staged_shrinkage_window=csp_staged_shrinkage_window,
         random_state=random_state,
         keep_trace=keep_trace,
         verbose=bool(verbose),
-        convergence_mean_tol=convergence_mean_tol,
-        stagewise=stagewise,
-        stage_min_iter=mcem_stage_min_iter,
-        stage_width_window=mcem_stage_width_window,
-        stage_freeze_deeper=bool(mcem_stage_freeze_deeper),
-        penalty_strength=resolved_penalty_strength,
-        shrinkage_burn=resolved_shrinkage_burn,
-        reorder_after_shrinkage_burn=bool(
-            mcem_reorder_after_shrinkage_burn
-        ),
-        stage_transition_mode=stage_transition_mode,
-        stage_spectral_gap_threshold=mcem_stage_spectral_gap_threshold,
-        family=family_adapter,
     )
-
     X_result = X_raw.copy()
     if standardize:
         raw["B_list"][0], raw["gamma"] = _destandardize_observed_layer(
             raw["B_list"][0], raw["gamma"], column_mean, column_sd
         )
-    latent_transition = raw["latent_transition"]
     diagnostics = {
         "iterations": raw["iterations"],
         "D": D,
@@ -1052,52 +807,59 @@ def fit_parametric_dde(
         "family": family_adapter.name,
         "dimension_method": "csp",
         "initialization": initialization,
+        "initializer": csp_initializer,
+        "init_binarize": fixed_init_binarize,
+        "max_iterations": max_it,
+        "tol": tol,
         "standardized": standardize,
         "column_mean": None if column_mean is None else column_mean.copy(),
         "column_sd": None if column_sd is None else column_sd.copy(),
-        "backend": backend,
-        "kernel": (
-            "systematic_gibbs_mcem_csp"
-            if latent_transition == "systematic_coordinate_gibbs"
-            else "approximate_mcem_csp"
-        ),
-        "latent_transition": latent_transition,
+        "backend": "copula",
+        "kernel": "copdde_csp",
+        "latent_transition": raw["latent_transition"],
         "mc_state_update": raw["mc_state_update"],
-        "transition_mode": stage_transition_mode,
-        "threshold_rule": "first_two_layers",
-        "canonicalized_initial_order": raw[
-            "canonicalized_initial_order"
-        ],
-        "initial_permutations": raw["initial_permutations"],
+        "threshold_rule": raw["threshold_rule"],
+        "mstep_solver": raw["mstep_solver"],
+        "mstep_latent": raw["mstep_latent"],
+        "observed_noise_scale": raw["observed_noise_scale"],
+        "optimizer_maxiter": raw["optimizer_maxiter"],
+        "fista_maxiter": raw["fista_maxiter"],
+        "slab_shape": raw["slab_shape"],
+        "slab_rate": raw["slab_rate"],
+        "penalty_scaling_power": raw["penalty_scaling_power"],
+        "penalty_scaling_reference": raw["penalty_scaling_reference"],
+        "penalty_scaling_layers": raw["penalty_scaling_layers"],
+        "penalty_scaling_allocation": raw["penalty_scaling_allocation"],
+        "penalty_factor": raw["penalty_factor"],
+        "reinit_top_after": raw["reinit_top_after"],
+        "reinit_top_rule": raw["reinit_top_rule"],
+        "reinit_top_source": raw["reinit_top_source"],
+        "merge_cosine": raw["merge_cosine"],
+        "merge_after": raw["merge_after"],
+        "merge_layers": raw["merge_layers"],
+        "merge_events": raw["merge_events"],
+        "top_prune": raw["top_prune"],
+        "prune_events": raw["prune_events"],
+        "convergence_width_window": raw["convergence_width_window"],
+        "staged_shrinkage_window": raw["staged_shrinkage_window"],
+        "stage_iterations": raw["stage_iterations"],
+        "top_reinit": raw["top_reinit"],
+        "shrinkage_burn": raw["shrinkage_burn"],
+        "reorder_after_shrinkage_burn": raw["reorder_after_shrinkage_burn"],
+        "burn_permutations": raw["burn_permutations"],
+        "convergence_metric": "rolling_relative_frobenius_std",
+        "convergence_tol": tol,
+        "convergence_window": int(convergence_window),
         "num_active": raw["num_active"].copy(),
         "allocation": [value.copy() for value in raw["allocation"]],
         "omega": [value.copy() for value in raw["omega"]],
         "slab_scale": [value.copy() for value in raw["slab_scale"]],
         "relative_history": raw["relative_history"],
         "temperature": raw["temperature"],
+        "stopped_by_convergence": raw["stopped_by_convergence"],
     }
-    diagnostics.update(
-        {
-            "stagewise": raw["stagewise"],
-            "stage_transitions": raw["stage_transitions"],
-            "final_stage": raw["final_stage"],
-            "stage_freeze_deeper": raw["stage_freeze_deeper"],
-            "penalty_strength": raw["penalty_strength"],
-            "shrinkage_burn": raw["shrinkage_burn"],
-            "shrinkage_default_policy": shrinkage_default_policy,
-            "reorder_after_shrinkage_burn": raw[
-                "reorder_after_shrinkage_burn"
-            ],
-            "warmup_reordered": raw["warmup_reordered"],
-            "stage_spectral_gap_threshold": raw["stage_spectral_gap_threshold"],
-            "stage_transition_events": raw["stage_transition_events"],
-            "stage_caps": raw["stage_caps"],
-            "stopped_by_convergence": raw["stopped_by_convergence"],
-        }
-    )
     if keep_trace:
         diagnostics["trace"] = raw["trace"]
-
     compressed = compress_csp_result_components(
         prop=raw["prop"],
         B_list=raw["B_list"],
@@ -1107,21 +869,6 @@ def fit_parametric_dde(
         active_masks=raw["active_masks"],
         min_active=False,
     )
-    if raw["canonicalized_initial_order"]:
-        active_precanonical = {}
-        active_canonical = compressed["diagnostics"][
-            "active_columns_original_index"
-        ]
-        for layer, permutation in enumerate(raw["initial_permutations"]):
-            canonical_indices = np.asarray(
-                active_canonical[f"layer_{layer + 1}"], dtype=int
-            )
-            active_precanonical[f"layer_{layer + 1}"] = (
-                np.asarray(permutation, dtype=int)[canonical_indices - 1] + 1
-            ).tolist()
-        compressed["diagnostics"][
-            "active_columns_precanonical_index"
-        ] = active_precanonical
     return DDEResult(
         model="DDE",
         K_list=list(compressed["diagnostics"]["K_list"]),

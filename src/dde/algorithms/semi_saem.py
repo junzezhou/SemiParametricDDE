@@ -2059,7 +2059,7 @@ def _semiparametric_g_step(
     """Update the SemiDDE pseudo-observations for one outer iteration.
 
     Keeping this step independent of the inner estimator lets the fixed-width
-    SAEM and CSP-MCEM paths use exactly the same semiparametric observation
+    SAEM and the CSP paths use exactly the same semiparametric observation
     update.  ``B_list`` and ``A1`` may already be compressed to the currently
     active CSP coordinates.
 

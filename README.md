@@ -76,7 +76,7 @@ SemiDDE supports the same maximum-width CSP initialization while retaining
 its semiparametric pseudo-observation update.  SemiDDE CSP runs on the same
 copula kernel (`csp_backend="copula"`, the default), with the Normal-family
 engine defaults and the precision-weighted `g` step after every committed
-iteration; `csp_backend="mcem"` selects the former MCEM path.  `D` fixes the
+iteration (the former MCEM path was removed; git tag `csp-mcem-last`).  `D` fixes the
 hierarchy depth; the fitted active widths are returned in `result.K_list`:
 
 ```python
@@ -109,11 +109,9 @@ penalty in every layer (`csp_penalty_scaling_power=0.5`,
 (`csp_threshold_rule="all"`), the dense marginal-likelihood deletion test for
 the deepest layer (`csp_top_prune="bic_dense"`), and 100 iterations without
 early stop (`max_it=100`, `tol=0`); `Results/csp_redesign/bench_v2` holds the
-20-replicate N-trend study behind these defaults.  The former MCEM backends
-stay available: ``"mcem"`` retains the original simultaneous MCEM updates,
-``"mcem_reinitialize"`` activates CSP layer by layer and rebuilds each waiting
-parent, and ``"mcem_cap_only"`` uses the same staged schedule while preserving
-eligible parent states and only enforcing the child-implied structural cap.
+20-replicate N-trend study behind these defaults.  The former MCEM CSP
+backends (``"mcem"``, ``"mcem_reinitialize"``, ``"mcem_cap_only"``) were
+removed; the git tag `csp-mcem-last` holds the last version with them.
 
 Bernoulli DDE uses the same fixed and CSP interfaces, requires a binary 0/1
 matrix, and has no `gamma` dispersion parameter. For fixed-width parametric
@@ -143,16 +141,13 @@ E/M-step timings, and accumulator sizes. It does not retain coefficient
 matrices or latent draws, so tracing does not scale with parameter-history
 storage.
 
-Bernoulli CSP uses the simultaneous MCEM path with a persistent systematic
-coordinate-Gibbs transition: its
-`C` draws are consecutive sweeps, and the last draw becomes the next MCEM
-state.  The transition respects CSP stage caps and the current annealing
-temperature.  For simultaneous MCEM with three or more layers, its automatic
-defaults delay irreversible CSP shrinkage for 10 iterations when at least 20
-outer iterations are requested, and scale the CSP penalty by
-`max(1, (N / 1000) ** (2 / 3))`.  Supplying
-`mcem_shrinkage_burn` or `mcem_penalty_strength` overrides the corresponding
-automatic value.  Two-layer Bernoulli CSP retains its established settings.
+Bernoulli and Poisson CSP share the copula kernel described above.  Its
+other latent transitions stay available as options: the CopDDE synchronous
+mean-field draws (`csp_latent_transition="synchronous_mean_field"`) and a
+persistent systematic coordinate-Gibbs chain
+(`csp_latent_transition="systematic_coordinate_gibbs"`).  Further options are
+a slab-start burn-in (`csp_shrinkage_burn`) and a stopping rule that also
+waits for stable widths (`csp_convergence_width_window`, with `tol>0`).
 
 ## Visualization
 

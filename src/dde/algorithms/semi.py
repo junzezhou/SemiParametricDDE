@@ -12,7 +12,7 @@ from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
 from .normal_init_semi import Normal_init_semi, rank_gaussianize_columns
-from .semi_csp import get_SAEM_semiparametric_csp, get_SAEM_semiparametric_csp_copula
+from .semi_csp import get_SAEM_semiparametric_csp_copula
 from .semi_em import get_EM_est
 from .semi_saem import get_SAEM_normal, get_SAEM_semiparametricv1
 
@@ -225,101 +225,13 @@ def _fit_semidde_csp(Y, K_max, kwargs, *, initialization):
         )
 
     max_inner_iter = _pop_inner_iterations(kwargs)
-    # The copula kernel is the default: on the CopDDE paper designs its
-    # deep-layer width error falls with N, the MCEM path's grows
-    # (Results/csp_redesign/bench_v1).
     backend = str(kwargs.pop("csp_backend", "copula")).strip().lower()
-    if backend == "copula":
-        return _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, initialization=initialization)
-    if backend != "mcem":
-        raise ValueError("SemiDDE csp_backend must be 'mcem' or 'copula'.")
-    accepted = {
-        "X_in",
-        "prop_in",
-        "B_list_in",
-        "gamma_in",
-        "A_list_in",
-        "C",
-        "t_spike",
-        "temp",
-        "tau",
-        "tol",
-        "max_outer_iter",
-        "max_enum_bits",
-        "mc_samples",
-        "g_update_rho",
-        "delta",
-        "random_state",
-        "optimizer_maxiter",
-        "optimizer_tol",
-        "convergence_window",
-        "convergence_mean_tol",
-        "burn",
-        "bound_val",
-        "estep_row_chunk_size",
-        "estep_coordinate_chunk_size",
-        "keep_trace",
-        "verbose",
-    }
-    unknown = sorted(set(kwargs) - accepted)
-    if unknown:
-        raise TypeError(
-            "Unexpected SemiDDE CSP argument(s): " + ", ".join(unknown) + "."
+    if backend != "copula":
+        raise ValueError(
+            "SemiDDE CSP runs on the copula kernel (csp_backend='copula', the "
+            "default); the MCEM path was removed (git tag csp-mcem-last)."
         )
-
-    raw = get_SAEM_semiparametric_csp(
-        **kwargs,
-        Y=Y,
-        max_inner_iter=max_inner_iter,
-    )
-    diagnostics = {
-        "iterations": raw["total_iterations"],
-        "outer_iterations": raw["outer_iterations"],
-        "inner_iterations_by_outer": raw["inner_iterations_by_outer"],
-        "D": len(K_max),
-        "K_list": tuple(raw["num_active"].tolist()),
-        "K_max_list": tuple(K_max),
-        "original_K_list": tuple(K_max),
-        "dimension_method": "csp",
-        "initialization": initialization,
-        "backend": "mcem",
-        "kernel": "semiparametric_pseudo_observation_mcem_csp",
-        "pseudo_observation_update": "semiparametric_g",
-        "threshold_rule": "first_two_layers",
-        "num_active": raw["num_active"].copy(),
-        "allocation": [value.copy() for value in raw["allocation"]],
-        "omega": [value.copy() for value in raw["omega"]],
-        "slab_scale": [value.copy() for value in raw["slab_scale"]],
-        "relative_history": raw["relative_history"],
-        "g_relative_history": raw["g_relative_history"],
-        "active_width_history": raw["active_width_history"],
-        "temperature": raw["temperature"],
-        "latent_transition": raw["latent_transition"],
-        "mc_state_update": raw["mc_state_update"],
-        "csp_state_continuation": "across_outer_iterations",
-    }
-    if kwargs.get("keep_trace", False):
-        diagnostics["trace"] = raw["outer_trace"]
-
-    compressed = compress_csp_result_components(
-        prop=raw["prop"],
-        B_list=raw["B_list"],
-        A_list=raw["A_list"],
-        diagnostics=diagnostics,
-        raw=raw,
-        min_active=True,
-    )
-    return DDEResult(
-        model="semi",
-        K_list=list(compressed["diagnostics"]["K_list"]),
-        prop=compressed["prop"],
-        B_list=compressed["B_list"],
-        gamma=raw["gamma"],
-        A_list=compressed["A_list"],
-        transformed=raw["X"],
-        diagnostics=compressed["diagnostics"],
-        raw=compressed["raw"],
-    )
+    return _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, initialization=initialization)
 
 
 def _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, *, initialization):
@@ -337,7 +249,7 @@ def _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, *, initialization)
             "estep_coordinate_chunk_size",
         })
         hint = (
-            "; " + ", ".join(mcem_only) + " belong to the MCEM path (csp_backend='mcem')"
+            "; " + ", ".join(mcem_only) + " belonged to the removed MCEM path"
             if mcem_only else ""
         )
         raise TypeError("Unexpected SemiDDE CSP argument(s): " + ", ".join(unknown) + hint + ".")
@@ -398,7 +310,7 @@ def fit_semidde(
     ``floor(J/3), floor(floor(J/3)/3), ...`` before shrinking them.  CSP mode
     runs on the copula kernel by default (``csp_backend="copula"``: the
     Normal-family engine with a ``g`` step after every committed
-    iteration); ``csp_backend="mcem"`` selects the former MCEM path.
+    iteration); the former MCEM path was removed.
     """
     Y = np.asarray(Y, dtype=float)
     if Y.ndim != 2 or Y.shape[0] < 1 or Y.shape[1] < 1:
@@ -445,7 +357,6 @@ __all__ = [
     "fit_semidde",
     "get_EM_est",
     "get_SAEM_normal",
-    "get_SAEM_semiparametric_csp",
     "get_SAEM_semiparametricv1",
     "rank_gaussianize_columns",
 ]

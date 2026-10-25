@@ -115,13 +115,11 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
         random_state=7, verbose=False,
     )
     assert default.diagnostics["backend"] == "copula"
-    mcem = fit(
-        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
-        t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
-        random_state=7, verbose=False, csp_backend="mcem",
-    )
-    assert mcem.diagnostics["backend"] == "mcem"
-    with pytest.raises(ValueError, match="mcem_shrinkage_burn"):
+    with pytest.raises(ValueError, match="were removed"):
+        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+            t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
+            verbose=False, csp_backend="mcem")
+    with pytest.raises(TypeError, match="mcem_shrinkage_burn"):
         fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
             verbose=False, mcem_shrinkage_burn=2)
@@ -410,8 +408,6 @@ def test_anchor_init_is_an_opt_in_for_the_copula_csp_only():
     res = fit(X, csp_backend="copula", fixed_init_binarize="anchor_lca", **common)
     assert res.diagnostics["init_binarize"] == "anchor_lca"
     assert fit(X, csp_backend="copula", **common).diagnostics["init_binarize"] == "projection"
-    with pytest.raises(ValueError, match="anchor_lca"):
-        fit(X, csp_backend="mcem", fixed_init_binarize="anchor_lca", **common)
     with pytest.raises(ValueError, match="anchor_mixture"):
         fit(X, csp_backend="copula", fixed_init_binarize="anchor_mixture", **common)
 

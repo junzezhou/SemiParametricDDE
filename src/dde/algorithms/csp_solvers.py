@@ -1,9 +1,8 @@
 """Weighted-L1 M-step solvers for the logistic and Poisson CSP layers.
 
-Shared by the copula-structured CSP engine (:mod:`dde.algorithms.normal_csp`),
-the MCEM CSP kernels (:mod:`dde.algorithms.parametric_csp_mcem`) and the
-Bernoulli and Poisson family adapters, so that none of them depends on the
-MCEM module for these solves.  The Monte Carlo draws enter through a design
+Shared by the copula-structured CSP engine (:mod:`dde.algorithms.normal_csp`)
+and the Bernoulli and Poisson family adapters.  The Monte Carlo draws enter
+through a design
 cross-product cache; the logistic solver is the tempered weighted-L1 problem of
 a binary child layer, the Poisson solver the log-link counterpart with a
 backtracking step.
