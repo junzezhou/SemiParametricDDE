@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import time
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from itertools import product
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -571,6 +574,184 @@ def _select_copula_pmse(
     return final
 
 
+def _candidate_global_seed(random_state: int, c_idx: int) -> int:
+    """Seed of the global NumPy generator for one candidate's fits."""
+    sequence = np.random.SeedSequence([int(random_state) & 0xFFFFFFFFFFFFFFFF, int(c_idx)])
+    return int(sequence.generate_state(1, dtype=np.uint32)[0])
+
+
+def _default_score_fn(chosen: str, family: Optional[str]):
+    if chosen == "dde":
+        return partial(_parametric_score, family=family)
+    return partial(_normal_score, model=chosen)
+
+
+def _parametric_score(holdout, fitted, *, family):
+    return parametric_mixture_loglik_score(holdout, fitted, family=family)
+
+
+def _normal_score(holdout, fitted, *, model):
+    return normal_mixture_loglik_score(holdout, fitted, model=model)
+
+
+def _evaluate_candidate_task(task):
+    return _evaluate_candidate(*task)
+
+
+def _evaluate_candidate(context: Mapping[str, Any], c_idx: int, candidate: Mapping[str, Any]):
+    """Fit and score one candidate (all folds, or the full data for EBIC).
+
+    A module-level function of explicit arguments so that a separate process
+    can run it.  With a ``random_state`` the legacy global NumPy generator is
+    seeded per candidate first: several kernels draw from it, and a seed that
+    depends only on (random_state, candidate) makes each candidate's fit
+    independent of the candidates evaluated before it, and so identical in
+    serial and parallel runs.  Returns the CV-table row, the scores, the
+    full-data fit (EBIC only), the fitted candidate values and its timing rows.
+    """
+    Y = context["Y"]; D = context["D"]; chosen = context["chosen"]; method = context["method"]
+    family = context["family"]; criterion = context["criterion"]; defaults = context["defaults"]
+    base = context["base"]; fixed = context["fixed"]; random_state = context["random_state"]
+    init_factory = context["init_factory"]; ebic_gamma = context["ebic_gamma"]; folds = context["folds"]
+    score_fn = context["scorer"] or _default_score_fn(chosen, family)
+    timing_rows: List[Dict[str, Any]] = []
+    if random_state is not None:
+        np.random.seed(_candidate_global_seed(random_state, c_idx))
+    candidate_started = time.perf_counter()
+    fit_candidate, meta = _split_fit_kwargs(candidate)
+    hp = dict(defaults)
+    hp.update(base)
+    hp.update(fixed)
+    hp.update(fit_candidate)
+    hp = _with_iteration_alias(hp, chosen, base, fixed, fit_candidate)
+    if random_state is not None and (chosen == "copula" or method == "csp"):
+        hp.setdefault("random_state", random_state)
+    hp["dimension_method"] = method
+    if chosen == "copula":
+        hp = _with_copula_method_defaults(hp, D)
+    K_list = hp.get("K_list")
+    if chosen != "copula" and method == "csp":
+        if K_list is not None:
+            raise ValueError("K_list must be omitted for DDE and SemiDDE CSP fits.")
+        K_list = estimate_K_list_copula(Y, D)
+    else:
+        if K_list is None:
+            raise ValueError("Each candidate, fixed_hp, or base_fit_kwargs must provide K_list.")
+        K_list = list(validate_K_list_identifiability(K_list, D=D, J=Y.shape[1]))
+        hp["K_list"] = K_list
+        if chosen == "semi" and method == "fixed" and "tol" not in fit_candidate and "tol" not in fixed and "tol" not in base:
+            hp["tol"] = float(K_list[-1]) / 2.0
+
+    full_result = None
+    if criterion == "ebic":
+        full_kwargs = dict(hp)
+        init_seconds = 0.0
+        if chosen == "semi" and method == "fixed":
+            factory = init_factory or _semi_data_init
+            init_started = time.perf_counter()
+            full_kwargs.update(factory(Y, full_kwargs["K_list"], {"epsilon": full_kwargs.get("epsilon", 1e-4)}))
+            init_seconds = time.perf_counter() - init_started
+        fit_started = time.perf_counter()
+        full_result = fit(Y, method=chosen, D=D, family=family, **full_kwargs)
+        fit_seconds = time.perf_counter() - fit_started
+        score_started = time.perf_counter()
+        avg_ll = float(score_fn(Y, full_result))
+        score_seconds = time.perf_counter() - score_started
+        df, capacity, edges = _model_df_and_capacity(full_result, tau=float(full_kwargs.get("tau", 0.0)))
+        scores = [
+            _score_from_loglik(
+                avg_ll,
+                criterion="ebic",
+                df=df,
+                capacity=capacity,
+                edges=edges,
+                n_model=Y.shape[0],
+                n_score=Y.shape[0],
+                ebic_gamma=ebic_gamma,
+            )
+        ]
+        timing_rows.append(
+            {
+                "candidate_index": c_idx,
+                "fold_index": None,
+                "n_train": int(Y.shape[0]),
+                "n_holdout": int(Y.shape[0]),
+                "init_seconds": float(init_seconds),
+                "fit_seconds": float(fit_seconds),
+                "score_seconds": float(score_seconds),
+                "total_seconds": float(init_seconds + fit_seconds + score_seconds),
+            }
+        )
+    else:
+        scores = []
+        for fold_idx, (train_idx, test_idx) in enumerate(folds):
+            train_Y = Y[train_idx]
+            holdout_Y = Y[test_idx]
+            kwargs = dict(hp)
+            init_seconds = 0.0
+            if chosen == "semi" and method == "fixed":
+                factory = init_factory or _semi_data_init
+                init_started = time.perf_counter()
+                kwargs.update(factory(train_Y, kwargs["K_list"], {"epsilon": kwargs.get("epsilon", 1e-4)}))
+                init_seconds = time.perf_counter() - init_started
+            fit_started = time.perf_counter()
+            fitted = fit(train_Y, method=chosen, D=D, family=family, **kwargs)
+            fit_seconds = time.perf_counter() - fit_started
+            score_started = time.perf_counter()
+            avg_ll = float(score_fn(holdout_Y, fitted))
+            score_seconds = time.perf_counter() - score_started
+            df, capacity, edges = _model_df_and_capacity(fitted, tau=float(kwargs.get("tau", 0.0)))
+            scores.append(
+                _score_from_loglik(
+                    avg_ll,
+                    criterion=criterion,
+                    df=df,
+                    capacity=capacity,
+                    edges=edges,
+                    n_model=len(train_idx),
+                    n_score=len(test_idx),
+                    ebic_gamma=ebic_gamma,
+                )
+            )
+            timing_rows.append(
+                {
+                    "candidate_index": c_idx,
+                    "fold_index": int(fold_idx),
+                    "n_train": int(len(train_idx)),
+                    "n_holdout": int(len(test_idx)),
+                    "init_seconds": float(init_seconds),
+                    "fit_seconds": float(fit_seconds),
+                    "score_seconds": float(score_seconds),
+                    "total_seconds": float(init_seconds + fit_seconds + score_seconds),
+                }
+            )
+
+    row = {
+        "candidate_index": c_idx,
+        **meta,
+        "K_list": list(K_list),
+        "criterion": criterion,
+        "mean_score": float(np.mean(scores)),
+        "std_score": float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0,
+    }
+    if full_result is not None and full_result.K_list is not None:
+        # Fitted widths of the full-data candidate fit (CSP diagnostics).
+        row["fitted_K"] = [int(value) for value in full_result.K_list]
+    if not np.isfinite(row["mean_score"]):
+        raise ValueError(f"Candidate {c_idx} produced a non-finite {criterion} score.")
+    candidate_timings = timing_rows
+    row["elapsed_seconds"] = float(time.perf_counter() - candidate_started)
+    row["init_seconds"] = float(sum(r["init_seconds"] for r in candidate_timings))
+    row["fit_seconds"] = float(sum(r["fit_seconds"] for r in candidate_timings))
+    row["score_seconds"] = float(sum(r["score_seconds"] for r in candidate_timings))
+    for key, value in hp.items():
+        if key not in row and np.isscalar(value):
+            row[key] = value
+        elif key in {"pen_list", "t_spike"}:
+            row[key] = np.asarray(value, dtype=float).reshape(-1).tolist()
+    return row, scores, full_result, fit_candidate, timing_rows
+
+
 def select_hyperparameters(
     Y,
     *,
@@ -601,6 +782,14 @@ def select_hyperparameters(
     layer-specific vectors, use ``{"pen_list": {"per_layer": [[...], ...]}}``
     or the same form with ``t_spike``. Every Cartesian combination is fitted.
     Candidate values override ``fixed_hp``, then ``base_fit_kwargs`` and defaults.
+
+    ``n_jobs > 1`` evaluates the candidates in that many worker processes
+    (spawned; the BIC/EBIC/log-likelihood paths and the CopDDE PMSE path).
+    A custom ``scorer`` or ``init_factory`` must then be picklable (a
+    module-level function).  With a ``random_state``, the global NumPy
+    generator is seeded per candidate from (``random_state``, candidate
+    index) before its fits, so the results do not depend on the evaluation
+    order and are identical for every ``n_jobs``.
     """
     Y = np.asarray(Y)
     if Y.ndim != 2 or min(Y.shape) < 1:
@@ -716,16 +905,6 @@ def select_hyperparameters(
                 n_splits=n_splits,
                 n_jobs=n_jobs,
             )
-    if scorer is not None:
-        score_fn = scorer
-    elif chosen == "dde":
-        score_fn = lambda holdout, fitted: parametric_mixture_loglik_score(
-            holdout, fitted, family=family,
-        )
-    else:
-        score_fn = lambda holdout, fitted: normal_mixture_loglik_score(
-            holdout, fitted, model=chosen,
-        )
     folds = (
         [] if criterion == "ebic" else
         list(KFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(Y))
@@ -737,145 +916,28 @@ def select_hyperparameters(
     evaluated_candidates: List[Dict[str, Any]] = []
     timing_rows: List[Dict[str, Any]] = []
 
-    def evaluate_candidate(c_idx: int, candidate: Mapping[str, Any]) -> tuple[Dict[str, Any], List[float], Optional[DDEResult], Dict[str, Any]]:
-        candidate_started = time.perf_counter()
-        fit_candidate, meta = _split_fit_kwargs(candidate)
-        hp = dict(defaults)
-        hp.update(base)
-        hp.update(fixed)
-        hp.update(fit_candidate)
-        hp = _with_iteration_alias(hp, chosen, base, fixed, fit_candidate)
-        if random_state is not None and (chosen == "copula" or method == "csp"):
-            hp.setdefault("random_state", random_state)
-        hp["dimension_method"] = method
-        if chosen == "copula":
-            hp = _with_copula_method_defaults(hp, D)
-        K_list = hp.get("K_list")
-        if chosen != "copula" and method == "csp":
-            if K_list is not None:
-                raise ValueError("K_list must be omitted for DDE and SemiDDE CSP fits.")
-            K_list = estimate_K_list_copula(Y, D)
-        else:
-            if K_list is None:
-                raise ValueError("Each candidate, fixed_hp, or base_fit_kwargs must provide K_list.")
-            K_list = list(validate_K_list_identifiability(K_list, D=D, J=Y.shape[1]))
-            hp["K_list"] = K_list
-            if chosen == "semi" and method == "fixed" and "tol" not in fit_candidate and "tol" not in fixed and "tol" not in base:
-                hp["tol"] = float(K_list[-1]) / 2.0
+    context = {
+        "Y": Y, "D": D, "chosen": chosen, "method": method, "family": family,
+        "criterion": criterion, "defaults": defaults, "base": base, "fixed": fixed,
+        "random_state": random_state, "init_factory": init_factory, "scorer": scorer,
+        "ebic_gamma": ebic_gamma, "folds": folds,
+    }
+    tasks = [(context, c_idx, candidate) for c_idx, candidate in enumerate(candidate_list)]
+    workers = min(int(n_jobs), len(tasks))
+    if workers > 1:
+        # Candidates are independent fits; the results are collected in
+        # candidate order, so the selection is the serial one.
+        with ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+        ) as executor:
+            outcomes = list(executor.map(_evaluate_candidate_task, tasks))
+    else:
+        outcomes = map(_evaluate_candidate_task, tasks)
 
-        full_result = None
-        if criterion == "ebic":
-            full_kwargs = dict(hp)
-            init_seconds = 0.0
-            if chosen == "semi" and method == "fixed":
-                factory = init_factory or _semi_data_init
-                init_started = time.perf_counter()
-                full_kwargs.update(factory(Y, full_kwargs["K_list"], {"epsilon": full_kwargs.get("epsilon", 1e-4)}))
-                init_seconds = time.perf_counter() - init_started
-            fit_started = time.perf_counter()
-            full_result = fit(Y, method=chosen, D=D, family=family, **full_kwargs)
-            fit_seconds = time.perf_counter() - fit_started
-            score_started = time.perf_counter()
-            avg_ll = float(score_fn(Y, full_result))
-            score_seconds = time.perf_counter() - score_started
-            df, capacity, edges = _model_df_and_capacity(full_result, tau=float(full_kwargs.get("tau", 0.0)))
-            scores = [
-                _score_from_loglik(
-                    avg_ll,
-                    criterion="ebic",
-                    df=df,
-                    capacity=capacity,
-                    edges=edges,
-                    n_model=Y.shape[0],
-                    n_score=Y.shape[0],
-                    ebic_gamma=ebic_gamma,
-                )
-            ]
-            timing_rows.append(
-                {
-                    "candidate_index": c_idx,
-                    "fold_index": None,
-                    "n_train": int(Y.shape[0]),
-                    "n_holdout": int(Y.shape[0]),
-                    "init_seconds": float(init_seconds),
-                    "fit_seconds": float(fit_seconds),
-                    "score_seconds": float(score_seconds),
-                    "total_seconds": float(init_seconds + fit_seconds + score_seconds),
-                }
-            )
-        else:
-            scores = []
-            for fold_idx, (train_idx, test_idx) in enumerate(folds):
-                train_Y = Y[train_idx]
-                holdout_Y = Y[test_idx]
-                kwargs = dict(hp)
-                init_seconds = 0.0
-                if chosen == "semi" and method == "fixed":
-                    factory = init_factory or _semi_data_init
-                    init_started = time.perf_counter()
-                    kwargs.update(factory(train_Y, kwargs["K_list"], {"epsilon": kwargs.get("epsilon", 1e-4)}))
-                    init_seconds = time.perf_counter() - init_started
-                fit_started = time.perf_counter()
-                fitted = fit(train_Y, method=chosen, D=D, family=family, **kwargs)
-                fit_seconds = time.perf_counter() - fit_started
-                score_started = time.perf_counter()
-                avg_ll = float(score_fn(holdout_Y, fitted))
-                score_seconds = time.perf_counter() - score_started
-                df, capacity, edges = _model_df_and_capacity(fitted, tau=float(kwargs.get("tau", 0.0)))
-                scores.append(
-                    _score_from_loglik(
-                        avg_ll,
-                        criterion=criterion,
-                        df=df,
-                        capacity=capacity,
-                        edges=edges,
-                        n_model=len(train_idx),
-                        n_score=len(test_idx),
-                        ebic_gamma=ebic_gamma,
-                    )
-                )
-                timing_rows.append(
-                    {
-                        "candidate_index": c_idx,
-                        "fold_index": int(fold_idx),
-                        "n_train": int(len(train_idx)),
-                        "n_holdout": int(len(test_idx)),
-                        "init_seconds": float(init_seconds),
-                        "fit_seconds": float(fit_seconds),
-                        "score_seconds": float(score_seconds),
-                        "total_seconds": float(init_seconds + fit_seconds + score_seconds),
-                    }
-                )
-
-        row = {
-            "candidate_index": c_idx,
-            **meta,
-            "K_list": list(K_list),
-            "criterion": criterion,
-            "mean_score": float(np.mean(scores)),
-            "std_score": float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0,
-        }
-        if full_result is not None and full_result.K_list is not None:
-            # Fitted widths of the full-data candidate fit (CSP diagnostics).
-            row["fitted_K"] = [int(value) for value in full_result.K_list]
-        if not np.isfinite(row["mean_score"]):
-            raise ValueError(f"Candidate {c_idx} produced a non-finite {criterion} score.")
-        candidate_timings = [r for r in timing_rows if r["candidate_index"] == c_idx]
-        row["elapsed_seconds"] = float(time.perf_counter() - candidate_started)
-        row["init_seconds"] = float(sum(r["init_seconds"] for r in candidate_timings))
-        row["fit_seconds"] = float(sum(r["fit_seconds"] for r in candidate_timings))
-        row["score_seconds"] = float(sum(r["score_seconds"] for r in candidate_timings))
-        for key, value in hp.items():
-            if key not in row and np.isscalar(value):
-                row[key] = value
-            elif key in {"pen_list", "t_spike"}:
-                row[key] = np.asarray(value, dtype=float).reshape(-1).tolist()
-        return row, scores, full_result, fit_candidate
-
-    for c_idx, candidate in enumerate(candidate_list):
-        row, scores, full_result, fit_candidate = evaluate_candidate(c_idx, candidate)
+    for row, scores, full_result, fit_candidate, candidate_timing in outcomes:
         cv_table.append(row)
         fold_scores.append(scores)
+        timing_rows.extend(candidate_timing)
         if full_result is not None and row["mean_score"] > best_full_score:
             best_full_result = full_result
             best_full_score = row["mean_score"]
@@ -934,6 +996,10 @@ def select_hyperparameters(
     if chosen == "semi" and method == "fixed":
         factory = init_factory or _semi_data_init
         final_kwargs.update(factory(Y, final_kwargs["K_list"], {"epsilon": final_kwargs.get("epsilon", 1e-4)}))
+    if random_state is not None:
+        # the refit draws from the global generator like the candidate fits;
+        # it uses the selected candidate's seed, whatever ran before it
+        np.random.seed(_candidate_global_seed(random_state, best_index))
     refit_started = time.perf_counter()
     final = fit(Y, method=chosen, D=D, family=family, **final_kwargs)
     refit_seconds = time.perf_counter() - refit_started

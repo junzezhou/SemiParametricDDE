@@ -556,3 +556,85 @@ def test_select_hyperparameters_copula_csp_rejects_pen_list_candidate():
         assert "pen_list is only valid for CopDDE dimension_method='fixed'" in str(exc)
     else:
         raise AssertionError("CopDDE CSP path should reject pen_list candidates.")
+
+
+_TIMING_FIELDS = {"elapsed_seconds", "init_seconds", "fit_seconds", "score_seconds"}
+
+
+def _selection_signature(result):
+    rows = [
+        {key: value for key, value in row.items() if key not in _TIMING_FIELDS}
+        for row in result.diagnostics["cv_table"]
+    ]
+    arrays = [np.asarray(result.prop)] + [np.asarray(B) for B in result.B_list]
+    arrays += [np.asarray(A) for A in result.A_list]
+    if result.gamma is not None:
+        arrays.append(np.asarray(result.gamma))
+    return rows, result.diagnostics["fold_scores"], list(result.K_list), arrays
+
+
+def _assert_same_selection(first, second):
+    rows_a, folds_a, K_a, arrays_a = _selection_signature(first)
+    rows_b, folds_b, K_b, arrays_b = _selection_signature(second)
+    assert rows_a == rows_b
+    assert folds_a == folds_b
+    assert K_a == K_b
+    assert len(arrays_a) == len(arrays_b)
+    for a, b in zip(arrays_a, arrays_b):
+        np.testing.assert_array_equal(a, b)
+    assert len(first.diagnostics["timing_table"]) == len(second.diagnostics["timing_table"])
+
+
+def _small_selection_data(kind):
+    rng = np.random.default_rng(91)
+    X = rng.normal(size=(60, 18))
+    if kind == "binary":
+        return (X > 0).astype(float)
+    return X
+
+
+@pytest.mark.parametrize(
+    ("kind", "spec"),
+    [
+        ("normal", dict(method="DDE", family="Normal")),  # draws from the global generator
+        ("binary", dict(method="DDE", family="Bernoulli")),
+        ("normal", dict(model="SemiDDE")),
+    ],
+)
+def test_parallel_candidates_match_serial_bitwise_ebic(kind, spec):
+    Y = _small_selection_data(kind)
+    args = dict(
+        D=2, dimension_method="csp", criterion="ebic", random_state=17,
+        candidates={"t_spike": {"per_layer": [[0.01, 0.05], [0.03, 0.1]]}, "temp": [0.9], "tau": [0.3]},
+        base_fit_kwargs={"max_iter": 3, "verbose": False}, **spec,
+    )
+    np.random.seed(1)
+    serial = select_hyperparameters(Y, n_jobs=1, **args)
+    np.random.seed(2)  # a different caller state must not matter
+    parallel = select_hyperparameters(Y, n_jobs=2, **args)
+    assert len(serial.diagnostics["cv_table"]) == 4
+    _assert_same_selection(serial, parallel)
+
+
+def test_parallel_candidates_match_serial_bitwise_cross_validated_bic():
+    K_list = [6, 2]
+    prop, B_list, gamma = _parameters(18, K_list)
+    X, _ = generate_X_normal(40, prop, B_list, gamma)
+    args = dict(
+        D=2, method="DDE", family="Normal", dimension_method="fixed", criterion="bic",
+        n_splits=2, random_state=5, fixed_hp={"K_list": K_list},
+        candidates=[{"pen_list": [0.5, 0.5], "tau": 0.3}, {"pen_list": [2.0, 2.0], "tau": 0.3}],
+        base_fit_kwargs={"max_iter": 2, "verbose": False},
+    )
+    np.random.seed(3)
+    serial = select_hyperparameters(X, n_jobs=1, **args)
+    np.random.seed(4)
+    parallel = select_hyperparameters(X, n_jobs=2, **args)
+    assert len(serial.diagnostics["fold_scores"][0]) == 2
+    _assert_same_selection(serial, parallel)
+
+
+def test_selection_rejects_nonpositive_n_jobs():
+    with pytest.raises(ValueError, match="n_jobs"):
+        select_hyperparameters(_small_selection_data("normal"), D=2, method="DDE", family="Normal",
+                               dimension_method="csp", n_jobs=0)
