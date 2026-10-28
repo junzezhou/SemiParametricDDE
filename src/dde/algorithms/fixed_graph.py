@@ -24,13 +24,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import linear_sum_assignment, minimize
 from scipy.special import expit
 
 from .bernoulli_init import (
     _initialize_binary_parent_layer,
     _two_class_latent_class_model,
 )
+from .normal_init_cop import Normal_init_cop
 from .normal_init_semi import _two_class_gaussian_mixture
 from .parametric_families import resolve_parametric_family
 from .poisson_init import _two_component_poisson_mixture
@@ -317,6 +318,104 @@ def graph_anchored_initialize(
     prop = np.clip(np.mean(A_list[-1], axis=0), 1e-3, 1.0 - 1e-3)
     diagnostics = {"anchors": anchors_list}
     return prop, B_list, gamma, A_list, diagnostics
+
+
+def _match_columns_to_graph(children, states, support):
+    """Estimated latent column matched to each graph column (Hungarian assignment).
+
+    The assignment maximizes the variance of the graph's children explained
+    by their matched parents: estimated column ``c`` scores
+    ``sum_{j in S_k} corr(child_j, state_c)**2`` for graph column ``k``.
+    The score is read from the data, not from the spectral loadings, whose
+    small entries are too noisy to tell apart graph columns that share their
+    strongly loading children; it ignores signs, as a binary graph does.
+    """
+    children = np.asarray(children, dtype=float)
+    states = np.asarray(states, dtype=float)
+    centred_children = children - children.mean(axis=0)
+    centred_states = states - states.mean(axis=0)
+    scale = np.outer(
+        np.sqrt(np.sum(centred_children**2, axis=0)),
+        np.sqrt(np.sum(centred_states**2, axis=0)),
+    )
+    correlation = np.divide(
+        centred_children.T @ centred_states, scale,
+        out=np.zeros(scale.shape), where=scale > 0,
+    )
+    score = support.T.astype(float) @ correlation**2
+    _, columns = linear_sum_assignment(-score)
+    return columns
+
+
+def spectral_graph_initialize(
+    X,
+    support_list,
+    K_tuple,
+    *,
+    epsilon: float = 1e-4,
+    bound_val: float = 10.0,
+    layer_em_starts: int = 0,
+    rng=None,
+):
+    """Initialize a Normal-observed DDE on a given graph from the spectral estimate.
+
+    The CopDDE spectral initializer (``Normal_init_cop``: SVD, varimax and
+    the binary-layer double SVD at the given widths) supplies unlabelled
+    latent columns; each fixed layer's columns are matched to the graph's
+    (``_match_columns_to_graph``), the matching carried into the rows of the
+    layer above, and the fixed layers' coefficients refitted on the graph
+    from the matched states.  This follows ``Normal_init_G`` in the CopDDE
+    code (``Sim_SampleSplit.m``), which aligns the spectral columns to a
+    graph before the unpenalized refit; unlike the anchor initializer it
+    needs no children with few parents, so it suits designs in which every
+    child loads on several latent variables.
+
+    Returns ``(prop, B_list, gamma, A_list, diagnostics)``.
+    """
+    X = np.asarray(X, dtype=float)
+    prop, B_list, gamma, A_list = Normal_init_cop(X, K_tuple, epsilon=epsilon)
+    B_list = [np.asarray(B, dtype=float).copy() for B in B_list]
+    A_list = [np.asarray(A, dtype=float).copy() for A in A_list]
+    D = len(K_tuple)
+    matches = []
+    for d, support in enumerate(support_list):
+        if support is None:
+            break
+        columns = _match_columns_to_graph(X if d == 0 else A_list[d - 1], A_list[d], support)
+        matches.append(columns.tolist())
+        B_list[d] = np.column_stack((B_list[d][:, 0], B_list[d][:, 1:][:, columns]))
+        A_list[d] = A_list[d][:, columns]
+        if d + 1 < D:
+            B_list[d + 1] = B_list[d + 1][columns, :]
+        else:
+            prop = prop[columns]
+    latent_bounds = resolve_parametric_family("normal").fixed_latent_bounds
+    layer_em_logliks = []
+    for d, support in enumerate(support_list[: len(matches)]):
+        if d == 0:
+            B_list[0], gamma = _fit_layer_on_graph(
+                X, A_list[0], support, "normal", None, epsilon=epsilon
+            )
+            continue
+        B_list[d], _ = _fit_layer_on_graph(
+            A_list[d - 1], A_list[d], support, "logistic",
+            latent_bounds(support.shape[1] + 1, bound_val), epsilon=epsilon,
+        )
+        if layer_em_starts and support.shape[1] <= EXACT_EM_MAX_WIDTH:
+            # The layer's children are the matched states below it; refit the
+            # layer as a one-layer Bernoulli DDE on its graph by exact EM.
+            fit = fit_fixed_graph_em_multistart(
+                A_list[d - 1].astype(float),
+                np.clip(A_list[d].mean(axis=0), 0.05, 0.95),
+                [B_list[d]], None, [support], family="bernoulli",
+                n_init=layer_em_starts, rng=rng, max_iter=300, tol=1e-6,
+            )
+            B_list[d] = fit[1][0]
+            A_list[d] = np.asarray(fit[3][0], dtype=float)
+            layer_em_logliks.append(fit[5]["start_logliks"])
+    prop = np.clip(np.mean(A_list[-1], axis=0), 1e-3, 1.0 - 1e-3)
+    A_list = [A.astype(np.uint8) for A in A_list]
+    return prop, B_list, gamma, A_list, {"spectral_matches": matches, "layer_em_logliks": layer_em_logliks}
 
 
 # ---------------------------------------------------------------------------

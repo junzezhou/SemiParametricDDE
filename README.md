@@ -324,6 +324,26 @@ fixed mode) accepts `G_list` with the SAEM path. The paper-format study is
 `scripts/evaluate_fixed_graph_paper.py` and the TIMSS replication
 `scripts/realdata_timss_fixed_graph.py`.
 
+CopDDE takes `G_list` the same way (`dimension_method` then defaults to
+`"fixed"`):
+
+```python
+result = fit(X_counts, method="CopDDE", G_list=[G1, G2], random_state=0)
+```
+
+The fixed layers are fitted by the rank-likelihood kernel (`get_SAEM_RL_D`)
+on their graph, unpenalized and unthresholded, with coordinate-Gibbs latent
+draws, as in the CopDDE code's fixed-graph refit (`get_SAEM_RL_G.m`); the
+defaults are `C=1`, `it=50`, `tol=0` and `temp=1`. The start matches the
+spectral estimate's columns to the graph, which needs no child with a single
+parent. With every layer fixed and deep layers no wider than 10, the layers
+above the first are then refitted by exact EM on the first layer's states
+after `graph_warmup_it=10` kernel iterations, keeping the best of `n_init=20`
+starts. A binary graph fixes the labels of the latent variables but not their
+0/1 coding, and variables with identical graph columns (and rows above) are
+interchangeable. The paper-format study is
+`scripts/evaluate_copdde_fixed_graph.py`.
+
 ## Hyperparameter selection
 
 `select_hyperparameters` accepts the same `method`, `family`, `D`, and

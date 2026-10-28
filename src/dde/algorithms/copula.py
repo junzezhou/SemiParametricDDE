@@ -12,6 +12,12 @@ from dde.results import DDEResult
 from dde.utils import validate_dde_lists
 from dde.utils.result_compression import compress_csp_result_components
 
+from .fixed_graph import (
+    EXACT_EM_MAX_WIDTH,
+    fit_fixed_graph_em_multistart,
+    resolve_graph_list,
+    spectral_graph_initialize,
+)
 from .get_SAEM_RL_CSP_D import get_SAEM_RL_CSP_D
 from .get_SAEM_RL_D import get_SAEM_RL_D
 from .normal_init_cop import Normal_init_cop
@@ -77,11 +83,56 @@ def normal_initialize_copula_dde(
     }
 
 
+def _graph_start(X, Z, R, Rlevels, K_tuple, support_list, *, epsilon, n_init, warmup_it, rng, kernel_kwargs):
+    """Start of a CopDDE fit on a given graph.
+
+    The spectral estimate is matched to the graph (``spectral_graph_initialize``)
+    and ``warmup_it`` kernel iterations settle the first latent layer, which the
+    latent Gaussian ``Z`` determines closely.  When every layer has a fixed
+    graph and the latent layers above the first are at most
+    ``EXACT_EM_MAX_WIDTH`` wide, those layers are then refitted as a Bernoulli
+    DDE on the first layer's states by exact EM from the warm-up estimate and
+    ``n_init - 1`` random starts on the graph, keeping the largest likelihood:
+    from the spectral start alone the kernel leaves deep layers in poor modes
+    (``D = 3`` paper design, ``N = 2000``: layer-2/3 MSE 0.1-0.9 / ~2 versus
+    0.02 / 0.04-0.13 from the truth).
+    """
+    prop, B_list, gamma, A_list, init_info = spectral_graph_initialize(
+        Z, support_list, K_tuple, epsilon=epsilon
+    )
+    info = {"spectral_matches": init_info["spectral_matches"], "warmup_it": 0}
+    D = len(K_tuple)
+    deep_em = (
+        D >= 2
+        and all(support is not None for support in support_list)
+        and max(K_tuple[1:]) <= EXACT_EM_MAX_WIDTH
+        and int(n_init) >= 1
+    )
+    if not deep_em or int(warmup_it) < 1:
+        return prop, B_list, gamma, A_list, Z, info
+    warm = get_SAEM_RL_D(
+        X, Z, R, Rlevels, prop, gamma, B_list, A_list,
+        **{**kernel_kwargs, "it": int(warmup_it), "tol": 0.0, "verbose": False},
+    )
+    info["warmup_it"] = int(warm["it_num"])
+    children = np.asarray(warm["A_list"][0], dtype=float)
+    fit = fit_fixed_graph_em_multistart(
+        children, warm["prop"], warm["B_list"][1:], None, support_list[1:],
+        family="bernoulli", n_init=int(n_init), rng=rng, max_iter=500, tol=1e-6,
+    )
+    info["deep_em_start_logliks"] = fit[5]["start_logliks"]
+    info["deep_em_best_start"] = fit[5]["best_start"]
+    B_list = [warm["B_list"][0]] + [np.asarray(B, dtype=float) for B in fit[1]]
+    A_list = [children] + [np.asarray(A, dtype=float) for A in fit[3]]
+    return fit[0], B_list, warm["gamma"], A_list, warm["Z"], info
+
+
 def fit_copula_dde(
     X,
     *,
     K_list: Optional[Sequence[int]] = None,
-    dimension_method: str = "csp",
+    dimension_method: Optional[str] = None,
+    G_list=None,
     Z=None,
     R=None,
     Rlevels=None,
@@ -95,11 +146,57 @@ def fit_copula_dde(
     B_list_oracle=None,
     G_list_oracle=None,
     epsilon: float = 1e-4,
+    n_init: Optional[int] = None,
+    graph_warmup_it: Optional[int] = None,
     **kwargs: Any,
 ) -> DDEResult:
-    """Fit CopDDE through the D-layer rank-likelihood kernel."""
+    """Fit CopDDE through the D-layer rank-likelihood kernel.
+
+    ``dimension_method`` is ``"csp"`` (default) or ``"fixed"``; it defaults
+    to ``"fixed"`` when ``G_list`` is given.
+
+    ``G_list`` fixes a user-specified graph, as in
+    :func:`dde.algorithms.dde.fit_parametric_dde`: binary matrices
+    ``G_list[0]`` (``J x K_1``) and ``G_list[d]`` (``K_d x K_{d+1}``), a
+    prefix of the layers.  The fixed layers are fitted on their graph by the
+    fixed-width kernel without the TLP penalty or threshold (``pen_list`` and
+    ``tau`` then matter only for free deeper layers), with systematic
+    coordinate-Gibbs latent draws (``latent_transition``) as in the MATLAB
+    ``get_SAEM_RL_G.m``.  The defaults are ``C=1``, ``it=50``, ``tol=0``
+    (run all iterations) and ``temp=1``.  The start matches the spectral
+    estimate to the graph and, when every layer is fixed and the deep widths
+    are at most 10, refits the deep layers by exact EM after
+    ``graph_warmup_it`` (default 10) kernel iterations, keeping the best of
+    ``n_init`` (default 20) starts.  A binary graph identifies each latent
+    variable only up to its 0/1 coding, and latent variables whose graph
+    columns and rows coincide only up to their order.
+    """
     X = np.asarray(X)
     verbose = bool(kwargs.get("verbose", True))
+    method = ("fixed" if G_list is not None else "csp") if dimension_method is None else str(dimension_method).lower()
+    support_list = None
+    if G_list is not None:
+        if method != "fixed":
+            raise ValueError("G_list requires dimension_method='fixed'; CSP estimates the graph.")
+        if B_list_oracle is not None or G_list_oracle is not None:
+            raise ValueError("G_list cannot be combined with oracle initialization lists.")
+        D_graph = len(K_list) if K_list is not None else len(G_list)
+        K_tuple, support_list = resolve_graph_list(G_list, D=D_graph, J=X.shape[1], K_list=K_list)
+        K_list = list(K_tuple)
+        n_fixed = sum(support is not None for support in support_list)
+        all_fixed = n_fixed == D_graph
+        kwargs.setdefault("C", 1)
+        kwargs.setdefault("it", 50)
+        kwargs.setdefault("tol", 0.0)
+        kwargs.setdefault("temp", 1.0)
+        kwargs.setdefault("latent_transition", "systematic_coordinate_gibbs")
+        if all_fixed:
+            kwargs.setdefault("pen_list", 0.0)
+            kwargs.setdefault("tau", 1.0)
+        kwargs["support_list"] = support_list
+    elif n_init is not None or graph_warmup_it is not None:
+        raise ValueError("n_init and graph_warmup_it apply only to fits with G_list.")
+    graph_info = None
     if Z is None or R is None or Rlevels is None:
         _, R0, Rlevels0 = prepare_rank_likelihood_inputs(X)
         if Z is None:
@@ -127,16 +224,40 @@ def fit_copula_dde(
             raise ValueError("K_list is required when initialized arguments are incomplete.")
         if verbose:
             print("CopDDE initialization: triggered using initialize='data'.")
-        init = normal_initialize_copula_dde(
-            X,
-            K_list,
-            Z=Z,
-            K1_max=K1_max,
-            B_list_oracle=B_list_oracle,
-            G_list_oracle=G_list_oracle,
-            random_state=random_state,
-            epsilon=epsilon,
-        )
+        if support_list is not None:
+            missing = [name for name in ("C", "temp", "pen_list", "tau") if name not in kwargs]
+            if missing:
+                raise ValueError("fit_copula_dde with a partial G_list needs: " + ", ".join(missing))
+            if isinstance(random_state, np.random.Generator):
+                rng = random_state
+            else:
+                rng = np.random.default_rng(
+                    np.random.randint(0, 2**31 - 1) if random_state is None else random_state
+                )
+            kernel_kwargs = {
+                name: kwargs[name]
+                for name in ("C", "temp", "pen_list", "tau", "optimizer_maxiter", "n_jobs",
+                             "support_list", "latent_transition")
+                if name in kwargs
+            }
+            prop0, B0, gamma0, A0, Z, graph_info = _graph_start(
+                X, Z, R, Rlevels, tuple(K_list), support_list,
+                epsilon=epsilon, n_init=20 if n_init is None else n_init,
+                warmup_it=10 if graph_warmup_it is None else graph_warmup_it,
+                rng=rng, kernel_kwargs=kernel_kwargs,
+            )
+            init = {"prop": prop0, "B_list": B0, "gamma": gamma0, "A_list": A0}
+        else:
+            init = normal_initialize_copula_dde(
+                X,
+                K_list,
+                Z=Z,
+                K1_max=K1_max,
+                B_list_oracle=B_list_oracle,
+                G_list_oracle=G_list_oracle,
+                random_state=random_state,
+                epsilon=epsilon,
+            )
         prop_in = init["prop"] if prop_in is None else prop_in
         gamma_in = init["gamma"] if gamma_in is None else gamma_in
         B_list_in = init["B_list"] if B_list_in is None else B_list_in
@@ -154,7 +275,6 @@ def fit_copula_dde(
         K_list=K_list,
     )
 
-    method = str(dimension_method).lower()
     common = dict(
         X=X,
         Z=Z,
@@ -181,7 +301,14 @@ def fit_copula_dde(
             "p": raw["p"],
             "A_sample_long": raw["A_sample_long"],
             "K_list": shape.K_list,
+            "latent_transition": raw["latent_transition"],
         }
+        if support_list is not None:
+            diagnostics["G_list"] = [
+                support.astype(int) for support in support_list if support is not None
+            ]
+            diagnostics["fixed_graph_layers"] = n_fixed
+            diagnostics["graph_start"] = graph_info
     elif method == "csp":
         required = ["C", "it", "t_spike", "temp", "tau"]
         missing = [name for name in required if name not in kwargs]

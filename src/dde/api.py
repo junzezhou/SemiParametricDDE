@@ -79,17 +79,18 @@ def fit(
     dimension_method:
         ``"fixed"`` for supplied widths, or ``"csp"`` for CSP-based width
         selection. If omitted, SemiDDE uses ``"fixed"`` and CopDDE uses
-        ``"csp"``.
+        ``"csp"`` (``"fixed"`` when ``G_list`` is given).
     max_iter:
         Common inner-kernel iteration limit. Legacy ``max_it`` (DDE),
         ``max_inner_iter`` (SemiDDE), and ``it`` (CopDDE) remain accepted.
     **kwargs:
-        Algorithm-specific keyword arguments.  ``G_list`` (DDE and SemiDDE,
-        ``dimension_method="fixed"``) fixes a user-specified graph: a list of
+        Algorithm-specific keyword arguments.  ``G_list`` (DDE, SemiDDE and
+        CopDDE, ``dimension_method="fixed"``) fixes a user-specified graph: a list of
         binary matrices, ``G_list[0]`` of shape ``J x K_1`` and
         ``G_list[d]`` of shape ``K_d x K_{d+1}``; a shorter list fixes the
         shallowest layers only.  The coefficients are then estimated on that
-        graph; see :func:`dde.algorithms.dde.fit_parametric_dde`.
+        graph; see :func:`dde.algorithms.dde.fit_parametric_dde` and
+        :func:`dde.algorithms.copula.fit_copula_dde`.
     """
     Y = np.asarray(Y)
     method_value = "auto" if method is None and model is None else (
@@ -152,7 +153,10 @@ def fit(
         from .algorithms.copula import fit_copula_dde
         from .algorithms.csp import maximal_identifiable_widths
 
-        method = "csp" if dimension_method is None else str(dimension_method).lower()
+        if dimension_method is None:
+            method = "fixed" if kwargs.get("G_list") is not None else "csp"
+        else:
+            method = str(dimension_method).lower()
         if method not in {"fixed", "csp"}:
             raise ValueError("CopDDE dimension_method must be 'fixed' or 'csp'.")
         if K_list is None and method == "csp":
