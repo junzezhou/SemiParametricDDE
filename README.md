@@ -289,6 +289,41 @@ Run `scripts/evaluate_poisson_csp_recovery.py` for checkpointed dimension
 recovery experiments. Its primary summary columns are the exact shrinkage
 recovery rate and the mean L1 distance between fitted and true width vectors.
 
+## Fixed (user-specified) graph
+
+When the graph is known, as for a Q-matrix in a cognitive assessment, pass it
+as `G_list` and only the coefficients on the graph are estimated (the
+confirmatory analysis of the paper's TIMSS application). `G_list[0]` is the
+`J x K_1` observed-layer graph and `G_list[d]` the `K_d x K_{d+1}` graph above
+it, binary with a nonempty column for every latent variable; the widths follow
+from the graphs:
+
+```python
+result = fit(
+    Y_log_times,
+    method="DDE",
+    family="Normal",
+    G_list=[Q, np.ones((7, 1))],
+)
+```
+
+The fixed layers are neither penalized nor thresholded (`tau` and `pen_list`
+may be omitted when every layer is fixed), and their coefficients outside the
+graph are exactly zero. The start is graph-anchored: each latent column is
+read off its children with the fewest parents, oriented so that the value one
+raises their means. With every layer fixed and no layer wider than 10, the
+default `graph_algorithm="auto"` runs an exact EM over each layer's `2**K_d`
+states, which reaches the maximum-likelihood estimate on the graph; it keeps
+the best of `n_init=10` starts (the graph-anchored one and random starts on
+the graph, drawn from `random_state`), because the likelihood can be
+multimodal on real data. Wider layers, or a `G_list` that fixes only the
+shallowest layers (`K_list` then gives the free widths, which keep the
+penalized estimation), use the fixed-width SAEM kernel with the graph held
+(`graph_algorithm="saem"`, which needs `C`). SemiDDE (`model="SemiDDE"`,
+fixed mode) accepts `G_list` with the SAEM path. The paper-format study is
+`scripts/evaluate_fixed_graph_paper.py` and the TIMSS replication
+`scripts/realdata_timss_fixed_graph.py`.
+
 ## Hyperparameter selection
 
 `select_hyperparameters` accepts the same `method`, `family`, `D`, and

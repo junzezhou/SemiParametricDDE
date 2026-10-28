@@ -36,6 +36,7 @@ from .parametric_families import (
     _matlab_debias,
     _normal_sample_statistics,
     _solve_bernoulli_tlp_batched,
+    _support_row_bounds,
     _tlp_penalty,
     _tlp_penalty_value_grad,
     _update_deep_normal_observed,
@@ -1285,12 +1286,28 @@ def _postprocess_and_measure_fixed_update(
     family,
     tau,
     depth,
+    support_list=None,
 ):
-    """Postprocess an M-step and return its parameter-normalised change."""
+    """Postprocess an M-step and return its parameter-normalised change.
+
+    Layers with a fixed graph (``support_list[d]`` not ``None``) are not
+    thresholded; their slopes outside the graph are set to zero.
+    """
     family = resolve_parametric_family(family)
-    B_processed = family.postprocess_fixed_coefficients(
-        B_updates, tau=tau, depth=depth
-    )
+    if support_list is None:
+        support_list = [None] * len(B_updates)
+    free = [d for d, support in enumerate(support_list) if support is None]
+    B_processed = list(B_updates)
+    if free:
+        thresholded = family.postprocess_fixed_coefficients(
+            [B_updates[d] for d in free], tau=tau, depth=depth
+        )
+        for d, B in zip(free, thresholded):
+            B_processed[d] = B
+    for d, support in enumerate(support_list):
+        if support is not None:
+            B_processed[d] = np.asarray(B_processed[d], dtype=float)
+            B_processed[d][:, 1:] *= support
     squared_error = (
         np.sum((np.asarray(prop) - np.asarray(prop_update)) ** 2)
         + sum(
@@ -1376,11 +1393,19 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                         pen_list, tau, A_list_in, C, tol,
                         max_iter=50, bound_val=10.0, verbose=True,
                         estep_row_chunk_size=2048, trace=None, *, family,
-                        sa_burn_in=0, observed_solver=None):
+                        sa_burn_in=0, observed_solver=None, support_list=None):
     """Run fixed-width SAEM with observed behavior supplied by ``family``.
 
     ``tol`` is compared with the root-mean-square parameter change after the
     family coefficient postprocessor has been applied.
+
+    ``support_list`` (length ``D``; entry ``d`` a ``rows x K_d`` boolean
+    graph or ``None``) fixes the graph of the given layers: their slopes
+    outside the graph are held at zero by the M-step bounds, and they are
+    neither penalized nor thresholded, so the M-step maximizes the
+    stochastic-approximation likelihood over the graph's coefficients (the
+    confirmatory EM of Lee and Gu's TIMSS analysis).  ``None`` entries keep
+    the TLP-penalized, thresholded update.
 
     ``sa_burn_in`` is the number of initial sweeps run with step size one
     (plain Monte Carlo EM: every accumulated objective is replaced by the
@@ -1405,6 +1430,27 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
     # their storage eightfold; floating-point design matrices are still formed
     # at the exact locations where the likelihood needs them.
     A_list = [np.array(A, dtype=np.uint8).copy() for A in A_list_in]
+    if support_list is None:
+        support_list = [None] * D
+    if len(support_list) != D:
+        raise ValueError("support_list must have one entry per latent layer.")
+    support_list = [
+        None if support is None else np.asarray(support, dtype=bool)
+        for support in support_list
+    ]
+    for d, support in enumerate(support_list):
+        if support is None:
+            continue
+        if support.shape != (B_list[d].shape[0], K[d]):
+            raise ValueError(
+                f"support_list[{d}] has shape {support.shape}; expected "
+                f"{(B_list[d].shape[0], K[d])}."
+            )
+        B_list[d][:, 1:] *= support
+    penalties = [
+        0.0 if support is not None else pen_list[d]
+        for d, support in enumerate(support_list)
+    ]
  
     # Only the deepest-layer running probabilities contribute to ``prop``.
     # Keeping the unused lower-layer arrays costs N * sum(K[:-1]) float64s.
@@ -1459,11 +1505,12 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
             f_acc_obs,
             iteration=t_sa,
             depth=D,
-            penalty=pen_list[0],
+            penalty=penalties[0],
             tau=tau,
             bound_val=bound_val,
             response_cache=response_cache,
             observed_solver=observed_solver,
+            support=support_list[0],
         )
         mstep_seconds = [time.perf_counter() - observed_mstep_started]
  
@@ -1476,19 +1523,26 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                 A_samples[d_idx - 1], A_samples[d_idx], t_sa
             )
             bounds = family.fixed_latent_bounds(K[d_idx] + 1, bound_val)
+            support = support_list[d_idx]
             if family.key in {"bernoulli", "poisson"}:
                 B_d_upd = _solve_bernoulli_tlp_batched(
                     f_acc_bern[bidx],
                     B_list[d_idx],
-                    pen_list[d_idx],
+                    penalties[d_idx],
                     tau,
                     bounds,
                     max_iter=10,
+                    support=support,
                 )
             else:
                 B_d_upd = np.zeros_like(B_list[d_idx])
+                row_bounds = (
+                    [bounds] * n_rows
+                    if support is None
+                    else _support_row_bounds(bounds, support)
+                )
                 for k in range(n_rows):
-                    _pen = pen_list[d_idx]
+                    _pen = penalties[d_idx]
 
                     def obj(x, __k=k, __pen=_pen):
                         value, grad = f_acc_bern[bidx].value_and_grad(__k, x)
@@ -1503,7 +1557,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                         B_list[d_idx][k, :],
                         method="L-BFGS-B",
                         jac=True,
-                        bounds=bounds,
+                        bounds=row_bounds[k],
                         options={"maxiter": 10},
                     )
                     B_d_upd[k, :] = res.x
@@ -1520,6 +1574,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
             family=family,
             tau=tau,
             depth=D,
+            support_list=support_list,
         )
 
         if trace is not None:
@@ -2187,6 +2242,7 @@ def get_SAEM_semiparametricv1(
     final_refit_max_iter=None,
     return_diagnostics=False,
     verbose=True,
+    support_list=None,
 ):
     """
     Semi-parametric SAEM for D-layer model.
@@ -2220,6 +2276,9 @@ def get_SAEM_semiparametricv1(
     ``schedule="nested", g_estimator="average", sa_burn_in=0`` reproduces
     the earlier package kernel.
 
+    ``support_list`` fixes the graphs of the shallowest layers in every
+    inner SAEM fit (see :func:`get_SAEM_parametric`).
+
     ``delta`` truncates the class CDFs of the averaged estimator (default
     ``{4 N^{1/4} sqrt(pi log N)}^{-1}`` as in the manuscript); the
     precision estimator does not use it.
@@ -2252,6 +2311,10 @@ def get_SAEM_semiparametricv1(
         raise ValueError("sa_burn_in must be a nonnegative integer.")
     if (B_list_true is None) != (G_list_true is None):
         raise ValueError("B_list_true and G_list_true must be supplied together.")
+    if support_list is None:
+        support_list = [None] * len(B_list_in)
+    if final_refit and any(support is not None for support in support_list):
+        raise ValueError("final_refit re-estimates the graph; it cannot be used with a fixed graph.")
 
     # MARK: Original default truncation took min(delta_N, 1e-12), which is
     # always 1e-12 and maps every class CDF outside the class's range to
@@ -2311,6 +2374,7 @@ def get_SAEM_semiparametricv1(
                 max_iter=max_inner_iter, verbose=False,
                 family=NORMAL_FAMILY,
                 sa_burn_in=sa_burn_in if outer_iter == 0 else 0,
+                support_list=[support_list[0]],
             )
             B_1, A_1 = B_1_list[0], A_1_list[0]
             itera += t
@@ -2350,6 +2414,7 @@ def get_SAEM_semiparametricv1(
                 G_list_true=G_list_true,
                 verbose=bool(verbose),
                 dispersion=gamma,
+                support_list=support_list,
             )
             itera += (
                 warm_start_diagnostics["stage1_iterations"]
@@ -2360,6 +2425,7 @@ def get_SAEM_semiparametricv1(
             pen_list, tau, A_list, C, tol,
             max_iter=max_inner_iter, verbose=verbose,
             family=NORMAL_FAMILY, sa_burn_in=sa_burn_in,
+            support_list=support_list,
         )
         itera += t_final
     else:
@@ -2375,6 +2441,7 @@ def get_SAEM_semiparametricv1(
                 max_iter=max_inner_iter, verbose=verbose,
                 family=NORMAL_FAMILY,
                 sa_burn_in=sa_burn_in if outer_iter == 0 else 0,
+                support_list=support_list,
             )
             itera += t
             inner_history.append(int(t))

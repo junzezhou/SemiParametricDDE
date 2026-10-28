@@ -11,7 +11,9 @@ from dde.utils import validate_K_list_identifiability, validate_dde_lists
 from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
+from .fixed_graph import graph_anchored_initialize, resolve_graph_list
 from .normal_init_semi import Normal_init_semi, rank_gaussianize_columns
+from .parametric_families import NORMAL_FAMILY
 from .semi_csp import get_SAEM_semiparametric_csp_copula
 from .semi_em import get_EM_est
 from .semi_saem import get_SAEM_normal, get_SAEM_semiparametricv1
@@ -20,8 +22,11 @@ from .semi_saem import get_SAEM_normal, get_SAEM_semiparametricv1
 _INIT_KEYS = ("X_in", "prop_in", "B_list_in", "gamma_in", "A_list_in")
 
 
-def _initialize_semidde(Y, K_list, kwargs, *, dimension_method):
+def _initialize_semidde(Y, K_list, kwargs, *, dimension_method, support_list=None):
     """Resolve supplied, data, or oracle initialization in one place."""
+    graph_fixed = support_list is not None and any(
+        support is not None for support in support_list
+    )
     supplied = [kwargs.get(name) for name in _INIT_KEYS]
     if any(value is not None for value in supplied) and not all(
         value is not None for value in supplied
@@ -75,6 +80,11 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method):
         )
     if mode not in {"data", "oracle"}:
         raise ValueError("initialize must be 'data' or 'oracle'.")
+    if graph_fixed and mode != "data":
+        raise ValueError(
+            "G_list labels the latent columns itself; use initialize='data' "
+            "(the graph-anchored initialization) or supply a full state."
+        )
 
     epsilon = float(kwargs.pop("epsilon", 1e-4))
     if dimension_method == "fixed":
@@ -118,6 +128,12 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method):
         if dimension_method == "fixed" and kwargs.get("final_refit", False):
             kwargs.setdefault("final_refit_B_list_true", B_list_true)
             kwargs.setdefault("final_refit_G_list_true", G_list_true)
+    elif graph_fixed:
+        kwargs.pop("init_binarize", None)
+        prop, B_list, gamma, A_list, _ = graph_anchored_initialize(
+            X_init, support_list, K_list, family=NORMAL_FAMILY, epsilon=epsilon
+        )
+        mode = "data_graph"
     else:
         if kwargs.get("final_refit", False):
             raise ValueError("final_refit=True requires initialize='oracle'.")
@@ -140,7 +156,18 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method):
     return mode
 
 
-def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization):
+def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization, support_list=None):
+    if support_list is not None and any(support is not None for support in support_list):
+        # Fixed layers are neither penalized nor thresholded; with every
+        # layer fixed, pen_list and tau are not used.
+        if all(support is not None for support in support_list):
+            kwargs.setdefault("pen_list", [0.0] * len(K_list))
+            if kwargs.get("tau") is None:
+                kwargs["tau"] = 1.0
+        # The graph-anchored start pins the layer-1 states (see the Normal
+        # DDE default in fit_parametric_dde).
+        kwargs.setdefault("sa_burn_in", 0)
+        kwargs["support_list"] = support_list
     required = [
         "X_in",
         "prop_in",
@@ -162,6 +189,9 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization):
     X, prop, B_list, gamma, A_list, iterations, kernel_diagnostics = (
         get_SAEM_semiparametricv1(Y=Y, return_diagnostics=True, **kwargs)
     )
+    fixed_layers = [
+        support is not None for support in (support_list or [None] * len(K_list))
+    ]
     return DDEResult(
         model="semi",
         K_list=[int(B.shape[1] - 1) for B in B_list],
@@ -177,6 +207,7 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization):
             "dimension_method": "fixed",
             "initialization": initialization,
             "pseudo_observation_update": "semiparametric_g",
+            "fixed_graph_layers": fixed_layers,
             **kernel_diagnostics,
         },
         raw=(X, prop, B_list, gamma, A_list, iterations),
@@ -301,9 +332,18 @@ def fit_semidde(
     D=None,
     K_list=None,
     dimension_method="fixed",
+    G_list=None,
     **kwargs: Any,
 ) -> DDEResult:
     """Fit fixed-width or CSP-selected SemiDDE.
+
+    ``G_list`` (fixed mode) fixes a user-specified graph of the shallowest
+    layers as in :func:`dde.algorithms.dde.fit_parametric_dde`: the fixed
+    layers are fitted on the graph without penalty or threshold in every
+    inner SAEM fit of the pseudo-observations, start from the
+    graph-anchored initialization, and run without the unit-step burn-in
+    (``sa_burn_in=0``) unless it is given.  ``pen_list`` and ``tau`` may be
+    omitted when every layer is fixed.
 
     Fixed mode uses the supplied ``K_list``.  CSP mode requires ``D``, rejects
     ``K_list``, and initializes the recursive maximum identifiable widths
@@ -319,12 +359,24 @@ def fit_semidde(
     if method not in {"fixed", "csp"}:
         raise ValueError("SemiDDE dimension_method must be 'fixed' or 'csp'.")
 
-    if method == "fixed":
-        if K_list is None:
-            raise ValueError("K_list is required when dimension_method='fixed'.")
-        K_tuple = validate_K_list_identifiability(
-            K_list, D=D, J=Y.shape[1]
+    support_list = None
+    if G_list is not None and method != "fixed":
+        raise ValueError(
+            "G_list fixes the graph and the widths; use dimension_method='fixed'."
         )
+    if method == "fixed":
+        if G_list is not None:
+            if D is None:
+                D = len(K_list) if K_list is not None else len(G_list)
+            K_tuple, support_list = resolve_graph_list(
+                G_list, D=int(D), J=Y.shape[1], K_list=K_list
+            )
+        else:
+            if K_list is None:
+                raise ValueError("K_list is required when dimension_method='fixed'.")
+            K_tuple = validate_K_list_identifiability(
+                K_list, D=D, J=Y.shape[1]
+            )
         if "t_spike" in kwargs or "temp" in kwargs:
             raise ValueError(
                 "t_spike and temp are only used by dimension_method='csp'."
@@ -341,11 +393,12 @@ def fit_semidde(
 
     fit_kwargs = dict(kwargs)
     initialization = _initialize_semidde(
-        Y, K_tuple, fit_kwargs, dimension_method=method
+        Y, K_tuple, fit_kwargs, dimension_method=method, support_list=support_list
     )
     if method == "fixed":
         return _fit_semidde_fixed(
-            Y, K_tuple, fit_kwargs, initialization=initialization
+            Y, K_tuple, fit_kwargs, initialization=initialization,
+            support_list=support_list,
         )
     return _fit_semidde_csp(
         Y, K_tuple, fit_kwargs, initialization=initialization

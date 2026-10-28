@@ -65,7 +65,8 @@ def fit(
     D:
         Number of stochastic binary latent layers. Required for parametric DDE
         fits and CSP fits that omit ``K_list``; fixed-width SemiDDE and
-        CopDDE can infer it from ``K_list``.
+        CopDDE can infer it from ``K_list``, and fits with a fixed graph from
+        ``K_list`` or ``G_list``.
     family:
         Parametric observed-data family. Required when ``method="DDE"``.
     K_list:
@@ -83,7 +84,12 @@ def fit(
         Common inner-kernel iteration limit. Legacy ``max_it`` (DDE),
         ``max_inner_iter`` (SemiDDE), and ``it`` (CopDDE) remain accepted.
     **kwargs:
-        Algorithm-specific keyword arguments.
+        Algorithm-specific keyword arguments.  ``G_list`` (DDE and SemiDDE,
+        ``dimension_method="fixed"``) fixes a user-specified graph: a list of
+        binary matrices, ``G_list[0]`` of shape ``J x K_1`` and
+        ``G_list[d]`` of shape ``K_d x K_{d+1}``; a shorter list fixes the
+        shallowest layers only.  The coefficients are then estimated on that
+        graph; see :func:`dde.algorithms.dde.fit_parametric_dde`.
     """
     Y = np.asarray(Y)
     method_value = "auto" if method is None and model is None else (
@@ -106,6 +112,9 @@ def fit(
         if target in kwargs and int(kwargs[target]) != limit:
             raise ValueError(f"max_iter conflicts with {target}.")
         kwargs[target] = limit
+
+    if D is None and kwargs.get("G_list") is not None:
+        D = len(K_list) if K_list is not None else len(kwargs["G_list"])
 
     if chosen == "dde":
         from .algorithms.dde import fit_parametric_dde

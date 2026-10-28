@@ -39,6 +39,25 @@ def _tlp_penalty_value_grad(x, pen, tau):
     return value, grad
 
 
+def _support_row_bounds(bounds, support):
+    """Per-row L-BFGS-B bounds that hold every slope outside ``support`` at zero.
+
+    ``bounds`` is the shared ``(intercept, slope_1, ..., slope_K)`` bound
+    list and ``support`` the ``rows x K`` boolean graph of one layer.  A
+    fixed variable (lower = upper = 0) stays at zero through the
+    optimization, so a user-specified graph is imposed without changing the
+    accumulated objectives.
+    """
+    bounds = list(bounds)
+    rows = []
+    for mask in np.asarray(support, dtype=bool):
+        row = list(bounds)
+        for k in np.flatnonzero(~mask):
+            row[k + 1] = (0.0, 0.0)
+        rows.append(row)
+    return rows
+
+
 def _solve_bernoulli_tlp_rowwise(
     accumulator,
     B_start,
@@ -47,10 +66,15 @@ def _solve_bernoulli_tlp_rowwise(
     bounds,
     *,
     max_iter=10,
+    support=None,
 ):
     """Reference implementation of the original per-response L-BFGS-B."""
     B_start = np.asarray(B_start, dtype=float)
     B_update = np.zeros_like(B_start)
+    if support is None:
+        row_bounds = [bounds] * B_start.shape[0]
+    else:
+        row_bounds = _support_row_bounds(bounds, support)
     for response_index in range(B_start.shape[0]):
 
         def objective(x, __index=response_index):
@@ -66,7 +90,7 @@ def _solve_bernoulli_tlp_rowwise(
             B_start[response_index],
             method="L-BFGS-B",
             jac=True,
-            bounds=bounds,
+            bounds=row_bounds[response_index],
             options={"maxiter": int(max_iter)},
         )
         B_update[response_index] = result.x
@@ -82,6 +106,7 @@ def _solve_bernoulli_tlp_batched(
     *,
     max_iter=10,
     row_chunk_size=2048,
+    support=None,
 ):
     """Joint L-BFGS-B evaluation of separable Bernoulli TLP objectives.
 
@@ -89,7 +114,8 @@ def _solve_bernoulli_tlp_batched(
     and iteration cap as ``_solve_bernoulli_tlp_rowwise``.  Combining the
     independent response objectives allows their logits and gradients to be
     evaluated by chunked matrix multiplications and removes one optimizer
-    invocation per response.
+    invocation per response.  ``support`` (a ``rows x K`` boolean graph)
+    holds the slopes outside the graph at zero.
     """
     B_start = np.asarray(B_start, dtype=float)
     if B_start.ndim != 2:
@@ -112,12 +138,18 @@ def _solve_bernoulli_tlp_batched(
         gradient[:, 1:] += penalty_gradient
         return value + penalty_value, gradient.ravel()
 
+    if support is None:
+        flat_bounds = bounds * B_start.shape[0]
+    else:
+        flat_bounds = [
+            bound for row in _support_row_bounds(bounds, support) for bound in row
+        ]
     result = minimize(
         objective,
         B_start.ravel(),
         method="L-BFGS-B",
         jac=True,
-        bounds=bounds * B_start.shape[0],
+        bounds=flat_bounds,
         options={"maxiter": int(max_iter)},
     )
     return result.x.reshape(shape)
@@ -131,10 +163,19 @@ def _solve_poisson_tlp_rowwise(
     bounds,
     *,
     max_iter=10,
+    support=None,
 ):
-    """Fit independent Poisson responses with the MATLAB TLP objective."""
+    """Fit independent Poisson responses with the MATLAB TLP objective.
+
+    ``support`` (a ``rows x K`` boolean graph) holds the slopes outside the
+    graph at zero.
+    """
     B_start = np.asarray(B_start, dtype=float)
     B_update = np.zeros_like(B_start)
+    if support is None:
+        row_bounds = [bounds] * B_start.shape[0]
+    else:
+        row_bounds = _support_row_bounds(bounds, support)
     for response_index in range(B_start.shape[0]):
 
         def objective(x, __index=response_index):
@@ -150,7 +191,7 @@ def _solve_poisson_tlp_rowwise(
             B_start[response_index],
             method="L-BFGS-B",
             jac=True,
-            bounds=bounds,
+            bounds=row_bounds[response_index],
             options={"maxiter": int(max_iter)},
         )
         B_update[response_index] = result.x
@@ -508,15 +549,46 @@ def _normal_sample_statistics(X, A_samples):
     return Q, q_all
 
 
-def _update_deep_normal_observed(X, Q, q_all, tau, *, x_sq_sum=None):
-    """MATLAB D>=3 closed-form observed-layer update and variances."""
+def _solve_normal_on_support(Q, q_all, support):
+    """Least-squares Normal coefficients restricted to each row's graph.
+
+    Row ``j`` solves ``Q[S, S] b_S = q_j[S]`` over the intercept and the
+    latent columns ``S`` of ``support[j]``; the remaining slopes are zero.
+    Rows sharing a parent set share one factorization.
+    """
+    support = np.asarray(support, dtype=bool)
+    J, K = support.shape
+    B_update = np.zeros((J, K + 1), dtype=float)
+    patterns, inverse = np.unique(support, axis=0, return_inverse=True)
+    for pattern_index, pattern in enumerate(patterns):
+        rows = np.flatnonzero(inverse.reshape(-1) == pattern_index)
+        columns = np.concatenate(([0], 1 + np.flatnonzero(pattern)))
+        Q_sub = Q[np.ix_(columns, columns)]
+        rhs = q_all[np.ix_(rows, columns)].T
+        try:
+            solution = np.linalg.solve(Q_sub, rhs)
+        except np.linalg.LinAlgError:
+            solution = np.linalg.lstsq(Q_sub, rhs, rcond=1e-10)[0]
+        B_update[np.ix_(rows, columns)] = solution.T
+    return B_update
+
+
+def _update_deep_normal_observed(X, Q, q_all, tau, *, x_sq_sum=None, support=None):
+    """MATLAB D>=3 closed-form observed-layer update and variances.
+
+    With ``support`` the least-squares solve is restricted to each row's
+    graph and the coefficients are not thresholded.
+    """
     X = np.asarray(X, dtype=float)
-    try:
-        coefficients_t = np.linalg.solve(Q, q_all.T)
-    except np.linalg.LinAlgError:
-        coefficients_t = np.linalg.lstsq(Q, q_all.T, rcond=1e-10)[0]
-    B_update = coefficients_t.T
-    B_update[:, 1:] = thres(B_update[:, 1:], tau)
+    if support is not None:
+        B_update = _solve_normal_on_support(Q, q_all, support)
+    else:
+        try:
+            coefficients_t = np.linalg.solve(Q, q_all.T)
+        except np.linalg.LinAlgError:
+            coefficients_t = np.linalg.lstsq(Q, q_all.T, rcond=1e-10)[0]
+        B_update = coefficients_t.T
+        B_update[:, 1:] = thres(B_update[:, 1:], tau)
 
     quadratic = np.einsum("jp,pq,jq->j", B_update, Q, B_update, optimize=True)
     cross = np.einsum("jp,jp->j", B_update, q_all, optimize=True)
@@ -907,12 +979,28 @@ class NormalFamilyAdapter:
         bound_val,
         response_cache,
         observed_solver=None,
+        support=None,
     ):
-        """Perform the existing fixed-width Normal observed-layer update."""
+        """Perform the existing fixed-width Normal observed-layer update.
+
+        With a fixed graph (``support``) every depth solves the
+        stochastic-approximation objective exactly: least squares on the
+        averaged statistics, restricted to each row's parents, without
+        penalty or threshold.
+        """
         N, J = X.shape
         K1 = B_start.shape[1] - 1
         C = A_samples.shape[2]
         Q_current, q_current = accumulator.update(X, A_samples, iteration)
+        if support is not None:
+            return _update_deep_normal_observed(
+                X,
+                accumulator.Q,
+                accumulator.q_all,
+                tau,
+                x_sq_sum=response_cache,
+                support=support,
+            )
         if depth >= 3:
             return _update_deep_normal_observed(
                 X,
@@ -1175,10 +1263,21 @@ class PoissonFamilyAdapter:
         bound_val,
         response_cache,
         observed_solver=None,
+        support=None,
     ):
         del dispersion, depth, response_cache
         accumulator.update(X, A_samples, iteration)
         bounds = self.fixed_latent_bounds(B_start.shape[1], bound_val)
+        if support is not None:
+            # A fixed graph has no support search; the row-wise solver
+            # holds the slopes outside it at zero.
+            return (
+                _solve_poisson_tlp_rowwise(
+                    accumulator, B_start, penalty, tau, bounds,
+                    max_iter=10, support=support,
+                ),
+                None,
+            )
         solver = str(observed_solver or "rowwise").strip().lower()
         if solver == "hybrid":
             # dense row-wise steps while the step size is one (burn-in,
@@ -1425,6 +1524,7 @@ class BernoulliFamilyAdapter:
         bound_val,
         response_cache,
         observed_solver=None,
+        support=None,
     ):
         del dispersion, depth, response_cache
         accumulator.update(X, A_samples, iteration)
@@ -1437,6 +1537,7 @@ class BernoulliFamilyAdapter:
                 tau,
                 bounds,
                 max_iter=10,
+                support=support,
             ),
             None,
         )

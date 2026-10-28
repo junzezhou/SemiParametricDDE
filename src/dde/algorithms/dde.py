@@ -12,6 +12,12 @@ from dde.utils import validate_K_list_identifiability, validate_dde_lists
 from dde.utils.result_compression import compress_csp_result_components
 
 from .csp import maximal_identifiable_widths
+from .fixed_graph import (
+    EXACT_EM_MAX_WIDTH,
+    fit_fixed_graph_em_multistart,
+    graph_anchored_initialize,
+    resolve_graph_list,
+)
 from .normal_csp import fit_parametric_csp_copula
 from .normal_init_cop import Normal_init_cop
 from .parametric_families import (
@@ -87,6 +93,7 @@ def _layerwise_warm_start(
     verbose,
     observed_solver=None,
     dispersion=None,
+    support_list=None,
 ):
     """Layer-wise warm start for fixed-width fits.
 
@@ -107,9 +114,13 @@ def _layerwise_warm_start(
     each deeper layer is identified from the layer below), so each stage
     solves an identified sub-problem from its own initialization instead of
     letting the deep layers drift while the observed layer is still far from
-    its optimum.
+    its optimum.  With a fixed graph (``support_list``) stage 1 holds the
+    observed-layer graph and stage 2 passes the deeper graphs on as its
+    ``G_list``.
     """
     D = len(B_list)
+    if support_list is None:
+        support_list = [None] * D
     A1 = np.asarray(A_list[0], dtype=float)
     prop_stage1 = np.clip(np.mean(A1, axis=0), 1e-3, 1.0 - 1e-3)
     prop_stage1, B_stage1, dispersion, A_stage1, iterations_stage1 = get_SAEM_parametric(
@@ -129,6 +140,7 @@ def _layerwise_warm_start(
         family=family_adapter,
         sa_burn_in=sa_burn_in,
         observed_solver=observed_solver,
+        support_list=[support_list[0]],
     )
     A1 = np.asarray(A_stage1[0], dtype=float)
     deep_widths = [int(np.asarray(B).shape[1] - 1) for B in B_list[1:]]
@@ -150,6 +162,8 @@ def _layerwise_warm_start(
         estep_row_chunk_size=estep_row_chunk_size,
         verbose=False,
     )
+    if any(support is not None for support in support_list[1:]):
+        deep_kwargs["G_list"] = list(support_list[1:])
     if oracle:
         deep_kwargs.update(
             initialize="oracle",
@@ -185,8 +199,11 @@ def fit_parametric_dde(
     pen_list=None,
     t_spike=None,
     temp=None,
-    tau: float,
-    C: int,
+    tau=None,
+    C=None,
+    G_list=None,
+    graph_algorithm=None,
+    n_init=None,
     tol=None,
     max_it=None,
     initialize: str = "data",
@@ -352,6 +369,41 @@ def fit_parametric_dde(
     0.07 at N=16000), so they are kept for wide layers where the dense
     solve is too slow.
 
+    ``G_list`` fixes a user-specified graph (fixed-width fits only):
+    ``G_list[0]`` is the ``J x K_1`` observed-layer graph and ``G_list[d]``
+    the ``K_d x K_{d+1}`` graph of layer ``d + 1``, binary with a nonempty
+    column for every latent variable.  A shorter list (or trailing ``None``
+    entries) fixes only the shallowest layers; the deeper graphs are still
+    estimated, and ``K_list`` gives their widths (the fixed widths follow
+    from the graphs).  The fixed layers are fitted without penalty or
+    threshold, their coefficients outside the graph held at exactly zero
+    (the confirmatory EM of the paper's TIMSS analysis), so ``tau`` and the
+    ``pen_list`` entries of fixed layers are not used; ``tau`` and
+    ``pen_list`` may be omitted when every layer is fixed.  The data
+    initialization is then graph-anchored (see
+    :mod:`dde.algorithms.fixed_graph`): each latent column is read off its
+    children with the fewest parents, oriented so that the value one raises
+    their means, which fixes the column labels to the graph's.  The
+    layer-wise warm start passes the graphs to its stages.
+    ``graph_algorithm`` chooses the estimator: ``"em"`` is the exact EM of
+    :func:`dde.algorithms.fixed_graph.fit_fixed_graph_em` (every layer
+    fixed; it enumerates the ``2**K_d`` states of each layer and reaches
+    the maximum-likelihood estimate on the graph without Monte Carlo
+    error), ``"saem"`` the fixed-width SAEM kernel above (any width, and
+    the only choice when deeper graphs are estimated), and the default
+    ``"auto"`` takes ``"em"`` when every layer is fixed and no layer is
+    wider than ``EXACT_EM_MAX_WIDTH`` (10).  For ``"em"`` ``C`` is not
+    used, ``max_it`` defaults to 500 M-steps and ``tol`` (default
+    ``1e-6``) bounds the log-likelihood gain per observation.  The EM
+    likelihood on a fixed graph can be multimodal on real data (TIMSS
+    response times, ``K_list=[7, 1]``: 20 random starts reach 9 local
+    optima spanning 140 log-likelihood units, and the graph-anchored start
+    is not the best), so ``"em"`` runs ``n_init`` starts (default 10): the
+    graph-anchored start (or the supplied state) and random starts on the
+    graph (:func:`dde.algorithms.fixed_graph.random_graph_start`, drawn
+    from ``random_state`` or else from the global NumPy generator), and
+    keeps the largest log-likelihood.
+
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
     scale on which the CopDDE latent Gaussian layer lives and on which the
@@ -384,16 +436,30 @@ def fit_parametric_dde(
             f"{family_adapter.name} DDE currently supports "
             f"dimension_method={supported} only."
         )
+    support_list = [None] * D
     if method == "fixed":
-        if K_list is None:
-            raise ValueError("K_list is required when dimension_method='fixed'.")
         if t_spike is not None or temp is not None:
             raise ValueError(
                 "t_spike and temp are only used by dimension_method='csp'."
             )
-        K_tuple = validate_K_list_identifiability(K_list, D=D, J=X.shape[1])
-        penalties = _validate_pen_list(pen_list, D)
+        if G_list is not None:
+            K_tuple, support_list = resolve_graph_list(
+                G_list, D=D, J=X.shape[1], K_list=K_list
+            )
+        else:
+            if K_list is None:
+                raise ValueError("K_list is required when dimension_method='fixed'.")
+            K_tuple = validate_K_list_identifiability(K_list, D=D, J=X.shape[1])
+        all_fixed = all(support is not None for support in support_list)
+        if pen_list is None and all_fixed:
+            penalties = [0.0] * D
+        else:
+            penalties = _validate_pen_list(pen_list, D)
     elif method == "csp":
+        if G_list is not None:
+            raise ValueError(
+                "G_list fixes the graph and the widths; use dimension_method='fixed'."
+            )
         if K_list is not None:
             raise ValueError(
                 "K_list must be omitted when dimension_method='csp'; maximal "
@@ -409,6 +475,34 @@ def fit_parametric_dde(
         K_tuple = maximal_identifiable_widths(X.shape[1], D)
         penalties = None
 
+    if graph_algorithm is None:
+        graph_algorithm = "auto"
+    graph_algorithm = str(graph_algorithm).strip().lower()
+    if graph_algorithm not in {"auto", "em", "saem"}:
+        raise ValueError("graph_algorithm must be 'auto', 'em' or 'saem'.")
+    every_layer_fixed = all(support is not None for support in support_list)
+    if graph_algorithm == "auto":
+        graph_algorithm = (
+            "em"
+            if every_layer_fixed and max(K_tuple) <= EXACT_EM_MAX_WIDTH
+            else "saem"
+        )
+    if graph_algorithm == "em" and not every_layer_fixed:
+        raise ValueError(
+            "graph_algorithm='em' needs G_list to fix every layer; partially fixed "
+            "graphs use 'saem'."
+        )
+    if graph_algorithm == "em" and max(K_tuple) > 16:
+        raise ValueError(
+            "graph_algorithm='em' enumerates 2**K_d states per layer; widths above 16 "
+            "need graph_algorithm='saem'."
+        )
+    exact_em = graph_algorithm == "em"
+    if n_init is not None and not exact_em:
+        raise ValueError("n_init applies to the exact EM on a fixed graph only.")
+    n_init_value = 10 if n_init is None else int(n_init)
+    if n_init_value < 1:
+        raise ValueError("n_init must be a positive integer.")
     # The copula-backend Bernoulli/Poisson CSP (the default CSP backend of
     # those families) runs its full iteration budget: column pruning pauses
     # for 15-25 iterations while the relative coefficient change is already
@@ -420,9 +514,24 @@ def fit_parametric_dde(
         and (csp_backend is None or str(csp_backend).strip().lower() == "copula")
     )
     if max_it is None:
-        max_it = _DISCRETE_COPULA_CSP_MAX_IT if discrete_copula_csp else 50
+        if exact_em:
+            max_it = 500
+        else:
+            max_it = _DISCRETE_COPULA_CSP_MAX_IT if discrete_copula_csp else 50
     if tol is None:
-        tol = 0.0 if discrete_copula_csp else DEFAULT_PARAMETRIC_CONVERGENCE_TOL
+        if exact_em:
+            tol = 1e-6
+        else:
+            tol = 0.0 if discrete_copula_csp else DEFAULT_PARAMETRIC_CONVERGENCE_TOL
+    graph_fixed = any(support is not None for support in support_list)
+    if tau is None:
+        if not all(support is not None for support in support_list):
+            raise ValueError("tau is required unless G_list fixes every layer.")
+        # Unused: fixed layers are neither penalized nor thresholded.
+        tau = 1.0
+        tau_used = None
+    else:
+        tau_used = float(tau)
     tau = float(tau)
     tol = float(tol)
     epsilon = float(epsilon)
@@ -435,10 +544,14 @@ def fit_parametric_dde(
         raise ValueError("epsilon must lie strictly between 0 and 0.5.")
     if not np.isfinite(bound_val) or bound_val <= 0:
         raise ValueError("bound_val must be finite and positive.")
-    C = int(C)
+    if C is None:
+        if not exact_em:
+            raise ValueError("C (Monte Carlo draws per sweep) is required.")
+    else:
+        C = int(C)
+        if C < 1:
+            raise ValueError("C must be a positive integer.")
     max_it = int(max_it)
-    if C < 1:
-        raise ValueError("C must be a positive integer.")
     if max_it < 1:
         raise ValueError("max_it must be a positive integer.")
 
@@ -446,7 +559,14 @@ def fit_parametric_dde(
     is_bernoulli = family_adapter.key == "bernoulli"
     is_normal = family_adapter.key == "normal"
     if sa_burn_in is None:
-        sa_burn_in = 10 if method == "fixed" else 0
+        # A graph-anchored Normal start already pins the layer-1 states; the
+        # unit-step sweeps then only fit single draws, which separate the
+        # rare-child rows of layer 2 (fixed-graph SAEM, (54, 18, 6) B_s
+        # design, N = 500: RMSE 0.33 with 10 sweeps, 0.20 without).
+        if method != "fixed" or (is_normal and graph_fixed):
+            sa_burn_in = 0
+        else:
+            sa_burn_in = 10
     sa_burn_in = int(sa_burn_in)
     if sa_burn_in < 0:
         raise ValueError("sa_burn_in must be a nonnegative integer.")
@@ -591,12 +711,27 @@ def fit_parametric_dde(
             )
     else:
         initialization = str(initialize).lower()
+        if graph_fixed and initialization != "data":
+            raise ValueError(
+                "G_list labels the latent columns itself; use initialize='data' "
+                "(the graph-anchored initialization) or supply a full state."
+            )
         if initialization == "data":
             if B_list_true is not None or G_list_true is not None:
                 raise ValueError(
                     "B_list_true and G_list_true are only used with initialize='oracle'."
                 )
-            if method == "csp" and csp_initializer == "copula":
+            if graph_fixed:
+                prop, B_list, gamma, A_list, graph_init = graph_anchored_initialize(
+                    X,
+                    support_list,
+                    K_tuple,
+                    family=family_adapter,
+                    epsilon=epsilon,
+                    bound_val=bound_val,
+                )
+                initialization = "data_graph"
+            elif method == "csp" and csp_initializer == "copula":
                 prop, B_list, gamma, A_list = Normal_init_cop(
                     X, K_tuple, epsilon=epsilon
                 )
@@ -629,9 +764,67 @@ def fit_parametric_dde(
             raise ValueError("initialize must be 'data' or 'oracle'.")
 
     if method == "fixed":
-        if random_state is not None:
+        if random_state is not None and not exact_em:
             raise ValueError(
-                "random_state is currently supported by the CSP path only."
+                "random_state is supported by the CSP path and the exact EM on a "
+                "fixed graph only."
+            )
+        if exact_em:
+            if random_state is None:
+                # Tie the random starts to the global generator, like the
+                # fixed kernels' draws.
+                start_rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+            else:
+                start_rng = np.random.default_rng(random_state)
+            prop, B_list, gamma, A_list, iterations, em_diagnostics = (
+                fit_fixed_graph_em_multistart(
+                    X,
+                    prop,
+                    B_list,
+                    gamma,
+                    support_list,
+                    family=family_adapter,
+                    n_init=n_init_value,
+                    rng=start_rng,
+                    max_iter=max_it,
+                    tol=tol,
+                    bound_val=bound_val,
+                    row_chunk_size=estep_row_chunk_size,
+                    verbose=bool(verbose),
+                )
+            )
+            diagnostics = {
+                "iterations": iterations,
+                "D": D,
+                "K_list": list(K_tuple),
+                "family": family_adapter.name,
+                "dimension_method": "fixed",
+                "initialization": initialization,
+                "graph_algorithm": "em",
+                "convergence_metric": "loglik_gain_per_observation",
+                "convergence_tol": tol,
+                "converged": em_diagnostics["converged"],
+                "loglik": em_diagnostics["loglik"],
+                "n_init": n_init_value,
+                "start_logliks": em_diagnostics["start_logliks"],
+                "best_start": em_diagnostics["best_start"],
+                "loglik_history": em_diagnostics["loglik_history"],
+                "posterior_marginals": em_diagnostics["posterior_marginals"],
+                "fixed_graph_layers": [True] * D,
+                "G_list": [support.astype(np.uint8) for support in support_list],
+            }
+            if initialization == "data_graph":
+                diagnostics["graph_init_anchors"] = graph_init["anchors"]
+            return DDEResult(
+                model="DDE",
+                K_list=list(K_tuple),
+                prop=prop,
+                B_list=B_list,
+                gamma=gamma,
+                A_list=A_list,
+                transformed=X.copy(),
+                diagnostics=diagnostics,
+                raw=(X.copy(), prop, B_list, gamma, A_list, iterations),
             )
         fixed_trace = [] if keep_trace else None
         warm_start_diagnostics = None
@@ -657,6 +850,7 @@ def fit_parametric_dde(
                 verbose=bool(verbose),
                 observed_solver=fixed_observed_solver,
                 dispersion=gamma,
+                support_list=support_list,
             )
         prop, B_list, gamma, A_list, iterations = get_SAEM_parametric(
             X,
@@ -676,6 +870,7 @@ def fit_parametric_dde(
             family=family_adapter,
             sa_burn_in=sa_burn_in,
             observed_solver=fixed_observed_solver,
+            support_list=support_list,
         )
 
         X_result = X.copy()
@@ -698,7 +893,17 @@ def fit_parametric_dde(
             "fixed_observed_solver": (
                 (fixed_observed_solver or "rowwise") if is_poisson else "family"
             ),
+            "tau": tau_used,
+            "fixed_graph_layers": [support is not None for support in support_list],
         }
+        if graph_fixed:
+            diagnostics["graph_algorithm"] = "saem"
+            diagnostics["G_list"] = [
+                None if support is None else support.astype(np.uint8)
+                for support in support_list
+            ]
+            if initialization == "data_graph":
+                diagnostics["graph_init_anchors"] = graph_init["anchors"]
         if warm_start_diagnostics is not None:
             diagnostics["warm_start"] = warm_start_diagnostics
         if fixed_trace is not None:
