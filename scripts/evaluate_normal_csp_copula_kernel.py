@@ -9,7 +9,11 @@ are the latent ``Z`` of the copula design without any marginal transform.
 For every scenario, sample size, replicate, and backend the script fits the
 model once from a data initialization and records the fitted active widths.
 The headline summary is the mean fitted width per layer, which is the
-quantity the CopDDE paper tabulates for its CSP path.
+quantity the CopDDE paper tabulates for its CSP path.  Each fit also records
+the aligned per-layer graph structure (``layer_graph_accuracy``,
+``layer_sensitivity``, ``layer_specificity``, ``layer_matched_columns``; see
+``dde.utils.layer_structure_recovery_metrics``), with the support of every
+layer thresholded at the fit's ``tau``.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from dde import fit  # noqa: E402
 from dde.algorithms.dde import _destandardize_observed_layer  # noqa: E402
 from dde.algorithms.normal_init_cop import Normal_init_cop  # noqa: E402
 from dde.algorithms.normal_init_semi import Normal_init_semi  # noqa: E402
+from dde.utils import layer_structure_recovery_metrics  # noqa: E402
 
 
 SCENARIOS = {
@@ -40,6 +45,10 @@ SCENARIOS = {
     "d3_j108": base._scenario_d3,
 }
 BACKEND_DEFAULT_OPTIMIZER_MAXITER = {"copula": 15}
+STRUCTURE_FIELDS = (
+    "layer_graph_accuracy", "layer_sensitivity", "layer_specificity",
+    "layer_matched_columns", "layer_graph_counts", "layer_column_pairs",
+)
 
 
 def _parse_args():
@@ -375,6 +384,14 @@ def _run_one(task):
         record[f"A{d + 1}_matched_truth"] = matched
         record[f"A{d + 1}_weak_columns"] = weak
         record[f"A{d + 1}_truth_corr"] = _truth_corr(result.A_list[d], A_true[d])
+    structure = layer_structure_recovery_metrics(
+        result.B_list, scenario["B_true"], result.A_list, A_true,
+        threshold=_tau_for(N, settings),
+    )
+    record["support_threshold"] = float(_tau_for(N, settings))
+    record["structure_alignment"] = structure["alignment"]
+    for key in STRUCTURE_FIELDS:
+        record[key] = json.dumps(structure[key])
     record["merge_count"] = len(result.diagnostics.get("merge_events") or [])
     top_reinit = result.diagnostics.get("top_reinit")
     if top_reinit is not None:
@@ -451,21 +468,25 @@ def _summarize(records, out_dir):
             row[f"A{d + 1}_accuracy_mean"] = (
                 float(np.nanmean([r[f"A{d + 1}_final_accuracy"] for r in ok])) if ok else np.nan
             )
-            layer_rows.append(
-                {
-                    "scenario": scenario,
-                    "backend": backend,
-                    "N": N,
-                    "layer": d + 1,
-                    "K_true": K_true[d],
-                    "mean_K_fit": mean_widths[-1],
-                    "sd_K_fit": row[f"K{d + 1}_sd"],
-                    "mean_bias": mean_widths[-1] - K_true[d] if ok else np.nan,
-                    "exact_rate": float(np.mean(values == K_true[d])) if ok else np.nan,
-                    "under_rate": float(np.mean(values < K_true[d])) if ok else np.nan,
-                    "over_rate": float(np.mean(values > K_true[d])) if ok else np.nan,
-                }
-            )
+            layer_row = {
+                "scenario": scenario,
+                "backend": backend,
+                "N": N,
+                "layer": d + 1,
+                "K_true": K_true[d],
+                "mean_K_fit": mean_widths[-1],
+                "sd_K_fit": row[f"K{d + 1}_sd"],
+                "mean_bias": mean_widths[-1] - K_true[d] if ok else np.nan,
+                "exact_rate": float(np.mean(values == K_true[d])) if ok else np.nan,
+                "under_rate": float(np.mean(values < K_true[d])) if ok else np.nan,
+                "over_rate": float(np.mean(values > K_true[d])) if ok else np.nan,
+            }
+            for key in STRUCTURE_FIELDS[:4]:
+                scored = [json.loads(r[key])[d] for r in ok if r.get(key)]
+                layer_row[f"{key.removeprefix('layer_')}_mean"] = (
+                    float(np.nanmean(scored)) if scored else np.nan
+                )
+            layer_rows.append(layer_row)
         row["mean_widths"] = json.dumps([round(v, 2) for v in mean_widths])
         summary_rows.append(row)
 

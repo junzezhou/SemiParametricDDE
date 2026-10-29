@@ -9,8 +9,12 @@ identifiable CSP initialization genuinely wider than the true hierarchy:
 * D=4: true (54, 18, 6, 2), maximum (64, 21, 7, 2), J=192.
 
 The primary outputs are the exact dimension-shrinkage recovery rate and the
-mean L1 distance between fitted and true width vectors. Fits are checkpointed
-after completion, and rerunning the command resumes unfinished cells.
+mean L1 distance between fitted and true width vectors. Each fit also records
+the aligned per-layer graph structure (``layer_graph_accuracy``,
+``layer_sensitivity``, ``layer_specificity``, ``layer_matched_columns``; see
+``dde.utils.layer_structure_recovery_metrics``) with the support thresholded
+at ``tau``. Fits are checkpointed after completion, and rerunning the command
+resumes unfinished cells.
 
 Fits use the Poisson CSP defaults of ``fit`` (the copula kernel: sequential
 mean-field transition, sqrt(N) penalty in every layer, every layer
@@ -42,9 +46,14 @@ from threadpoolctl import threadpool_limits
 
 from dde import fit
 from dde.algorithms.csp import maximal_identifiable_widths
+from dde.utils import layer_structure_recovery_metrics
 
 
 SAMPLE_SIZES = (500, 1000, 2000, 4000, 8000)
+STRUCTURE_FIELDS = (
+    "layer_graph_accuracy", "layer_sensitivity", "layer_specificity",
+    "layer_matched_columns", "layer_graph_counts", "layer_column_pairs",
+)
 SCENARIO_SPECS = {
     "d2": {
         "name": "D2_MATLAB_sparse_overspecified_J27",
@@ -214,7 +223,7 @@ def dimension_recovery_metrics(fitted, truth) -> dict:
     return metrics
 
 
-def _poisson_fit_metrics(result, X, A_true, scenario):
+def _poisson_fit_metrics(result, X, A_true, scenario, threshold):
     fitted = tuple(int(value) for value in result.K_list)
     dimension = dimension_recovery_metrics(fitted, scenario["K_true"])
     B1 = np.asarray(result.B_list[0], dtype=float)
@@ -224,6 +233,10 @@ def _poisson_fit_metrics(result, X, A_true, scenario):
     oracle_eta = oracle_B1[:, 0][None, :] + A_true[0] @ oracle_B1[:, 1:].T
     oracle_nll = float(
         np.mean(np.exp(oracle_eta) - X * oracle_eta + gammaln(X + 1.0))
+    )
+    structure = layer_structure_recovery_metrics(
+        result.B_list, scenario["B_true"], result.A_list, A_true,
+        threshold=threshold,
     )
     return {
         "K_fit": json.dumps(fitted),
@@ -242,6 +255,16 @@ def _poisson_fit_metrics(result, X, A_true, scenario):
         ),
         "conditional_nll": conditional_nll,
         "oracle_conditional_nll": oracle_nll,
+        "support_threshold": float(threshold),
+        "structure_alignment": structure["alignment"],
+        **{key: json.dumps(structure[key]) for key in STRUCTURE_FIELDS},
+        # Mean agreement of the aligned latent columns (as in the Bernoulli driver).
+        "layer_latent_accuracy": json.dumps(
+            [
+                float(np.mean(scores)) if scores else float("nan")
+                for scores in structure["layer_pair_similarity"]
+            ]
+        ),
     }
 
 
@@ -310,7 +333,9 @@ def run_one(task):
                 **overrides,
                 **initialization_arguments,
             )
-        metrics = _poisson_fit_metrics(result, X, A_true, scenario)
+        metrics = _poisson_fit_metrics(
+            result, X, A_true, scenario, settings["tau"]
+        )
         finite = bool(
             np.all(np.isfinite(result.prop))
             and all(np.all(np.isfinite(B)) for B in result.B_list)
@@ -422,6 +447,15 @@ def summarize(rows):
             summary[-1][f"layer_{layer}_exact_rate"] = _mean(
                 successful, f"layer_{layer}_exact"
             )
+            for field in ("layer_latent_accuracy",) + STRUCTURE_FIELDS[:4]:
+                scored = [
+                    json.loads(row[field])[layer - 1]
+                    for row in successful
+                    if row.get(field, "") != ""
+                ]
+                summary[-1][
+                    f"layer_{layer}_{field.removeprefix('layer_')}_mean"
+                ] = float(np.nanmean(scored)) if scored else float("nan")
     return summary
 
 
