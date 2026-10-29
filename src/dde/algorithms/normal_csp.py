@@ -52,7 +52,7 @@ import itertools
 import numpy as np
 from scipy.special import expit, logsumexp
 
-from .csp import _canonicalize_csp_layer_order, csp_active_mask, update_csp_layer
+from .csp import csp_active_mask, update_csp_layer
 from .csp_solvers import _solve_logistic_weighted_l1, _solve_poisson_weighted_l1
 from .get_SAEM_RL_CSP_D import (
     _make_bounds,
@@ -351,7 +351,7 @@ def fit_parametric_csp_copula(
     merge_cosine: float = 0.0,
     merge_after: int = 10,
     merge_layers: str = "top",
-    shrinkage_burn: int = 0,
+    shrinkage_burn=0,
     reorder_after_shrinkage_burn: bool = True,
     top_prune: str = "none",
     top_prune_after: int = 10,
@@ -483,10 +483,14 @@ def fit_parametric_csp_copula(
         latent states and coefficients can settle before any column can
         fall into the spike; the CUSP updates start at iteration
         ``shrinkage_burn + 1``.  Zero (the CopDDE behaviour) starts the
-        CUSP updates at iteration 1.
+        CUSP updates at iteration 1.  A length-``D`` sequence gives each
+        layer its own burn-in (layer ``d`` is held in the slab, unthresholded,
+        for ``shrinkage_burn[d]`` iterations); the deletion test of the
+        deepest layer follows that layer's burn-in, and the convergence
+        check and the observed-layer update wait for the longest one.
     reorder_after_shrinkage_burn : when ``shrinkage_burn`` is positive,
         permute each layer's columns by decreasing coefficient L1 norm
-        once the burn-in ends (the model is permutation invariant, the
+        once its burn-in ends (the model is permutation invariant, the
         ordered CUSP prior is not).
     top_prune : ``"none"`` (default), ``"bic"`` or ``"bic_dense"``.  With
         ``"bic"``, every
@@ -711,10 +715,17 @@ def fit_parametric_csp_copula(
         raise ValueError("merge_layers must be one of " + ", ".join(_MERGE_LAYERS) + ".")
     if reinit_top_after and D < 2:
         raise ValueError("reinit_top_after requires at least two latent layers.")
-    shrinkage_burn = int(shrinkage_burn)
-    if shrinkage_burn < 0:
+    if np.ndim(shrinkage_burn) == 0:
+        shrinkage_burn = int(shrinkage_burn)
+        layer_burn = np.full(D, shrinkage_burn, dtype=int)
+    else:
+        layer_burn = np.asarray(shrinkage_burn, dtype=int).reshape(-1)
+        if layer_burn.size != D:
+            raise ValueError("shrinkage_burn must be an integer or a length-D sequence.")
+        shrinkage_burn = tuple(int(value) for value in layer_burn)
+    if np.any(layer_burn < 0):
         raise ValueError("shrinkage_burn must be a nonnegative integer.")
-    if shrinkage_burn >= it:
+    if np.any(layer_burn >= it):
         raise ValueError("shrinkage_burn must be smaller than it.")
     reorder_after_shrinkage_burn = bool(reorder_after_shrinkage_burn)
     top_prune = str(top_prune).strip().lower()
@@ -827,28 +838,31 @@ def fit_parametric_csp_copula(
     it_num = 0
     stopped_by_convergence = False
     while it_num < it:
-        shrinkage_active = it_num >= shrinkage_burn
-        # 0a) End of the slab-start burn-in: order the columns of every
-        #     layer by strength.  The CUSP state is column symmetric at
-        #     this point (all slab, unit slab scales), so only the model
-        #     parameters and latent states need permuting.
-        if (
-            shrinkage_burn
-            and shrinkage_active
-            and reorder_after_shrinkage_burn
-            and burn_permutations is None
-        ):
-            prop, B_list, A_list, burn_permutations = _canonicalize_csp_layer_order(
-                prop, B_list, A_list
-            )
-            for d, permutation in enumerate(burn_permutations):
-                theta_slab[d] = theta_slab[d][permutation]
-                theta[d] = theta[d][:, permutation]
-                theta_mstep[d] = theta_mstep[d][:, permutation]
-                z_cusp[d] = z_cusp[d][permutation]
-                if d >= 1 and burn_permutations[d - 1] is not None:
-                    theta[d] = theta[d][burn_permutations[d - 1], :]
-                    theta_mstep[d] = theta_mstep[d][burn_permutations[d - 1], :]
+        layer_active = it_num >= layer_burn
+        shrinkage_active = bool(np.all(layer_active))
+        # 0a) End of a layer's slab-start burn-in: order its columns by
+        #     strength.  Its CUSP state is column symmetric at this point
+        #     (all slab, unit slab scales), so only the model parameters,
+        #     latent states and the next layer's rows need permuting.
+        for d in range(D):
+            if not (reorder_after_shrinkage_burn and layer_burn[d] and it_num == layer_burn[d]):
+                continue
+            permutation = np.argsort(-np.sum(np.abs(B_list[d][:, 1:]), axis=0), kind="stable")
+            if burn_permutations is None:
+                burn_permutations = [None] * D
+            burn_permutations[d] = permutation
+            B_list[d][:, 1:] = B_list[d][:, permutation + 1]
+            A_list[d] = A_list[d][:, permutation]
+            theta_slab[d] = theta_slab[d][permutation]
+            theta[d] = theta[d][:, permutation]
+            theta_mstep[d] = theta_mstep[d][:, permutation]
+            z_cusp[d] = z_cusp[d][permutation]
+            if d + 1 < D:
+                B_list[d + 1] = B_list[d + 1][permutation, :]
+                theta[d + 1] = theta[d + 1][permutation, :]
+                theta_mstep[d + 1] = theta_mstep[d + 1][permutation, :]
+            else:
+                prop = prop[permutation]
 
         # 0) Optional one-off re-initialization of the deepest layer from
         #    the current active children.
@@ -893,7 +907,7 @@ def fit_parametric_csp_copula(
         if (
             top_prune != "none"
             and D >= 2
-            and shrinkage_active
+            and layer_active[D - 1]
             and stage_open[D - 1]
             and it_num >= top_prune_after
             and (it_num - top_prune_after) % top_prune_every == 0
@@ -969,7 +983,7 @@ def fit_parametric_csp_copula(
         #    M-step prior is Laplace(0, scale / c_N); the allocation either
         #    sees c_N * B (the matching densities) or the raw B (power prior).
         for d in range(D - 1, -1, -1):
-            if not shrinkage_active or not stage_open[d]:
+            if not layer_active[d] or not stage_open[d]:
                 # Slab-start burn-in (or a layer whose stage has not
                 # started): every column in the slab at the current slab
                 # scale.
@@ -1060,10 +1074,9 @@ def fit_parametric_csp_copula(
             inactive = np.flatnonzero(~csp_active_mask(z_cusp[d]))
             ind_inact[d] = inactive
             num_act[d] = K[d] - inactive.size
-        if shrinkage_active:
-            for d in range(thresholded_layers):
-                if stage_open[d]:
-                    B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
+        for d in range(thresholded_layers):
+            if layer_active[d] and stage_open[d]:
+                B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
         for d in range(D - 1):
             if ind_inact[d].size:
                 B_update[d + 1][ind_inact[d], :] = 0.0

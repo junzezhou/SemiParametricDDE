@@ -109,7 +109,12 @@ penalty in every layer (`csp_penalty_scaling_power=0.5`,
 (`csp_threshold_rule="all"`), the dense marginal-likelihood deletion test for
 the deepest layer (`csp_top_prune="bic_dense"`), and 100 iterations without
 early stop (`max_it=100`, `tol=0`); `Results/csp_redesign/bench_v2` holds the
-20-replicate N-trend study behind these defaults.  The former MCEM CSP
+20-replicate N-trend study behind these defaults.  Bernoulli CSP also holds
+the columns in the CUSP slab for the first fifth of the budget
+(`csp_shrinkage_burn`: 20 of 100 iterations, in every layer except the
+deepest layer of a model with three or more layers); without it the rarest
+latents are pruned before their states settle and the width error does not
+fall with N (`Results/dde_modification`).  The former MCEM CSP
 backends (``"mcem"``, ``"mcem_reinitialize"``, ``"mcem_cap_only"``) were
 removed; the git tag `csp-mcem-last` holds the last version with them.
 
@@ -146,8 +151,9 @@ other latent transitions stay available as options: the CopDDE synchronous
 mean-field draws (`csp_latent_transition="synchronous_mean_field"`) and a
 persistent systematic coordinate-Gibbs chain
 (`csp_latent_transition="systematic_coordinate_gibbs"`).  Further options are
-a slab-start burn-in (`csp_shrinkage_burn`) and a stopping rule that also
-waits for stable widths (`csp_convergence_width_window`, with `tol>0`).
+the slab-start burn-in (`csp_shrinkage_burn`, an integer or one value per
+layer) and a stopping rule that also waits for stable widths
+(`csp_convergence_width_window`, with `tol>0`).
 
 ## Visualization
 

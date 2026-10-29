@@ -45,9 +45,9 @@ import numpy as np
 
 FAMILY_KERNELS = {
     "normal": ("copdde", "dde_csp", "cop_norm100"),
-    "bernoulli": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100"),
-    "poisson": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100"),
-    "semidde": ("copdde", "semi_csp", "semi_csp_cop", "semi_csp_cop100"),
+    "bernoulli": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100", "dde_csp_sb10", "dde_csp_sb20", "dde_csp_sb20L1", "dde_csp_sb20t10", "dde_csp_sb20t0"),
+    "poisson": ("copdde", "dde_csp", "dde_csp_cop", "cop_mf", "cop_mf_p1", "cop_mf_p0", "cop_mf_l1", "cop_mf_l1p1", "cop_gibbs_merge", "cop_gibbs_merge_top", "cop_seq", "cop_seq_thr", "cop_gibbs_thr", "cop_seq_thr_s05", "cop_seq_thr_s05top", "cop_gibbs_thr_s05", "cop_seqL", "cop_seqP", "cop_gibbsP", "cop_seqP100", "cop_seqPA100", "cop_seqPD100", "cop_seqPDA100", "dde_csp_sb10", "dde_csp_sb20", "dde_csp_sb20L1", "dde_csp_sb20t10", "dde_csp_sb20t0"),
+    "semidde": ("copdde", "semi_csp", "semi_csp_cop", "semi_csp_cop100", "semi_csp_seqPD", "semi_csp_seqPDall", "semi_csp_seqPDall05", "semi_csp_seqPD100"),
 }
 
 
@@ -161,6 +161,19 @@ def run_kernel(kernel, family, Y, truth, N, seed):
     elif kernel == "dde_csp":
         # the kernel's own defaults, iteration budget included (Bernoulli/Poisson: 100, no early stop)
         res = fit(Y, method="DDE", family=family.capitalize(), D=D, random_state=seed, verbose=False, **common)
+    elif kernel.startswith("dde_csp_sb"):
+        # the kernel's defaults with a slab-start shrinkage burn-in of that many
+        # iterations (suffix L1: layer 1 only; tB: deepest layer B)
+        spec = kernel[len("dde_csp_sb"):]
+        if spec.endswith("L1"):
+            burn = [int(spec[:-2])] + [0] * (D - 1)
+        elif "t" in spec:
+            lower, top = spec.split("t")
+            burn = [int(lower)] * (D - 1) + [int(top)]
+        else:
+            burn = int(spec)
+        res = fit(Y, method="DDE", family=family.capitalize(), D=D, random_state=seed, verbose=False,
+                  csp_shrinkage_burn=burn, **common)
     elif kernel == "dde_csp_cop":
         res = fit(Y, method="DDE", family=family.capitalize(), D=D, max_it=50, random_state=seed, verbose=False,
                   csp_backend="copula", **common)
@@ -176,6 +189,18 @@ def run_kernel(kernel, family, Y, truth, N, seed):
                   tol=0.0, **common)
     elif kernel == "semi_csp_cop":
         res = fit(Y, model="SemiDDE", D=D, max_it=50, random_state=seed, verbose=False, csp_backend="copula", **common)
+    elif kernel.startswith("semi_csp_seqPD"):
+        # the discrete-family top-layer settings: sequential transition, every
+        # layer thresholded, dense deletion test for the deepest layer;
+        # suffix all / all05: N (or sqrt(N)) penalty scaling in every layer
+        extra = {"semi_csp_seqPD": {},
+                 "semi_csp_seqPD100": dict(tol=0.0, max_it=100),
+                 "semi_csp_seqPDall": dict(csp_penalty_scaling_layers="all"),
+                 "semi_csp_seqPDall05": dict(csp_penalty_scaling_layers="all", csp_penalty_scaling_power=0.5)}[kernel]
+        extra = {"max_it": 50, **extra}
+        res = fit(Y, model="SemiDDE", D=D, random_state=seed, verbose=False,
+                  csp_latent_transition="sequential_mean_field", csp_threshold_rule="all",
+                  csp_top_prune="bic_dense", **extra, **common)
     elif kernel == "semi_csp":
         res = fit(Y, model="SemiDDE", D=D, max_it=50, random_state=seed, verbose=False, **common)
     else:

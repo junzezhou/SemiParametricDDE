@@ -308,13 +308,16 @@ def fit_parametric_dde(
     (``csp_penalty_scaling_power=0.5``, ``csp_penalty_scaling_layers="all"``),
     hard thresholding of every layer (``csp_threshold_rule="all"``), the
     dense marginal-likelihood deletion test for the deepest layer
-    (``csp_top_prune="bic_dense"``), no slab burn-in, and 100 iterations
-    without early stop.  The former MCEM CSP backends (``"mcem"``,
+    (``csp_top_prune="bic_dense"``), 100 iterations without early stop,
+    and for Bernoulli a slab-start burn-in over the first fifth of the
+    budget (``min(20, max_it // 5)`` iterations in every layer, except the
+    deepest layer of a model with three or more layers; Poisson: none).  The former MCEM CSP backends (``"mcem"``,
     ``"mcem_reinitialize"``, ``"mcem_cap_only"``) were removed; the git tag
     ``csp-mcem-last`` holds the last version with them.
     ``csp_shrinkage_burn`` holds every column in the CUSP slab (no
     allocation, thresholding or convergence check) for that many initial
-    iterations before the CUSP updates start (a slab-start warm-up);
+    iterations before the CUSP updates start (a slab-start warm-up; a
+    length-``D`` sequence sets it per layer);
     ``csp_reorder_after_shrinkage_burn`` then orders the
     columns by strength once.  ``csp_top_prune="bic"`` (or
     ``"bic_dense"``) adds the copula kernel's marginal-likelihood deletion
@@ -946,7 +949,23 @@ def fit_parametric_dde(
     if csp_top_prune is None:
         csp_top_prune = "bic_dense" if discrete else "none"
     if csp_shrinkage_burn is None:
-        csp_shrinkage_burn = 0
+        # Bernoulli: hold the columns in the slab for the first fifth of the
+        # budget (20 of the default 100 iterations).  Without it the CUSP
+        # prunes the rarest latents within the first ten iterations, before
+        # their states have settled, and they never return (B_s design
+        # (18, 6, 2), J=64: width error 3.1-3.6 at every N; CopDDE design
+        # (10, 3), J=50: layer 2 one column short at every N).  The deepest
+        # layer of a D >= 3 model starts its CUSP updates at once: its
+        # children are the noisiest states, and a burn-in there leaves an
+        # extra column that the deletion test keeps (CopDDE design
+        # (18, 6, 2), J=108).  Results/dde_modification.
+        if family_adapter.key == "bernoulli":
+            burn_length = min(20, max_it // 5)
+            csp_shrinkage_burn = (
+                burn_length if D <= 2 else [burn_length] * (D - 1) + [0]
+            )
+        else:
+            csp_shrinkage_burn = 0
     raw = fit_parametric_csp_copula(
         X,
         prop,

@@ -103,7 +103,7 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
     assert d["penalty_scaling_layers"] == "all"
     assert d["threshold_rule"] == "all"
     assert d["top_prune"] == "bic_dense"
-    assert d["shrinkage_burn"] == 0
+    assert d["shrinkage_burn"] == 6  # a fifth of max_iter=30
     assert result.gamma is None
     assert tuple(d["K_max_list"]) == (9, 3)
     K1, K2 = result.K_list
@@ -123,6 +123,51 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
         fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
             verbose=False, mcem_shrinkage_burn=2)
+
+
+@pytest.mark.parametrize(
+    ("max_iter", "extra", "expected"),
+    [(100, {}, 20), (200, {}, 20), (4, {}, 0), (30, {"csp_shrinkage_burn": 0}, 0),
+     (30, {"csp_shrinkage_burn": 3}, 3)],
+)
+def test_bernoulli_csp_default_shrinkage_burn(monkeypatch, max_iter, extra, expected):
+    """The default burn-in is a fifth of the budget, at most 20; an explicit value wins."""
+    import dde.algorithms.dde as dde_module
+
+    seen = {}
+    real = dde_module.fit_parametric_csp_copula
+
+    def spy(*args, **kwargs):
+        seen["shrinkage_burn"] = kwargs["shrinkage_burn"]
+        kwargs["it"] = 1
+        kwargs["shrinkage_burn"] = 0
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dde_module, "fit_parametric_csp_copula", spy)
+    X, _ = _simulate(5, N=120)
+    fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=max_iter,
+        random_state=7, verbose=False, **extra)
+    assert seen["shrinkage_burn"] == expected
+
+
+def test_poisson_csp_keeps_no_default_shrinkage_burn(monkeypatch):
+    import dde.algorithms.dde as dde_module
+
+    seen = {}
+    real = dde_module.fit_parametric_csp_copula
+
+    def spy(*args, **kwargs):
+        seen["shrinkage_burn"] = kwargs["shrinkage_burn"]
+        kwargs["it"] = 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dde_module, "fit_parametric_csp_copula", spy)
+    X, _ = _simulate(5, N=120)
+    counts = np.random.default_rng(0).poisson(1.0 + 2.0 * X)
+    fit(counts, method="DDE", family="Poisson", D=2, dimension_method="csp",
+        t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, random_state=7, verbose=False)
+    assert seen["shrinkage_burn"] == 0
 
 
 def test_bernoulli_copula_backend_rejects_standardize():
@@ -190,6 +235,57 @@ def test_shrinkage_burn_without_reordering_and_validation():
         )
 
 
+def test_per_layer_shrinkage_burn_holds_only_the_listed_layers():
+    inputs = _inputs()
+    raw = fit_bernoulli_csp(
+        inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+        C=1, it=4, t_spike=[0.03, 0.05], temp=0.9, tau=0.3, verbose=False,
+        latent_transition="systematic_coordinate_gibbs", shrinkage_burn=[2, 0],
+        keep_trace=True, random_state=4,
+    )
+    assert raw["shrinkage_burn"] == (2, 0)
+    trace = raw["trace"]
+    for entry in trace[:2]:
+        # layer 1 is held in the slab, layer 2 runs its CUSP update from the start
+        assert np.array_equal(entry["allocation"][0], np.full(6, 7))
+        assert entry["shrinkage_active"] is False
+        assert entry["will_stop"] is False
+    assert not np.allclose(trace[0]["slab_scale"][1], 1.0)
+    assert np.allclose(trace[1]["slab_scale"][0], 1.0)
+    # only the burned layer is reordered when its burn-in ends
+    assert raw["burn_permutations"][1] is None
+    assert sorted(raw["burn_permutations"][0].tolist()) == list(range(6))
+    base = dict(C=1, t_spike=0.03, temp=0.9, tau=0.3, verbose=False, random_state=4)
+    with pytest.raises(ValueError, match="length-D"):
+        fit_bernoulli_csp(
+            inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+            it=3, shrinkage_burn=[1, 1, 1], **base,
+        )
+    with pytest.raises(ValueError, match="smaller than it"):
+        fit_bernoulli_csp(
+            inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+            it=3, shrinkage_burn=[0, 3], **base,
+        )
+
+
+def test_uniform_per_layer_burn_matches_the_scalar_burn():
+    inputs = _inputs()
+    common = dict(C=1, it=4, t_spike=[0.03, 0.05], temp=0.9, tau=0.3, verbose=False,
+                  latent_transition="systematic_coordinate_gibbs", random_state=4)
+    scalar = fit_bernoulli_csp(
+        inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+        shrinkage_burn=2, **common,
+    )
+    listed = fit_bernoulli_csp(
+        inputs["X"], inputs["prop"], _copy(inputs["B_list"]), _copy(inputs["A_list"]),
+        shrinkage_burn=[2, 2], **common,
+    )
+    for a, b in zip(scalar["B_list"], listed["B_list"]):
+        np.testing.assert_array_equal(a, b)
+    for a, b in zip(scalar["burn_permutations"], listed["burn_permutations"]):
+        np.testing.assert_array_equal(a, b)
+
+
 def test_shrinkage_burn_reordering_sorts_columns_by_strength():
     inputs = _inputs()
     raw = fit_bernoulli_csp(
@@ -233,7 +329,8 @@ def test_bernoulli_copula_defaults_and_explicit_burn_in_for_three_layers():
         verbose=False, csp_backend="copula", keep_trace=True,
     )
     auto = fit(X, max_iter=20, **common)
-    assert auto.diagnostics["shrinkage_burn"] == 0
+    # a fifth of max_iter=20 in every layer but the deepest
+    assert auto.diagnostics["shrinkage_burn"] == (4, 4, 0)
     assert auto.diagnostics["penalty_scaling_power"] == (0.5, 0.5, 0.5)
     assert auto.diagnostics["iterations"] == 20  # tol=0 by default: no early stop
     explicit = fit(X, max_iter=12, csp_shrinkage_burn=4, **common)
@@ -454,11 +551,12 @@ def test_discrete_csp_defaults_are_the_copula_engine_settings(family):
     assert d["top_prune"] == "bic_dense"
     assert d["penalty_scaling_power"] == (0.5, 0.5)
     assert d["penalty_scaling_layers"] == "all"
-    assert d["shrinkage_burn"] == 0
+    burn = 20 if family == "Bernoulli" else 0  # Bernoulli: slab-start burn-in
+    assert d["shrinkage_burn"] == burn
     assert d["iterations"] == 100  # max_it=100, tol=0: no early stop
     explicit = fit(
         X, **common, max_it=100, tol=0.0, csp_backend="copula",
-        csp_latent_transition="sequential_mean_field", csp_shrinkage_burn=0,
+        csp_latent_transition="sequential_mean_field", csp_shrinkage_burn=burn,
         csp_threshold_rule="all", csp_penalty_scaling_power=0.5,
         csp_penalty_scaling_layers="all", csp_top_prune="bic_dense",
     )
