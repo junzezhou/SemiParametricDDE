@@ -168,6 +168,8 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization, support_list=None):
         # DDE default in fit_parametric_dde).
         kwargs.setdefault("sa_burn_in", 0)
         kwargs["support_list"] = support_list
+    if kwargs.get("C") is None:
+        kwargs["C"] = 1
     required = [
         "X_in",
         "prop_in",
@@ -193,7 +195,7 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization, support_list=None):
         support is not None for support in (support_list or [None] * len(K_list))
     ]
     return DDEResult(
-        model="semi",
+        model="SemiDDE",
         K_list=[int(B.shape[1] - 1) for B in B_list],
         prop=prop,
         B_list=B_list,
@@ -210,7 +212,10 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization, support_list=None):
             "fixed_graph_layers": fixed_layers,
             **kernel_diagnostics,
         },
-        raw=(X, prop, B_list, gamma, A_list, iterations),
+        raw={
+            "X": X, "prop": prop, "B_list": B_list, "gamma": gamma,
+            "A_list": A_list, "iterations": iterations,
+        },
     )
 
 
@@ -236,6 +241,8 @@ def _fit_semidde_csp(Y, K_max, kwargs, *, initialization):
         )
     if kwargs.pop("final_refit", False):
         raise ValueError("final_refit is only available for fixed-width SemiDDE.")
+    if kwargs.get("C") is None:
+        kwargs["C"] = 1
 
     required = [
         "X_in",
@@ -314,7 +321,7 @@ def _fit_semidde_csp_copula(Y, K_max, kwargs, max_inner_iter, *, initialization)
         min_active=True,
     )
     return DDEResult(
-        model="semi",
+        model="SemiDDE",
         K_list=list(compressed["diagnostics"]["K_list"]),
         prop=compressed["prop"],
         B_list=compressed["B_list"],
@@ -345,9 +352,11 @@ def fit_semidde(
     (``sa_burn_in=0``) unless it is given.  ``pen_list`` and ``tau`` may be
     omitted when every layer is fixed.
 
-    Fixed mode uses the supplied ``K_list``.  CSP mode requires ``D``, rejects
-    ``K_list``, and initializes the recursive maximum identifiable widths
-    ``floor(J/3), floor(floor(J/3)/3), ...`` before shrinking them.  CSP mode
+    Fixed mode uses the supplied ``K_list``.  CSP mode starts from the
+    maximal widths ``K_list`` when given and otherwise from the recursive
+    maximum identifiable widths ``floor(J/3), floor(floor(J/3)/3), ...``
+    (``D`` is then required) before shrinking them.  ``C`` defaults to 1.
+    CSP mode
     runs on the copula kernel by default (``csp_backend="copula"``: the
     Normal-family engine with a ``g`` step after every committed
     iteration); the former MCEM path was removed.
@@ -383,13 +392,16 @@ def fit_semidde(
             )
     else:
         if D is None:
-            raise ValueError("D is required when SemiDDE dimension_method='csp'.")
-        if K_list is not None:
-            raise ValueError(
-                "K_list must be omitted when dimension_method='csp'; maximal "
-                "identifiable widths are derived recursively from J."
-            )
-        K_tuple = maximal_identifiable_widths(Y.shape[1], int(D))
+            if K_list is None:
+                raise ValueError("D is required when SemiDDE dimension_method='csp'.")
+            D = len(K_list)
+        # Optional maximal widths; by default the recursive maximal
+        # identifiable widths floor(J/3), floor(K_1/3), ...
+        K_tuple = (
+            maximal_identifiable_widths(Y.shape[1], int(D))
+            if K_list is None
+            else validate_K_list_identifiability(K_list, D=int(D), J=Y.shape[1])
+        )
 
     fit_kwargs = dict(kwargs)
     initialization = _initialize_semidde(

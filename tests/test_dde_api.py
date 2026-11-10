@@ -27,7 +27,7 @@ def test_fit_dde_normal_fixed_public_smoke():
     np.random.seed(91)
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         D=2,
         family="Normal",
         dimension_method="fixed",
@@ -47,7 +47,13 @@ def test_fit_dde_normal_fixed_public_smoke():
     assert [A.shape for A in result.A_list] == [(16, 6), (16, 2)]
     assert result.gamma.shape == (18,)
     assert np.array_equal(result.transformed, X)
-    assert result.raw[0] is result.transformed
+    assert result.raw["X"] is result.transformed
+    assert result.diagnostics["active_by_layer"] == [
+        int((B[:, 1:] != 0).any(axis=0).sum()) for B in result.B_list
+    ]
+    assert result.diagnostics["n_active_edges"] == [
+        int((B[:, 1:] != 0).sum()) for B in result.B_list
+    ]
     assert result.diagnostics["family"] == "Normal"
     assert result.diagnostics["dimension_method"] == "fixed"
     assert result.diagnostics["initialization"] == "data"
@@ -85,7 +91,7 @@ def test_fit_dde_normal_is_equivalent_to_direct_kernel_with_same_initial_state()
     np.random.seed(31415)
     actual = fit(
         X,
-        method="DDE",
+        model="DDE",
         D=2,
         family="Normal",
         dimension_method="fixed",
@@ -124,7 +130,7 @@ def test_fit_dde_normal_is_equivalent_to_direct_kernel_with_same_initial_state()
 def test_fit_dde_normal_rejects_invalid_path_arguments(overrides, message):
     X, K_list, _, _ = _normal_parameters()
     args = dict(
-        method="DDE",
+        model="DDE",
         D=2,
         family="Normal",
         dimension_method="fixed",
@@ -143,14 +149,41 @@ def test_fit_dde_normal_rejects_invalid_path_arguments(overrides, message):
 
 def test_fit_rejects_conflicting_method_and_model():
     X, _, _, _ = _normal_parameters()
-    with pytest.raises(ValueError, match="different DDE formulations"):
-        fit(X, method="DDE", model="SemiDDE")
+    with pytest.warns(DeprecationWarning, match="'method' argument is deprecated"):
+        with pytest.raises(ValueError, match="different DDE formulations"):
+            fit(X, method="DDE", model="SemiDDE")
+
+
+def test_fit_method_is_a_deprecated_spelling_of_model():
+    X, K_list, _, _ = _normal_parameters()
+    args = dict(
+        D=2, family="Normal", dimension_method="fixed", K_list=K_list,
+        pen_list=[0.0, 0.0], tau=0.3, max_it=1, verbose=False,
+    )
+    np.random.seed(5)
+    current = fit(X, model="DDE", **args)
+    np.random.seed(5)
+    with pytest.warns(DeprecationWarning, match="use 'model'"):
+        legacy = fit(X, method="DDE", **args)
+    assert legacy.model == current.model == "DDE"
+    for actual, expected in zip(legacy.B_list, current.B_list):
+        np.testing.assert_allclose(actual, expected)
+
+
+def test_fit_warns_when_dimension_method_is_omitted():
+    X, K_list, _, _ = _normal_parameters()
+    with pytest.warns(FutureWarning, match="dimension_method was not given"):
+        result = fit(
+            X, model="DDE", D=2, family="Normal", K_list=K_list,
+            pen_list=[0.0, 0.0], tau=0.3, max_it=1, verbose=False,
+        )
+    assert result.diagnostics["dimension_method"] == "fixed"
 
 
 def test_fit_common_max_iter_alias_and_conflict():
     X, K_list, _, _ = _normal_parameters()
     args = dict(
-        method="DDE", D=2, family="Normal", dimension_method="fixed",
+        model="DDE", D=2, family="Normal", dimension_method="fixed",
         K_list=K_list, pen_list=[0.0, 0.0], tau=0.3, C=1,
         max_iter=1, verbose=False,
     )
@@ -162,14 +195,14 @@ def test_fit_common_max_iter_alias_and_conflict():
     assert result.diagnostics["iterations"] == legacy.diagnostics["iterations"]
     for actual, expected in zip(result.B_list, legacy.B_list):
         np.testing.assert_allclose(actual, expected)
-    with pytest.raises(ValueError, match="max_iter conflicts with max_it"):
+    with pytest.raises(ValueError, match="Conflicting iteration limits: max_it, max_iter"):
         fit(X, **args, max_it=2)
 
 
 def test_fit_copula_csp_derives_widths_from_D():
     X, _, _, _ = _normal_parameters()
     result = fit(
-        X, method="CopDDE", D=2, dimension_method="csp",
+        X, model="CopDDE", D=2, dimension_method="csp",
         t_spike=[0.03, 0.05], temp=0.7, tau=0.3, C=1,
         max_iter=1, optimizer_maxiter=1, random_state=4, verbose=False,
     )
@@ -180,7 +213,7 @@ def test_fit_copula_csp_derives_widths_from_D():
 def test_fit_dde_normal_csp_public_smoke_and_is_reproducible():
     X, _, _, _ = _normal_parameters()
     args = dict(
-        method="DDE",
+        model="DDE",
         D=2,
         family="Normal",
         dimension_method="csp",
@@ -239,7 +272,7 @@ def test_fit_dde_csp_rejects_removed_mcem_backends(backend, family):
     with pytest.raises(ValueError, match="were removed"):
         fit(
             X,
-            method="DDE",
+            model="DDE",
             D=2,
             family=family,
             dimension_method="csp",
@@ -260,7 +293,7 @@ def test_fit_dde_normal_csp_rejects_removed_saem_backend():
     with pytest.raises(ValueError, match="not available"):
         fit(
             X,
-            method="DDE",
+            model="DDE",
             D=2,
             family="Normal",
             dimension_method="csp",
@@ -285,7 +318,7 @@ def test_fit_dde_normal_csp_rejects_removed_backend_switches(removed_option):
     with pytest.raises(TypeError, match="Unexpected Normal DDE argument"):
         fit(
             X,
-            method="DDE",
+            model="DDE",
             D=2,
             family="Normal",
             dimension_method="csp",
@@ -304,7 +337,7 @@ def test_fit_dde_normal_csp_rejects_removed_backend_switches(removed_option):
 def test_fit_dde_normal_csp_uses_copula_backend_by_default():
     X, _, _, _ = _normal_parameters()
     args = dict(
-        method="DDE",
+        model="DDE",
         D=2,
         family="Normal",
         dimension_method="csp",
@@ -335,7 +368,7 @@ def test_fit_dde_normal_csp_uses_copula_backend_by_default():
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"K_list": [6, 2]}, "K_list must be omitted"),
+        ({"K_list": [7, 2]}, "J >= 3"),
         ({"pen_list": [0.1, 0.1]}, "pen_list.*fixed"),
         ({"t_spike": None}, "requires t_spike and temp"),
         ({"temp": None}, "requires t_spike and temp"),
@@ -344,7 +377,7 @@ def test_fit_dde_normal_csp_uses_copula_backend_by_default():
 def test_fit_dde_normal_csp_rejects_path_incompatible_arguments(overrides, message):
     X, _, _, _ = _normal_parameters()
     args = dict(
-        method="DDE",
+        model="DDE",
         D=2,
         family="Normal",
         dimension_method="csp",

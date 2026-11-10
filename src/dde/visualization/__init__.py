@@ -1,9 +1,11 @@
 """Visualization of fitted DDE models.
 
-Two primary interfaces (manuscript Section 5.4): :func:`plot_weights` draws
-the estimated weight matrices and :func:`get_anchors` ranks the observed
-variables that anchor each shallow-layer latent feature.  The earlier
-multi-panel report bundle lives in :mod:`dde.visualization.legacy`.
+Primary interfaces (manuscript Section 5.4 and Appendix C):
+:func:`plot_weights` draws the estimated weight matrices, :func:`get_anchors`
+ranks the observed variables that anchor each shallow-layer latent feature,
+and :func:`visualization_report` writes the standard bundle of diagnostic
+plots of a SemiDDE or CopDDE fit.  The remaining report helpers live in
+:mod:`dde.visualization.legacy`.
 """
 
 from __future__ import annotations
@@ -11,9 +13,10 @@ from __future__ import annotations
 import warnings
 
 from . import legacy
+from .report import visualization_report
 from .weights import anchor_scores, get_anchors, plot_weights
 
-__all__ = ["anchor_scores", "get_anchors", "legacy", "plot_weights"]
+__all__ = ["anchor_scores", "get_anchors", "legacy", "plot_weights", "visualization_report"]
 
 
 def __getattr__(name):

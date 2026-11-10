@@ -20,7 +20,7 @@ def test_shared_utils():
 def test_fit_requires_initialized_args():
     Y = np.zeros((5, 18))
     with pytest.raises(ValueError, match="initialized algorithm arguments"):
-        fit(Y, model="semi", K_list=[6, 2])
+        fit(Y, model="semi", dimension_method="fixed", K_list=[6, 2])
 
     with pytest.raises(ValueError):
-        fit(Y, model="copula", K_list=[6, 2])
+        fit(Y, model="copula", dimension_method="csp", K_list=[6, 2])

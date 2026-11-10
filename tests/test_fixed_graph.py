@@ -228,7 +228,7 @@ def test_exact_em_increases_loglik_and_recovers_parameters(family):
 def test_dde_fit_with_full_graph_uses_exact_em_without_tau_or_pen_list(family):
     X, B_true, _ = _simulate(family, 1500, (6, 2), seed=5)
     G = _graph(B_true)
-    result = fit(X, method="DDE", family=family, G_list=G, verbose=False)
+    result = fit(X, model="DDE", dimension_method="fixed", family=family, G_list=G, verbose=False)
     assert result.K_list == [6, 2]
     assert result.diagnostics["graph_algorithm"] == "em"
     assert result.diagnostics["initialization"] == "data_graph"
@@ -242,7 +242,7 @@ def test_dde_fit_with_graph_saem_path(family):
     X, B_true, _ = _simulate(family, 1500, (6, 2), seed=6)
     G = _graph(B_true)
     result = fit(
-        X, method="DDE", family=family, D=2, G_list=G, C=1, graph_algorithm="saem",
+        X, model="DDE", dimension_method="fixed", family=family, D=2, G_list=G, C=1, graph_algorithm="saem",
         max_it=15, verbose=False,
     )
     diagnostics = result.diagnostics
@@ -258,7 +258,7 @@ def test_dde_fit_with_partial_graph_estimates_deeper_layer():
     X, B_true, _ = _simulate("poisson", 1500, (6, 2), seed=7)
     G1 = _graph(B_true)[0]
     result = fit(
-        X, method="DDE", family="poisson", D=2, K_list=[6, 2], G_list=[G1],
+        X, model="DDE", dimension_method="fixed", family="poisson", D=2, K_list=[6, 2], G_list=[G1],
         pen_list=[0.0, 2.0], tau=0.3, C=1, max_it=15, verbose=False,
     )
     diagnostics = result.diagnostics
@@ -273,26 +273,26 @@ def test_dde_fit_graph_argument_errors():
     X, B_true, _ = _simulate("bernoulli", 300, (6, 2), seed=8)
     G = _graph(B_true)
     with pytest.raises(ValueError, match="dimension_method='fixed'"):
-        fit(X, method="DDE", family="bernoulli", D=2, G_list=G, dimension_method="csp",
+        fit(X, model="DDE", family="bernoulli", D=2, G_list=G, dimension_method="csp",
             t_spike=[0.1, 0.1], temp=0.9, tau=0.3, C=1, verbose=False)
     with pytest.raises(ValueError, match="fix every layer"):
-        fit(X, method="DDE", family="bernoulli", D=2, K_list=[6, 2], G_list=[G[0]],
+        fit(X, model="DDE", dimension_method="fixed", family="bernoulli", D=2, K_list=[6, 2], G_list=[G[0]],
             pen_list=[0.0, 1.0], tau=0.3, C=1, graph_algorithm="em", verbose=False)
     with pytest.raises(ValueError, match="tau is required"):
-        fit(X, method="DDE", family="bernoulli", D=2, K_list=[6, 2], G_list=[G[0]],
+        fit(X, model="DDE", dimension_method="fixed", family="bernoulli", D=2, K_list=[6, 2], G_list=[G[0]],
             pen_list=[0.0, 1.0], C=1, verbose=False)
     with pytest.raises(ValueError, match="labels the latent columns"):
-        fit(X, method="DDE", family="bernoulli", G_list=G, initialize="oracle",
+        fit(X, model="DDE", dimension_method="fixed", family="bernoulli", G_list=G, initialize="oracle",
             B_list_true=B_true, G_list_true=G, verbose=False)
-    with pytest.raises(ValueError, match="C \\(Monte Carlo"):
-        fit(X, method="DDE", family="bernoulli", G_list=G, graph_algorithm="saem", verbose=False)
+    with pytest.raises(ValueError, match="C must be a positive integer"):
+        fit(X, model="DDE", dimension_method="fixed", family="bernoulli", G_list=G, graph_algorithm="saem", C=0, verbose=False)
 
 
 def test_semidde_fit_with_graph_holds_support():
     X, B_true, A_true = _simulate("normal", 1000, (6, 2), seed=9)
     Y = np.exp(X / 2.0)
     G = _graph(B_true)
-    result = fit(Y, method="SemiDDE", G_list=G, C=1, tol=0.005, verbose=False)
+    result = fit(Y, model="SemiDDE", dimension_method="fixed", G_list=G, C=1, tol=0.005, verbose=False)
     assert result.diagnostics["initialization"] == "data_graph"
     assert result.diagnostics["fixed_graph_layers"] == [True, True]
     assert result.diagnostics["sa_burn_in"] == 0
@@ -304,20 +304,20 @@ def test_semidde_fit_with_graph_holds_support():
 def test_exact_em_multistart_keeps_best_start_and_is_reproducible():
     X, B_true, _ = _simulate("normal", 600, (6, 2), seed=12)
     G = _graph(B_true)
-    first = fit(X, method="DDE", family="normal", G_list=G, n_init=4, random_state=3, verbose=False)
-    again = fit(X, method="DDE", family="normal", G_list=G, n_init=4, random_state=3, verbose=False)
+    first = fit(X, model="DDE", dimension_method="fixed", family="normal", G_list=G, n_init=4, random_state=3, verbose=False)
+    again = fit(X, model="DDE", dimension_method="fixed", family="normal", G_list=G, n_init=4, random_state=3, verbose=False)
     logliks = first.diagnostics["start_logliks"]
     assert len(logliks) == 4 and first.diagnostics["n_init"] == 4
     assert first.diagnostics["loglik"] == pytest.approx(max(logliks))
     assert logliks[first.diagnostics["best_start"]] == pytest.approx(max(logliks))
     np.testing.assert_array_equal(first.B_list[1], again.B_list[1])
-    single = fit(X, method="DDE", family="normal", G_list=G, n_init=1, verbose=False)
+    single = fit(X, model="DDE", dimension_method="fixed", family="normal", G_list=G, n_init=1, verbose=False)
     assert single.diagnostics["loglik"] <= first.diagnostics["loglik"] + 1e-8
     with pytest.raises(ValueError, match="n_init applies"):
-        fit(X, method="DDE", family="normal", D=2, G_list=G, C=1, graph_algorithm="saem",
+        fit(X, model="DDE", dimension_method="fixed", family="normal", D=2, G_list=G, C=1, graph_algorithm="saem",
             n_init=3, verbose=False)
     with pytest.raises(ValueError, match="random_state"):
-        fit(X, method="DDE", family="normal", D=2, G_list=G, C=1, graph_algorithm="saem",
+        fit(X, model="DDE", dimension_method="fixed", family="normal", D=2, G_list=G, C=1, graph_algorithm="saem",
             random_state=1, verbose=False)
 
 

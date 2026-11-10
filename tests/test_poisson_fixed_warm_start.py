@@ -61,7 +61,7 @@ def test_anchor_mixture_initializer_starts_rare_columns_near_true_prevalence():
 
 def test_poisson_fixed_defaults_record_burn_in_and_warm_start():
     X, _, B_true, G_true = _design((6, 2), seed=5, N=600)
-    result = fit(X, method="DDE", family="Poisson", D=2, dimension_method="fixed", K_list=[6, 2],
+    result = fit(X, model="DDE", family="Poisson", D=2, dimension_method="fixed", K_list=[6, 2],
                  pen_list=[2.0, 2.0], tau=0.3, C=1, tol=0.01, max_it=12, verbose=False)
     d = result.diagnostics
     assert d["sa_burn_in"] == 10 and d["fixed_init_binarize"] == "anchor_mixture"
@@ -73,10 +73,10 @@ def test_poisson_fixed_defaults_record_burn_in_and_warm_start():
 
 def test_poisson_one_layer_and_provided_state_skip_the_warm_start():
     X, A_true, B_true, G_true = _design((6, 2), seed=6, N=500)
-    one = fit(X, method="DDE", family="Poisson", D=1, dimension_method="fixed", K_list=[6],
+    one = fit(X, model="DDE", family="Poisson", D=1, dimension_method="fixed", K_list=[6],
               pen_list=[2.0], tau=0.3, C=1, tol=0.01, max_it=12, verbose=False)
     assert one.diagnostics["fixed_warm_start"] == "none" and "warm_start" not in one.diagnostics
-    provided = fit(X, method="DDE", family="Poisson", D=2, dimension_method="fixed", K_list=[6, 2],
+    provided = fit(X, model="DDE", family="Poisson", D=2, dimension_method="fixed", K_list=[6, 2],
                    pen_list=[2.0, 2.0], tau=0.3, C=1, tol=0.01, max_it=12, verbose=False,
                    prop_in=np.full(2, 0.5), B_list_in=B_true, A_list_in=A_true)
     assert provided.diagnostics["fixed_warm_start"] == "none" and "warm_start" not in provided.diagnostics
@@ -85,21 +85,21 @@ def test_poisson_one_layer_and_provided_state_skip_the_warm_start():
 def test_other_families_keep_their_fixed_defaults():
     rng = np.random.default_rng(7)
     Y = (rng.random((200, 18)) < 0.4).astype(float)
-    bernoulli = fit(Y, method="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
+    bernoulli = fit(Y, model="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
                     pen_list=[1.0, 1.0], tau=0.3, C=1, tol=0.5, max_it=3, verbose=False)
     assert bernoulli.diagnostics["sa_burn_in"] == 10
     assert bernoulli.diagnostics["fixed_init_binarize"] == "anchor_lca"
     assert bernoulli.diagnostics["fixed_warm_start"] == "none"
     # the Normal defaults are covered by tests/test_normal_fixed_defaults.py
     with pytest.raises(ValueError):
-        fit(Y, method="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
+        fit(Y, model="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
             pen_list=[1.0, 1.0], tau=0.3, C=1, max_it=2, verbose=False, fixed_init_binarize="anchor_mixture")
 
 
 def test_poisson_two_layer_recovery_with_oracle_labels():
     X, A_true, B_true, G_true = _design((6, 2), seed=11, N=2000)
     np.random.seed(11)
-    result = fit(X, method="DDE", family="Poisson", D=2, dimension_method="fixed", K_list=[6, 2],
+    result = fit(X, model="DDE", family="Poisson", D=2, dimension_method="fixed", K_list=[6, 2],
                  pen_list=[2000 ** 0.25] * 2, tau=0.3, C=1, tol=0.01, max_it=50,
                  initialize="oracle", B_list_true=B_true, G_list_true=G_true, verbose=False)
     for B_hat, B_t, G_t in zip(result.B_list, B_true, G_true):

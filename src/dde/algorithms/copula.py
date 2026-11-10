@@ -153,7 +153,10 @@ def fit_copula_dde(
     """Fit CopDDE through the D-layer rank-likelihood kernel.
 
     ``dimension_method`` is ``"csp"`` (default) or ``"fixed"``; it defaults
-    to ``"fixed"`` when ``G_list`` is given.
+    to ``"fixed"`` when ``G_list`` is given.  ``C`` defaults to 1 and the
+    iteration limit ``it`` to 50.  Fixed-width fits run at ``temp=1``
+    unless ``temp`` is given; for CSP fits ``tol`` sets the stopping rule's
+    ``convergence_std``.
 
     ``G_list`` fixes a user-specified graph, as in
     :func:`dde.algorithms.dde.fit_parametric_dde`: binary matrices
@@ -196,6 +199,26 @@ def fit_copula_dde(
         kwargs["support_list"] = support_list
     elif n_init is not None or graph_warmup_it is not None:
         raise ValueError("n_init and graph_warmup_it apply only to fits with G_list.")
+    if method not in {"fixed", "csp"}:
+        raise ValueError("dimension_method must be 'fixed' or 'csp'.")
+    # Manuscript defaults: one latent draw per E-step and 50 iterations.  The
+    # temperature is a CSP argument; fixed-width fits run untempered unless
+    # ``temp`` is given.
+    if kwargs.get("C") is None:
+        kwargs["C"] = 1
+    if kwargs.get("it") is None:
+        kwargs["it"] = 50
+    if method == "fixed":
+        kwargs.setdefault("temp", 1.0)
+    elif "tol" in kwargs:
+        # The CSP kernel stops when the relative coefficient change is stable
+        # over ``convergence_window`` iterations; ``tol`` bounds its spread,
+        # as in the DDE and SemiDDE CSP paths.
+        tol = kwargs.pop("tol")
+        if tol is not None:
+            if "convergence_std" in kwargs and float(kwargs["convergence_std"]) != float(tol):
+                raise ValueError("tol conflicts with convergence_std.")
+            kwargs["convergence_std"] = float(tol)
     graph_info = None
     if Z is None or R is None or Rlevels is None:
         _, R0, Rlevels0 = prepare_rank_likelihood_inputs(X)
@@ -347,7 +370,7 @@ def fit_copula_dde(
     diagnostics["dimension_method"] = method
     diagnostics["D"] = len(shape.K_list)
     return DDEResult(
-        model="copula",
+        model="CopDDE",
         K_list=list(diagnostics["K_list"]),
         prop=raw["prop"],
         B_list=raw["B_list"],

@@ -147,7 +147,7 @@ def test_spectral_graph_initialize_labels_columns_by_the_graph():
 def test_fit_copdde_on_a_given_graph():
     sim, G = _simulate(1500, seed=6)
     np.random.seed(6)
-    result = fit(sim["X"], method="CopDDE", G_list=[g.astype(int) for g in G],
+    result = fit(sim["X"], model="CopDDE", dimension_method="fixed", G_list=[g.astype(int) for g in G],
                  random_state=6, verbose=False, it=20, n_init=5)
     assert result.K_list == [6, 2]
     assert result.diagnostics["dimension_method"] == "fixed"

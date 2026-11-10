@@ -1126,7 +1126,7 @@ def test_public_fixed_bernoulli_matches_direct_kernel_with_provided_state():
     np.random.seed(918)
     actual = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Bernoulli",
         D=2,
         dimension_method="fixed",
@@ -1168,7 +1168,7 @@ def test_public_fixed_bernoulli_data_initialization_smoke():
     np.random.seed(920)
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="binary",
         D=2,
         dimension_method="fixed",
@@ -1216,7 +1216,7 @@ def test_public_fixed_bernoulli_supports_three_latent_layers():
     np.random.seed(926)
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Bernoulli",
         D=3,
         dimension_method="fixed",
@@ -1241,7 +1241,7 @@ def test_public_fixed_bernoulli_supports_three_latent_layers():
 def test_public_bernoulli_csp_uses_data_initialization():
     X, _, _, _ = _bernoulli_state(927)
     arguments = dict(
-        method="DDE",
+        model="DDE",
         family="Bernoulli",
         D=2,
         dimension_method="csp",
@@ -1288,7 +1288,7 @@ def test_bernoulli_conditional_scoring_and_simulation_are_stable():
 def test_public_bernoulli_rejects_nonbinary_data_and_gamma():
     X, _, _, _ = _bernoulli_state(924)
     common = dict(
-        method="DDE",
+        model="DDE",
         family="Bernoulli",
         D=2,
         dimension_method="fixed",

@@ -395,7 +395,7 @@ def plot_model_summary(
         f"{config['label']} model and selected hyperparameters",
         config["header_color"],
     )
-    paths = {"summary": _save(fig, output_dir, f"{prefix}_model_summary.png")}
+    paths = {"model_summary": _save(fig, output_dir, f"{prefix}_model_summary.png")}
     plt.close(fig)
 
     row_names = _item_labels(B_list[0].shape[0], feature_names) if B_list else []

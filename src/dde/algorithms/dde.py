@@ -463,11 +463,6 @@ def fit_parametric_dde(
             raise ValueError(
                 "G_list fixes the graph and the widths; use dimension_method='fixed'."
             )
-        if K_list is not None:
-            raise ValueError(
-                "K_list must be omitted when dimension_method='csp'; maximal "
-                "identifiable widths are derived recursively from J."
-            )
         if pen_list is not None:
             raise ValueError("pen_list is only used by dimension_method='fixed'.")
         if t_spike is None or temp is None:
@@ -475,7 +470,13 @@ def fit_parametric_dde(
                 f"{family_adapter.name} DDE with dimension_method='csp' "
                 "requires t_spike and temp."
             )
-        K_tuple = maximal_identifiable_widths(X.shape[1], D)
+        # Optional maximal widths; by default the recursive maximal
+        # identifiable widths floor(J/3), floor(K_1/3), ...
+        K_tuple = (
+            maximal_identifiable_widths(X.shape[1], D)
+            if K_list is None
+            else validate_K_list_identifiability(K_list, D=D, J=X.shape[1])
+        )
         penalties = None
 
     if graph_algorithm is None:
@@ -547,13 +548,10 @@ def fit_parametric_dde(
         raise ValueError("epsilon must lie strictly between 0 and 0.5.")
     if not np.isfinite(bound_val) or bound_val <= 0:
         raise ValueError("bound_val must be finite and positive.")
-    if C is None:
-        if not exact_em:
-            raise ValueError("C (Monte Carlo draws per sweep) is required.")
-    else:
-        C = int(C)
-        if C < 1:
-            raise ValueError("C must be a positive integer.")
+    # One latent draw per stochastic E-step is the manuscript's default.
+    C = 1 if C is None else int(C)
+    if C < 1:
+        raise ValueError("C must be a positive integer.")
     max_it = int(max_it)
     if max_it < 1:
         raise ValueError("max_it must be a positive integer.")
@@ -827,7 +825,10 @@ def fit_parametric_dde(
                 A_list=A_list,
                 transformed=X.copy(),
                 diagnostics=diagnostics,
-                raw=(X.copy(), prop, B_list, gamma, A_list, iterations),
+                raw={
+                    "X": X.copy(), "prop": prop, "B_list": B_list, "gamma": gamma,
+                    "A_list": A_list, "iterations": iterations,
+                },
             )
         fixed_trace = [] if keep_trace else None
         warm_start_diagnostics = None
@@ -920,7 +921,10 @@ def fit_parametric_dde(
             A_list=A_list,
             transformed=X_result,
             diagnostics=diagnostics,
-            raw=(X_result, prop, B_list, gamma, A_list, iterations),
+            raw={
+                "X": X_result, "prop": prop, "B_list": B_list, "gamma": gamma,
+                "A_list": A_list, "iterations": iterations,
+            },
         )
 
     # Family defaults for the copula kernel.  The Gaussian observed layer

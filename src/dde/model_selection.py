@@ -14,7 +14,7 @@ import numpy as np
 from scipy.special import gammaln
 from sklearn.model_selection import KFold
 
-from .api import fit
+from .api import ITERATION_LIMIT_NAMES, MODEL_NAMES, fit
 from .algorithms.normal_init_semi import Normal_init_semi, rank_gaussianize_columns
 from .results import DDEResult
 from .utils import validate_K_list_identifiability
@@ -47,15 +47,36 @@ class CVSelectionResult:
     fold_scores: List[List[float]]
 
 
+def _normalize_iteration_limit(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Store any iteration-limit spelling under the manuscript's ``max_it``."""
+    present = [(name, params.pop(name)) for name in ITERATION_LIMIT_NAMES if name in params]
+    values = {int(value) for _, value in present if value is not None}
+    if len(values) > 1:
+        names = ", ".join(name for name, _ in present)
+        raise ValueError(f"Conflicting iteration limits: {names}.")
+    if values:
+        params["max_it"] = values.pop()
+    return params
+
+
 def _copy_candidate(candidate: Mapping[str, Any]) -> Dict[str, Any]:
     copied = dict(candidate)
     if "K_list" in copied and copied["K_list"] is not None:
         copied["K_list"] = [int(k) for k in copied["K_list"]]
-    if "pen_list" in copied and copied["pen_list"] is not None:
-        copied["pen_list"] = list(copied["pen_list"])
-    if "t_spike" in copied and copied["t_spike"] is not None:
-        copied["t_spike"] = list(copied["t_spike"])
-    return copied
+    for key in ("pen_list", "t_spike"):
+        # A scalar stands for the same value in every layer (broadcast once D
+        # is known, see _broadcast_layer_values).
+        if copied.get(key) is not None and not np.isscalar(copied[key]):
+            copied[key] = list(copied[key])
+    return _normalize_iteration_limit(copied)
+
+
+def _broadcast_layer_values(params: Dict[str, Any], D: int) -> Dict[str, Any]:
+    """Expand scalar ``pen_list`` and ``t_spike`` values to length-``D`` lists."""
+    for key in ("pen_list", "t_spike"):
+        if params.get(key) is not None and np.isscalar(params[key]):
+            params[key] = [float(params[key])] * int(D)
+    return params
 
 
 def _split_fit_kwargs(candidate: Mapping[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -65,14 +86,6 @@ def _split_fit_kwargs(candidate: Mapping[str, Any]) -> tuple[Dict[str, Any], Dic
         if key in fit_kwargs:
             meta[key] = fit_kwargs.pop(key)
     return fit_kwargs, meta
-
-
-def _with_iteration_alias(hp: Dict[str, Any], chosen: str, *explicit: Mapping[str, Any]) -> Dict[str, Any]:
-    if "max_iter" in hp:
-        legacy = {"dde": "max_it", "semi": "max_inner_iter", "copula": "it"}[chosen]
-        if not any(legacy in source for source in explicit):
-            hp.pop(legacy, None)
-    return hp
 
 
 def _as_candidate_list(candidates: Optional[Iterable[Mapping[str, Any]]]) -> List[Dict[str, Any]]:
@@ -87,7 +100,19 @@ def _as_candidate_list(candidates: Optional[Iterable[Mapping[str, Any]]]) -> Lis
                 axes[key] = [list(v) for v in product(*value["per_layer"])]
             elif isinstance(value, Mapping):
                 raise ValueError(f"Candidate axis {key!r} must use a 'per_layer' mapping.")
-            elif key in {"K_list", "pen_list", "t_spike"}:
+            elif key in {"pen_list", "t_spike"}:
+                # Manuscript Section 5.2: a flat list holds one candidate per
+                # value, each used in every layer; nested lists are explicit
+                # layer vectors.
+                if isinstance(value, (list, tuple, np.ndarray)):
+                    values = list(value)
+                    if values and isinstance(values[0], (list, tuple, np.ndarray)):
+                        axes[key] = [list(v) for v in values]
+                    else:
+                        axes[key] = values
+                else:
+                    axes[key] = [value]
+            elif key == "K_list":
                 if isinstance(value, (list, tuple, np.ndarray)) and len(value) and isinstance(value[0], (list, tuple, np.ndarray)):
                     axes[key] = [list(v) for v in value]
                 else:
@@ -189,7 +214,7 @@ def _resolve_semidde_defaults(
     defaults: Dict[str, Any] = {
         "C": 1,
         "max_outer_iter": 10,
-        "max_inner_iter": 50,
+        "max_it": 50,
         "max_enum_bits": 12,
         "mc_samples": 50_000,
         "g_update_rho": 1.0,
@@ -254,7 +279,7 @@ def _resolve_dde_defaults(
 def _resolve_semidde_csp_defaults(Y: np.ndarray, D: int) -> tuple[Dict[str, Any], Dict[str, Any]]:
     return {
         # The copula CSP path updates g after every iteration (no outer loop).
-        "C": 1, "max_inner_iter": 50,
+        "C": 1, "max_it": 50,
         "max_enum_bits": 12, "mc_samples": 50_000,
         "initialize": "data", "verbose": False, "tol": 0.005,
         "tau": 0.3, "temp": 0.7 if D <= 2 else 0.9,
@@ -266,19 +291,21 @@ def _resolve_copula_defaults(
     D: int,
     fixed_hp: Mapping[str, Any],
     *,
+    dimension_method: str,
     estimate_K: bool = True,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     N = Y.shape[0]
     defaults: Dict[str, Any] = {
         "C": 1,
-        "it": 50,
-        "tol": 1e-3,
+        "max_it": 50,
         "temp": 0.7 if int(D) <= 2 else 0.9,
         "tau": copula_tau_default(N),
-        "pen_list": [float(N ** (2 / 8))] * int(D),
         "initialize": "data",
         "verbose": False,
     }
+    if dimension_method == "fixed":
+        defaults["tol"] = 1e-3
+        defaults["pen_list"] = [float(N ** (2 / 8))] * int(D)
     diagnostics: Dict[str, Any] = {}
     if "K_list" in fixed_hp:
         defaults["K_list"] = list(validate_K_list_identifiability(fixed_hp["K_list"], D=D, J=Y.shape[1]))
@@ -295,7 +322,6 @@ def _with_copula_method_defaults(hp: Mapping[str, Any], D: int) -> Dict[str, Any
     method = str(hp_out.get("dimension_method", "csp")).lower()
     if method == "csp":
         hp_out.pop("pen_list", None)
-        hp_out.pop("tol", None)
         if "t_spike" not in hp_out:
             hp_out["t_spike"] = _default_csp_t_spike_base(D, _default_csp_t_spike_values(D))
     elif method == "fixed":
@@ -303,9 +329,12 @@ def _with_copula_method_defaults(hp: Mapping[str, Any], D: int) -> Dict[str, Any
     return hp_out
 
 
-def _resolve_dimension_method(model: str, dimension_method: Optional[str]) -> str:
-    default = "csp" if model == "copula" else "fixed"
-    method = default if dimension_method is None else str(dimension_method).lower()
+def _resolve_dimension_method(model: str, dimension_method: Optional[str], *, has_graph: bool = False) -> str:
+    if dimension_method is None:
+        from .api import _default_dimension_method
+
+        return _default_dimension_method(model, has_graph, stacklevel=4)
+    method = str(dimension_method).lower()
     if method not in {"fixed", "csp"}:
         raise ValueError("dimension_method must be 'fixed' or 'csp'.")
     return method
@@ -465,7 +494,6 @@ def _select_copula_pmse(
         hp.update(base)
         hp.update(fixed)
         hp.update(fit_candidate)
-        hp = _with_iteration_alias(hp, "copula", base, fixed, fit_candidate)
         if random_state is not None:
             hp.setdefault("random_state", random_state)
         hp["dimension_method"] = dimension_method
@@ -565,13 +593,56 @@ def _select_copula_pmse(
     }
     diagnostics["copula_grid_strategy"] = "full"
     if not refit:
-        return DDEResult(model="copula", diagnostics=diagnostics)
+        return _record_selection(
+            DDEResult(model=MODEL_NAMES["copula"], diagnostics=diagnostics),
+            dimension_method=dimension_method, criterion="pmse", selection=selection,
+        )
     final = best_result
     if final is None:
         raise RuntimeError("No CopDDE pMSE candidate was fitted.")
     final.diagnostics = dict(final.diagnostics)
     final.diagnostics.update(diagnostics)
-    return final
+    return _record_selection(
+        final, dimension_method=dimension_method, criterion="pmse", selection=selection,
+    )
+
+
+def _record_selection(
+    result: DDEResult,
+    *,
+    dimension_method: str,
+    criterion: str,
+    selection: CVSelectionResult,
+) -> DDEResult:
+    """Record the selected configuration in ``result.raw`` (manuscript Section 5.3)."""
+    if isinstance(result.raw, Mapping):
+        raw = dict(result.raw)
+    else:
+        raw = {} if result.raw is None else {"kernel_output": result.raw}
+    raw.update(
+        selection_method=dimension_method,
+        selection_criterion=criterion,
+        selected_hyperparameters=dict(selection.best_candidate),
+        selected_index=int(selection.best_index),
+    )
+    result.raw = raw
+    return result
+
+
+def _semi_initial_state(
+    Y: np.ndarray,
+    kwargs: Mapping[str, Any],
+    init_factory: Optional[InitFactory],
+) -> Dict[str, Any]:
+    """Initial state that fixed-width SemiDDE candidate fits share.
+
+    With a ``G_list`` the fit's own graph-anchored initialization is used
+    unless a custom ``init_factory`` is given.
+    """
+    if init_factory is None and kwargs.get("G_list") is not None:
+        return {}
+    factory = init_factory or _semi_data_init
+    return factory(Y, kwargs["K_list"], {"epsilon": kwargs.get("epsilon", 1e-4)})
 
 
 def _candidate_global_seed(random_state: int, c_idx: int) -> int:
@@ -623,7 +694,6 @@ def _evaluate_candidate(context: Mapping[str, Any], c_idx: int, candidate: Mappi
     hp.update(base)
     hp.update(fixed)
     hp.update(fit_candidate)
-    hp = _with_iteration_alias(hp, chosen, base, fixed, fit_candidate)
     if random_state is not None and (chosen == "copula" or method == "csp"):
         hp.setdefault("random_state", random_state)
     hp["dimension_method"] = method
@@ -631,9 +701,12 @@ def _evaluate_candidate(context: Mapping[str, Any], c_idx: int, candidate: Mappi
         hp = _with_copula_method_defaults(hp, D)
     K_list = hp.get("K_list")
     if chosen != "copula" and method == "csp":
-        if K_list is not None:
-            raise ValueError("K_list must be omitted for DDE and SemiDDE CSP fits.")
-        K_list = estimate_K_list_copula(Y, D)
+        if K_list is None:
+            # the maximal identifiable widths the CSP fit starts from
+            K_list = estimate_K_list_copula(Y, D)
+        else:
+            K_list = list(validate_K_list_identifiability(K_list, D=D, J=Y.shape[1]))
+            hp["K_list"] = K_list
     else:
         if K_list is None:
             raise ValueError("Each candidate, fixed_hp, or base_fit_kwargs must provide K_list.")
@@ -647,12 +720,11 @@ def _evaluate_candidate(context: Mapping[str, Any], c_idx: int, candidate: Mappi
         full_kwargs = dict(hp)
         init_seconds = 0.0
         if chosen == "semi" and method == "fixed":
-            factory = init_factory or _semi_data_init
             init_started = time.perf_counter()
-            full_kwargs.update(factory(Y, full_kwargs["K_list"], {"epsilon": full_kwargs.get("epsilon", 1e-4)}))
+            full_kwargs.update(_semi_initial_state(Y, full_kwargs, init_factory))
             init_seconds = time.perf_counter() - init_started
         fit_started = time.perf_counter()
-        full_result = fit(Y, method=chosen, D=D, family=family, **full_kwargs)
+        full_result = fit(Y, model=chosen, D=D, family=family, **full_kwargs)
         fit_seconds = time.perf_counter() - fit_started
         score_started = time.perf_counter()
         avg_ll = float(score_fn(Y, full_result))
@@ -690,12 +762,11 @@ def _evaluate_candidate(context: Mapping[str, Any], c_idx: int, candidate: Mappi
             kwargs = dict(hp)
             init_seconds = 0.0
             if chosen == "semi" and method == "fixed":
-                factory = init_factory or _semi_data_init
                 init_started = time.perf_counter()
-                kwargs.update(factory(train_Y, kwargs["K_list"], {"epsilon": kwargs.get("epsilon", 1e-4)}))
+                kwargs.update(_semi_initial_state(train_Y, kwargs, init_factory))
                 init_seconds = time.perf_counter() - init_started
             fit_started = time.perf_counter()
-            fitted = fit(train_Y, method=chosen, D=D, family=family, **kwargs)
+            fitted = fit(train_Y, model=chosen, D=D, family=family, **kwargs)
             fit_seconds = time.perf_counter() - fit_started
             score_started = time.perf_counter()
             avg_ll = float(score_fn(holdout_Y, fitted))
@@ -734,6 +805,9 @@ def _evaluate_candidate(context: Mapping[str, Any], c_idx: int, candidate: Mappi
         "mean_score": float(np.mean(scores)),
         "std_score": float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0,
     }
+    if criterion == "ebic":
+        # Standard EBIC (smaller is better): -2 loglik + df log N + 2 gamma log C.
+        row["ebic"] = float(-2.0 * Y.shape[0] * row["mean_score"])
     if full_result is not None and full_result.K_list is not None:
         # Fitted widths of the full-data candidate fit (CSP diagnostics).
         row["fitted_K"] = [int(value) for value in full_result.K_list]
@@ -756,14 +830,14 @@ def select_hyperparameters(
     Y,
     *,
     D: int,
-    method: Optional[str] = None,
     model: Optional[str] = None,
     family: Optional[str] = None,
-    variable_types: Optional[Sequence[str]] = None,
     dimension_method: Optional[str] = None,
     candidates: Optional[Iterable[Mapping[str, Any]]] = None,
+    criterion: Optional[str] = None,
+    method: Optional[str] = None,
+    variable_types: Optional[Sequence[str]] = None,
     fixed_hp: Optional[Mapping[str, Any]] = None,
-    criterion: str = "bic",
     n_splits: int = 5,
     random_state: Optional[int] = None,
     base_fit_kwargs: Optional[Mapping[str, Any]] = None,
@@ -772,24 +846,51 @@ def select_hyperparameters(
     scorer: Optional[Callable[[np.ndarray, DDEResult], float]] = None,
     ebic_gamma: float = 1.0,
     k_estimator_kwargs: Optional[Mapping[str, Any]] = None,
-    n_repeats: int = 10,
+    n_repeats: int = 25,
     pmse_n_estimators: int = 100,
     n_jobs: int = 1,
+    **fit_kwargs: Any,
 ) -> DDEResult:
     """Evaluate every candidate and select the best DDE-family configuration.
 
-    ``candidates`` may be explicit rows or a mapping of candidate axes. For
-    layer-specific vectors, use ``{"pen_list": {"per_layer": [[...], ...]}}``
-    or the same form with ``t_spike``. Every Cartesian combination is fitted.
-    Candidate values override ``fixed_hp``, then ``base_fit_kwargs`` and defaults.
+    The interface follows Section 5.2 of the package manuscript: ``model``,
+    ``family``, ``D`` and ``dimension_method`` choose the fit as in
+    :func:`dde.fit`; ``candidates`` is the tuning grid; every other keyword
+    (``K_list``, ``G_list``, ``C``, ``tol``, ``max_it``, ...) is passed to
+    :func:`dde.fit` unchanged for every candidate.
 
-    ``n_jobs > 1`` evaluates the candidates in that many worker processes
-    (spawned; the BIC/EBIC/log-likelihood paths and the CopDDE PMSE path).
-    A custom ``scorer`` or ``init_factory`` must then be picklable (a
-    module-level function).  With a ``random_state``, the global NumPy
-    generator is seeded per candidate from (``random_state``, candidate
-    index) before its fits, so the results do not depend on the evaluation
-    order and are identical for every ``n_jobs``.
+    ``candidates`` maps each tuned argument to its candidate values, e.g.
+    ``{"pen_list": [.1, .05], "tau": [.1, .3]}`` for fixed widths or
+    ``{"t_spike": [.1, .05], "tau": [.2], "temp": [.7, .9]}`` for CSP; every
+    Cartesian combination is fitted.  A flat list of ``pen_list`` or
+    ``t_spike`` values holds one candidate per value, used in every layer;
+    nested lists (``[[.02, .06], [.04, .08]]``) or
+    ``{"per_layer": [[...], ...]}`` give layer-specific vectors.  A list of
+    explicit candidate rows is also accepted.
+
+    ``criterion`` defaults to ``"ebic"`` for the DDE and SemiDDE (the
+    candidate with the smallest EBIC, reported in the ``"ebic"`` column of
+    ``diagnostics["cv_table"]``, is returned) and to ``"pmse"`` for the
+    CopDDE (the smallest mean propensity-score MSE over ``n_repeats``
+    synthetic data sets, each scored by ``n_splits``-fold cross-validated
+    random forests).  ``"bic"`` and ``"loglik"`` select by ``n_splits``-fold
+    cross-validated likelihood instead.
+
+    The selected fit is returned (refitted to the full data when the
+    criterion is cross-validated).  ``raw["selection_method"]`` holds the
+    ``dimension_method``, ``raw["selected_hyperparameters"]`` the selected
+    candidate, and ``diagnostics["hyperparameter_selection"]`` and
+    ``diagnostics["cv_table"]`` the full search.
+
+    Advanced arguments: ``fixed_hp`` and ``base_fit_kwargs`` are older ways
+    to pass fixed ``fit`` arguments (a direct keyword may not repeat a
+    ``fixed_hp`` entry); candidate values override them.  ``n_jobs > 1``
+    evaluates the candidates in that many worker processes (spawned); a
+    custom ``scorer`` or ``init_factory`` must then be picklable.  With a
+    ``random_state``, the global NumPy generator is seeded per candidate
+    from (``random_state``, candidate index) before its fits, so the results
+    do not depend on the evaluation order and are identical for every
+    ``n_jobs``.  ``method`` is the deprecated spelling of ``model``.
     """
     Y = np.asarray(Y)
     if Y.ndim != 2 or min(Y.shape) < 1:
@@ -801,38 +902,43 @@ def select_hyperparameters(
         raise ValueError("D must be positive.")
     if int(n_jobs) < 1:
         raise ValueError("n_jobs must be positive.")
-    from .api import _canonical_method, _infer_model
+    from .api import _infer_model, _resolve_model
     if method is None and model is None:
-        raise ValueError("method or model is required.")
-    chosen = _canonical_method(method if method is not None else model)
-    if model is not None and method is not None and chosen != _canonical_method(model):
-        raise ValueError("method and model specify different DDE formulations.")
+        raise ValueError("model is required.")
+    chosen = _resolve_model(model, method)
     if chosen == "auto":
         chosen = _infer_model(Y, variable_types)
     if chosen == "dde":
         if family is None:
-            raise ValueError("family is required when method='DDE'.")
+            raise ValueError("family is required when model='DDE'.")
         from .algorithms.parametric_families import resolve_parametric_family
         family = resolve_parametric_family(family).name
     elif family is not None:
-        raise ValueError("family is only used with method='DDE'.")
+        raise ValueError("family is only used with model='DDE'.")
+    if criterion is None:
+        criterion = "pmse" if chosen == "copula" else "ebic"
     criterion = criterion.lower()
     if criterion not in {"bic", "ebic", "loglik", "pmse"}:
         raise ValueError("criterion must be 'bic', 'ebic', 'loglik', or 'pmse'.")
     if criterion == "pmse" and chosen != "copula":
-        raise ValueError("criterion='pmse' is only available for method='CopDDE'.")
-    method = _resolve_dimension_method(chosen, dimension_method)
+        raise ValueError("criterion='pmse' is only available for model='CopDDE'.")
 
     if criterion != "ebic" and n_splits < 2:
         raise ValueError("n_splits must be at least 2.")
 
     fixed = _copy_candidate(fixed_hp or {})
-    base = dict(base_fit_kwargs or {})
+    for key, value in _copy_candidate(fit_kwargs).items():
+        if key in fixed:
+            raise ValueError(f"{key!r} is given both as an argument and in fixed_hp.")
+        fixed[key] = value
+    fixed = _broadcast_layer_values(fixed, D)
+    base = _broadcast_layer_values(_normalize_iteration_limit(dict(base_fit_kwargs or {})), D)
+    method = _resolve_dimension_method(
+        chosen, dimension_method,
+        has_graph=fixed.get("G_list") is not None or base.get("G_list") is not None,
+    )
     candidate_list = None if candidates is None else _as_candidate_list(candidates)
     _reject_embedded_dimension_method(candidates=candidate_list, fixed_hp=fixed, base_fit_kwargs=base)
-    if method == "csp" and ("K_list" in fixed or "K_list" in base):
-        if chosen != "copula":
-            raise ValueError("K_list must be omitted for DDE and SemiDDE CSP fits.")
     if candidates is None:
         if method == "fixed" and chosen in {"semi", "dde"}:
             candidates = auto_grid(Y.shape[0], D)
@@ -848,6 +954,7 @@ def select_hyperparameters(
                 temp_values=None if chosen == "copula" else [0.7, 0.9],
             )
         candidate_list = _as_candidate_list(candidates)
+    candidate_list = [_broadcast_layer_values(candidate, D) for candidate in candidate_list]
     if chosen == "copula":
         _validate_copula_path_hyperparameters(
             dimension_method=method,
@@ -856,10 +963,7 @@ def select_hyperparameters(
             base_fit_kwargs=base,
         )
     elif method == "csp":
-        for candidate in candidate_list:
-            if "pen_list" in candidate or "K_list" in candidate:
-                raise ValueError("pen_list and K_list are only valid for fixed-width DDE and SemiDDE.")
-        if "pen_list" in fixed or "pen_list" in base:
+        if any("pen_list" in c for c in [fixed, base, *candidate_list]):
             raise ValueError("pen_list is only valid for fixed-width DDE and SemiDDE.")
     elif any("t_spike" in c or "temp" in c for c in [fixed, base, *candidate_list]):
         raise ValueError("t_spike and temp are only valid for CSP DDE and SemiDDE.")
@@ -885,6 +989,7 @@ def select_hyperparameters(
             Y,
             D,
             known_hp,
+            dimension_method=method,
             estimate_K=not candidate_has_all_K,
         )
         if criterion == "pmse":
@@ -951,10 +1056,11 @@ def select_hyperparameters(
         cv_table=cv_table,
         fold_scores=fold_scores,
     )
+    record = partial(_record_selection, dimension_method=method, criterion=criterion, selection=selection)
 
     if not refit:
-        return DDEResult(
-            model=chosen,
+        return record(DDEResult(
+            model=MODEL_NAMES[chosen],
             diagnostics={
                 "hyperparameter_selection": selection,
                 "cv_table": cv_table,
@@ -962,7 +1068,7 @@ def select_hyperparameters(
                 "timing_table": timing_rows,
                 **setup_diagnostics,
             },
-        )
+        ))
 
     if criterion == "ebic" and best_full_result is not None:
         final = best_full_result
@@ -976,32 +1082,28 @@ def select_hyperparameters(
                 **setup_diagnostics,
             }
         )
-        return final
+        return record(final)
 
     final_kwargs = dict(defaults)
     final_kwargs.update(base)
     final_kwargs.update(fixed)
     final_fit_candidate, _ = _split_fit_kwargs(best_candidate)
     final_kwargs.update(final_fit_candidate)
-    final_kwargs = _with_iteration_alias(final_kwargs, chosen, base, fixed, final_fit_candidate)
     if random_state is not None and (chosen == "copula" or method == "csp"):
         final_kwargs.setdefault("random_state", random_state)
     if chosen == "semi" and method == "fixed" and "tol" not in final_fit_candidate and "tol" not in fixed and "tol" not in base:
         final_kwargs["tol"] = float(final_kwargs["K_list"][-1]) / 2.0
+    final_kwargs["dimension_method"] = method
     if chosen == "copula":
-        final_kwargs["dimension_method"] = method
         final_kwargs = _with_copula_method_defaults(final_kwargs, D)
-    else:
-        final_kwargs["dimension_method"] = method
     if chosen == "semi" and method == "fixed":
-        factory = init_factory or _semi_data_init
-        final_kwargs.update(factory(Y, final_kwargs["K_list"], {"epsilon": final_kwargs.get("epsilon", 1e-4)}))
+        final_kwargs.update(_semi_initial_state(Y, final_kwargs, init_factory))
     if random_state is not None:
         # the refit draws from the global generator like the candidate fits;
         # it uses the selected candidate's seed, whatever ran before it
         np.random.seed(_candidate_global_seed(random_state, best_index))
     refit_started = time.perf_counter()
-    final = fit(Y, method=chosen, D=D, family=family, **final_kwargs)
+    final = fit(Y, model=chosen, D=D, family=family, **final_kwargs)
     refit_seconds = time.perf_counter() - refit_started
     final.diagnostics = dict(final.diagnostics)
     final.diagnostics.update(
@@ -1014,7 +1116,7 @@ def select_hyperparameters(
             **setup_diagnostics,
         }
     )
-    return final
+    return record(final)
 
 
 __all__ = [

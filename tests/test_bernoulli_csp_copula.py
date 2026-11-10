@@ -88,7 +88,7 @@ def test_bernoulli_gibbs_transition_runs():
 def test_fit_routes_bernoulli_to_copula_backend_explicitly():
     X, _ = _simulate(5)
     result = fit(
-        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
         t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=30,
         random_state=7, verbose=False, csp_backend="copula",
     )
@@ -110,17 +110,17 @@ def test_fit_routes_bernoulli_to_copula_backend_explicitly():
     assert 1 <= K1 <= 9 and 1 <= K2 <= 3
     assert result.B_list[0].shape == (27, K1 + 1)
     default = fit(
-        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
         t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
         random_state=7, verbose=False,
     )
     assert default.diagnostics["backend"] == "copula"
     with pytest.raises(ValueError, match="were removed"):
-        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
             verbose=False, csp_backend="mcem")
     with pytest.raises(TypeError, match="mcem_shrinkage_burn"):
-        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=1,
             verbose=False, mcem_shrinkage_burn=2)
 
@@ -145,7 +145,7 @@ def test_bernoulli_csp_default_shrinkage_burn(monkeypatch, max_iter, extra, expe
 
     monkeypatch.setattr(dde_module, "fit_parametric_csp_copula", spy)
     X, _ = _simulate(5, N=120)
-    fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+    fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
         t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=max_iter,
         random_state=7, verbose=False, **extra)
     assert seen["shrinkage_burn"] == expected
@@ -165,7 +165,7 @@ def test_poisson_csp_keeps_no_default_shrinkage_burn(monkeypatch):
     monkeypatch.setattr(dde_module, "fit_parametric_csp_copula", spy)
     X, _ = _simulate(5, N=120)
     counts = np.random.default_rng(0).poisson(1.0 + 2.0 * X)
-    fit(counts, method="DDE", family="Poisson", D=2, dimension_method="csp",
+    fit(counts, model="DDE", family="Poisson", D=2, dimension_method="csp",
         t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, random_state=7, verbose=False)
     assert seen["shrinkage_burn"] == 0
 
@@ -174,7 +174,7 @@ def test_bernoulli_copula_backend_rejects_standardize():
     X, _ = _simulate(6, N=120)
     with pytest.raises(ValueError, match="standardize"):
         fit(
-            X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+            X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=0.03, temp=0.9, tau=0.3, C=1, max_iter=1, verbose=False,
             csp_backend="copula", standardize=True,
         )
@@ -307,7 +307,7 @@ def test_shrinkage_burn_reordering_sorts_columns_by_strength():
 def test_fit_passes_shrinkage_burn_to_copula_backend():
     X, _ = _simulate(5, N=200)
     result = fit(
-        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
         t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_iter=6,
         random_state=7, verbose=False, csp_backend="copula",
         csp_shrinkage_burn=3, keep_trace=True,
@@ -324,7 +324,7 @@ def test_bernoulli_copula_defaults_and_explicit_burn_in_for_three_layers():
     rng = np.random.default_rng(3)
     X = rng.integers(0, 2, size=(120, 27)).astype(float)
     common = dict(
-        method="DDE", family="Bernoulli", D=3, dimension_method="csp",
+        model="DDE", family="Bernoulli", D=3, dimension_method="csp",
         t_spike=[0.01, 0.03, 0.005], temp=0.9, tau=0.3, C=1, random_state=1,
         verbose=False, csp_backend="copula", keep_trace=True,
     )
@@ -454,7 +454,7 @@ def test_bic_prune_removes_a_spurious_top_column_and_keeps_true_ones():
 def test_fit_runs_top_prune_and_width_window_and_validates():
     X, _ = _simulate(21, N=400)
     res = fit(
-        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
         t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=15, random_state=5,
         verbose=False, csp_backend="copula", csp_top_prune="bic", csp_top_prune_after=3,
         csp_top_prune_every=2, csp_convergence_width_window=4,
@@ -463,11 +463,11 @@ def test_fit_runs_top_prune_and_width_window_and_validates():
     assert diag["top_prune"] == "bic" and diag["convergence_width_window"] == 4
     assert all(event["iteration"] >= 3 for event in diag["prune_events"])
     with pytest.raises(ValueError, match="top_prune"):
-        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=5, verbose=False,
             csp_backend="copula", csp_top_prune="aic")
     with pytest.raises(ValueError, match="convergence_width_window"):
-        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=5, verbose=False,
             csp_backend="copula", csp_convergence_width_window=-1)
 
@@ -476,7 +476,7 @@ def test_staged_shrinkage_holds_upper_layer_until_lower_width_is_stable():
     X, _ = _simulate(31, N=400)
     window = 3
     res = fit(
-        X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
         t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=25, random_state=8,
         verbose=False, csp_backend="copula", csp_staged_shrinkage_window=window,
         keep_trace=True,
@@ -493,14 +493,14 @@ def test_staged_shrinkage_holds_upper_layer_until_lower_width_is_stable():
     widths = [record["num_active"][0] for record in trace if record["iteration"] <= opened]
     assert len(set(widths[-window:])) == 1
     with pytest.raises(ValueError, match="staged_shrinkage_window"):
-        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp",
+        fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="csp",
             t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, max_it=5, verbose=False,
             csp_backend="copula", csp_staged_shrinkage_window=-2)
 
 
 def test_anchor_init_is_an_opt_in_for_the_copula_csp_only():
     X, _ = _simulate(41, N=300)
-    common = dict(method="DDE", family="Bernoulli", D=2, dimension_method="csp", t_spike=[0.03, 0.05],
+    common = dict(model="DDE", family="Bernoulli", D=2, dimension_method="csp", t_spike=[0.03, 0.05],
                   temp=0.9, tau=0.3, C=1, max_it=3, random_state=2, verbose=False)
     res = fit(X, csp_backend="copula", fixed_init_binarize="anchor_lca", **common)
     assert res.diagnostics["init_binarize"] == "anchor_lca"
@@ -541,7 +541,7 @@ def _poisson_counts(seed, N=200, J=27, K=6):
 @pytest.mark.parametrize("family", ["Bernoulli", "Poisson"])
 def test_discrete_csp_defaults_are_the_copula_engine_settings(family):
     X = _simulate(51)[0] if family == "Bernoulli" else _poisson_counts(51)
-    common = dict(method="DDE", family=family, D=2, dimension_method="csp",
+    common = dict(model="DDE", family=family, D=2, dimension_method="csp",
                   t_spike=[0.03, 0.05], temp=0.9, tau=0.3, C=1, random_state=4, verbose=False)
     default = fit(X, **common)
     d = default.diagnostics
@@ -573,7 +573,7 @@ def test_discrete_csp_defaults_are_the_copula_engine_settings(family):
 
 def test_poisson_copula_csp_runs_with_one_latent_layer():
     X = _poisson_counts(52)
-    res = fit(X, method="DDE", family="Poisson", D=1, dimension_method="csp",
+    res = fit(X, model="DDE", family="Poisson", D=1, dimension_method="csp",
               t_spike=[0.03], temp=0.9, tau=0.3, C=1, max_it=5, random_state=2, verbose=False)
     assert res.diagnostics["backend"] == "copula"  # the single (observed) layer is solved by FISTA
     assert len(res.K_list) == 1

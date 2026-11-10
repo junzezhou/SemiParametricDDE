@@ -7,6 +7,7 @@ from dde.visualization import anchor_scores, get_anchors, plot_weights
 from dde.visualization.legacy import (
     make_copula_visualization_report,
     make_semi_visualization_report,
+    plot_model_summary,
     visualization_report,
 )
 
@@ -39,7 +40,7 @@ def test_copula_visualization_smoke(tmp_path):
         latent_frame={"A1_1": [1, 0, 1, 0], "A1_2": [0, 1, 1, 0], "label": ["a", "a", "b", "b"]},
         label_col="label",
     )
-    assert "summary" in paths
+    assert "model_summary" in paths
     assert all((tmp_path / name).exists() for name in [p.split("/")[-1] for p in paths.values()])
 
 
@@ -50,7 +51,7 @@ def test_semi_visualization_smoke(tmp_path):
         latent_frame={"A1_1": [1, 0, 1, 0], "A1_2": [0, 1, 1, 0], "skill": ["n", "n", "g", "g"]},
         label_col="skill",
     )
-    assert "summary" in paths
+    assert "model_summary" in paths
     assert all((tmp_path / name).exists() for name in [p.split("/")[-1] for p in paths.values()])
 
 
@@ -60,7 +61,7 @@ def test_visualization_report_unified_entrypoint(tmp_path):
         output_dir=tmp_path,
         latent_frame={"A1_1": [1, 0, 1, 0], "A1_2": [0, 1, 1, 0]},
     )
-    assert "summary" in paths
+    assert "model_summary" in paths
     assert "latent_profiles" in paths
 
 
@@ -117,4 +118,6 @@ def test_plot_weights_returns_figures_and_saves_files(tmp_path):
 def test_legacy_names_are_reachable_with_a_deprecation_warning():
     import dde.visualization as viz
     with pytest.warns(DeprecationWarning):
-        assert viz.visualization_report is visualization_report
+        assert viz.plot_model_summary is plot_model_summary
+    # visualization_report is a primary interface (manuscript Appendix C)
+    assert "visualization_report" in viz.__all__

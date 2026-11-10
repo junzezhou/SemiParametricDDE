@@ -81,7 +81,7 @@ def test_anchor_lca_initializer_improves_deep_latent_states():
 def test_bernoulli_fixed_defaults_record_burn_in_and_anchor_lca():
     X, _, _, _ = _design((6, 2), seed=5, N=600)
     np.random.seed(5)
-    result = fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
+    result = fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
                  pen_list=[2.0, 2.0], tau=0.3, C=1, tol=0.01, max_it=14, verbose=False)
     d = result.diagnostics
     assert d["sa_burn_in"] == 10 and d["fixed_init_binarize"] == "anchor_lca"
@@ -93,24 +93,24 @@ def test_bernoulli_fixed_defaults_record_burn_in_and_anchor_lca():
 def test_bernoulli_fixed_plain_kernel_remains_available():
     X, _, _, _ = _design((6, 2), seed=6, N=400)
     np.random.seed(6)
-    result = fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
+    result = fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
                  pen_list=[2.0, 2.0], tau=0.3, C=1, tol=0.01, max_it=4, verbose=False,
                  sa_burn_in=0, fixed_init_binarize="projection")
     d = result.diagnostics
     assert d["sa_burn_in"] == 0 and d["fixed_init_binarize"] == "projection"
     with pytest.raises(ValueError):
-        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
+        fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
             pen_list=[2.0, 2.0], tau=0.3, C=1, max_it=2, verbose=False, fixed_init_binarize="anchor_mixture")
     # the CSP path never burns in or re-binarizes
     with pytest.raises(ValueError):
-        fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="csp", t_spike=[0.03, 0.05], temp=0.9,
+        fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="csp", t_spike=[0.03, 0.05], temp=0.9,
             tau=0.3, C=1, max_it=2, verbose=False, sa_burn_in=10)
 
 
 def test_bernoulli_two_layer_recovery_with_oracle_labels_under_defaults():
     X, A_true, B_true, G_true = _design((6, 2), seed=11, N=2000)
     np.random.seed(11)
-    result = fit(X, method="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
+    result = fit(X, model="DDE", family="Bernoulli", D=2, dimension_method="fixed", K_list=[6, 2],
                  pen_list=[2000 ** 0.25] * 2, tau=0.3, C=1, tol=0.005, max_it=50,
                  initialize="oracle", B_list_true=B_true, G_list_true=G_true, verbose=False)
     for B_hat, G_t in zip(result.B_list, G_true):
