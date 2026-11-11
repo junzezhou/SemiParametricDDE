@@ -20,6 +20,33 @@ from .semi_saem import get_SAEM_normal, get_SAEM_semiparametricv1
 
 
 _INIT_KEYS = ("X_in", "prop_in", "B_list_in", "gamma_in", "A_list_in")
+_PSEUDO_INITS = ("rank_normal", "rank_spectral")
+
+
+def _initial_pseudo_observations(Y, pseudo_init, random_state=None):
+    """Starting pseudo-observations ``X = g(Y)`` of a data or oracle start.
+
+    ``"rank_normal"`` (default) takes the normal scores of each column's
+    ranks.  ``"rank_spectral"`` is the rank-preserving spectral start of
+    manuscript Section 4.1 and the CopDDE kernel
+    (:func:`dde.copula.simulate_gaussian_mixture`): a two-column Gaussian
+    mixture fitted to each variable and its spectral nearest neighbour is
+    simulated, and the draws are matched to the variable's ranks.  The
+    mixture draws use ``random_state`` when given, otherwise the global NumPy
+    generator; the k-means fits always use the global generator, so
+    ``np.random.seed`` reproduces the start.
+    """
+    choice = str(pseudo_init).strip().lower()
+    if choice == "rank_normal":
+        return rank_gaussianize_columns(Y)
+    if choice == "rank_spectral":
+        from dde.copula import simulate_gaussian_mixture
+
+        Y = np.asarray(Y, dtype=float)
+        if random_state is None:
+            random_state = int(np.random.randint(0, 2**31 - 1))
+        return simulate_gaussian_mixture(Y, Y.shape[1], random_state=random_state)
+    raise ValueError(f"pseudo_init must be one of {_PSEUDO_INITS}.")
 
 
 def _initialize_semidde(Y, K_list, kwargs, *, dimension_method, support_list=None):
@@ -56,6 +83,7 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method, support_list=Non
             require_binary_A=True,
         )
         kwargs.pop("init_binarize", None)
+        kwargs.pop("pseudo_init", None)
         if verbose:
             print(
                 "SemiDDE initialization: not triggered; using supplied "
@@ -98,7 +126,9 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method, support_list=Non
         "init_binarize",
         "anchor_mixture" if dimension_method == "fixed" else "projection",
     )
-    X_init = rank_gaussianize_columns(Y)
+    X_init = _initial_pseudo_observations(
+        Y, kwargs.pop("pseudo_init", "rank_normal"), kwargs.get("random_state")
+    )
     if verbose:
         print(f"SemiDDE initialization: triggered using initialize='{mode}'.")
 
@@ -354,6 +384,10 @@ def fit_semidde(
     maximal widths ``K_list`` when given and otherwise from the recursive
     maximum identifiable widths ``floor(J/3), floor(floor(J/3)/3), ...``
     (``D`` is then required) before shrinking them.  ``C`` defaults to 1.
+    ``pseudo_init`` chooses the starting pseudo-observations of a data or
+    oracle start: ``"rank_normal"`` (default; the normal scores of each
+    column's ranks) or ``"rank_spectral"`` (the CopDDE rank-preserving
+    spectral start, see :func:`_initial_pseudo_observations`).
     CSP mode
     runs on the copula kernel by default (``csp_backend="copula"``: the
     Normal-family engine with a ``g`` step after every committed

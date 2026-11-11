@@ -219,3 +219,31 @@ def test_sparse_normal_gibbs_matches_dense_fixed_seed_sweep():
     for sparse_sample, dense_sample in zip(sparse_samples, dense_samples):
         np.testing.assert_array_equal(sparse_sample, dense_sample)
     np.testing.assert_allclose(sparse_top, dense_top, rtol=0.0, atol=1e-12)
+
+
+def test_rank_spectral_pseudo_observations_keep_the_ranks_and_follow_the_seed():
+    from dde.algorithms.semi import _initial_pseudo_observations
+
+    Y = np.exp(_design((6, 2), seed=4, N=300)[0])
+    normal = _initial_pseudo_observations(Y, "rank_normal")
+    np.testing.assert_allclose(normal, rank_gaussianize_columns(Y))
+    np.random.seed(7)
+    spectral = _initial_pseudo_observations(Y, "rank_spectral")
+    np.random.seed(7)
+    again = _initial_pseudo_observations(Y, "rank_spectral")
+    np.testing.assert_array_equal(spectral, again)
+    for j in range(Y.shape[1]):  # a monotone transform of every column
+        np.testing.assert_array_equal(np.argsort(spectral[:, j], kind="stable"),
+                                      np.argsort(Y[:, j], kind="stable"))
+    with pytest.raises(ValueError, match="pseudo_init"):
+        _initial_pseudo_observations(Y, "spectral")
+
+
+def test_fixed_semidde_accepts_the_rank_spectral_start():
+    X = _design((6, 2), seed=5, N=400)[0]
+    np.random.seed(1)
+    result = fit(np.exp(X), model="SemiDDE", D=2, K_list=[6, 2], dimension_method="fixed",
+                 pen_list=[400 ** 0.25] * 2, tau=0.3, max_it=5, pseudo_init="rank_spectral",
+                 verbose=False)
+    assert result.K_list == [6, 2]
+    assert np.all(np.isfinite(result.transformed))
