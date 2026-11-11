@@ -310,6 +310,17 @@ family.  `result.diagnostics` records `g_iterations`, `g_converged`,
 `schedule="nested", g_estimator="average", sa_burn_in=0,
 init_binarize="projection", g_tol=0.01` for the earlier kernel.
 
+The starting pseudo-observations (fixed and CSP, data or oracle start) are the
+normal scores of each column's ranks, `Phi^{-1}((r_ij - 0.5) / N)`
+standardized (`pseudo_init="rank_normal"`, the default).
+`pseudo_init="rank_spectral"` uses the CopDDE kernel's rank-preserving
+spectral start instead (`dde.copula.simulate_gaussian_mixture`; its mixture
+draws follow `random_state`, else the global NumPy generator, and its k-means
+fits the global generator, so `np.random.seed` reproduces it).  On the D=2 and D=3
+log-normal designs (N = 500-8000, `Results/paper_f9_semi_init/REPORT.md`) both
+starts give the same accuracy and the same rate in N; the spectral start takes
+1.4-5 times as long.
+
 Poisson CSP uses the same maximum-width initialization and cumulative
 shrinkage state as the other parametric families. Its observed M-step solves
 the tempered Poisson likelihood with CSP-weighted L1 penalties by bounded
