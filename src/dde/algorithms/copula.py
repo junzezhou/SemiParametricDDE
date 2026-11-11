@@ -177,8 +177,20 @@ def fit_copula_dde(
     ``n_init`` (default 20) starts.  A binary graph identifies each latent
     variable only up to its 0/1 coding, and latent variables whose graph
     columns and rows coincide only up to their order.
+
+    The kernel draws from the global NumPy generator; ``random_state``
+    seeds the start (mixture pseudo-observations, spectral or graph start)
+    and defaults to a seed drawn from the global generator, so
+    ``np.random.seed(...)`` before the call reproduces the fit.
     """
     X = np.asarray(X)
+    if random_state is None:
+        # MARK: the start (mixture Z, spectral and graph starts) used to draw
+        # from fresh OS entropy when random_state was None, so
+        # np.random.seed(...) did not reproduce a CopDDE fit although the
+        # kernel itself draws from the global generator.  Take the seed from
+        # the global generator, as the DDE and SemiDDE paths do.
+        random_state = int(np.random.randint(0, 2**31 - 1))
     verbose = bool(kwargs.get("verbose", True))
     method = ("fixed" if G_list is not None else "csp") if dimension_method is None else str(dimension_method).lower()
     support_list = None
@@ -192,8 +204,10 @@ def fit_copula_dde(
         K_list = list(K_tuple)
         n_fixed = sum(support is not None for support in support_list)
         if n_fixed == 0:
-            # Every graph allows every connection: the fit without a graph.
+            # Every graph allows every connection: the fit without a graph,
+            # with its default tolerance.
             support_list = None
+            kwargs.setdefault("tol", 0.005)
         else:
             kwargs.setdefault("C", 1)
             kwargs.setdefault("it", 50)

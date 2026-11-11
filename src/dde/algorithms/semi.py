@@ -422,6 +422,13 @@ def fit_semidde(
             raise ValueError(
                 "t_spike and temp are only used by dimension_method='csp'."
             )
+        if kwargs.get("random_state") is not None:
+            raise ValueError(
+                "random_state is used by the CSP path only; the fixed-width SAEM "
+                "draws from the global NumPy generator, so np.random.seed(...) "
+                "before fit reproduces it."
+            )
+        kwargs.pop("random_state", None)
     else:
         if D is None:
             if K_list is None:

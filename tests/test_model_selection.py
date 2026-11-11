@@ -641,3 +641,25 @@ def test_selection_rejects_nonpositive_n_jobs():
     with pytest.raises(ValueError, match="n_jobs"):
         select_hyperparameters(_small_selection_data("normal"), D=2, model="DDE", family="Normal",
                                dimension_method="csp", n_jobs=0)
+
+
+def test_semidde_candidates_start_from_the_fit_initialization():
+    from dde.algorithms.normal_init_semi import Normal_init_semi, rank_gaussianize_columns
+    from dde.model_selection import _semi_data_init
+    from dde.utils.hyperparameter_selection import COPDDE_FIXED_TEMP, default_fit_hyperparameters
+    from dde.model_selection import _resolve_copula_defaults
+
+    rng = np.random.default_rng(2)
+    A = rng.binomial(1, 0.4, size=(300, 2))
+    Y = np.exp(A @ rng.normal(2.0, 0.2, size=(2, 9)) + rng.normal(size=(300, 9)))
+    state = _semi_data_init(Y, (3, 1), {"epsilon": 1e-4})
+    X = rank_gaussianize_columns(Y)
+    _, _, _, A_anchor, _ = Normal_init_semi(X, 3, (3, 1), epsilon=1e-4, mode="data", binarize="anchor_mixture")
+    np.testing.assert_array_equal(state["X_in"], X)
+    for got, expected in zip(state["A_list_in"], A_anchor):
+        np.testing.assert_array_equal(got, expected)
+    # fixed-width CopDDE candidates use fit()'s temperature and tolerance
+    defaults, _ = _resolve_copula_defaults(Y, 2, {"K_list": [3, 1]}, dimension_method="fixed")
+    shared = default_fit_hyperparameters("copula", "fixed", 300, 2)
+    assert defaults["temp"] == COPDDE_FIXED_TEMP == shared["temp"]
+    assert defaults["tol"] == shared["tol"]

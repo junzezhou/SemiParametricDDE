@@ -100,6 +100,30 @@ def _pop_iteration_limit(kwargs: dict, max_it: Optional[int]) -> Optional[int]:
 _RECORDED_ARGUMENTS = ("pen_list", "tau", "t_spike", "temp", "C", "tol")
 
 
+def _fill_default_hyperparameters(kwargs, *, chosen, dimension, N, D, K_list, has_graph):
+    """Fill the hyperparameters that were not given; return their names.
+
+    The values are :func:`dde.utils.hyperparameter_selection.default_fit_hyperparameters`.
+    A CopDDE fit on a restricting ``G_list`` keeps its own ``tol=0`` and
+    ``temp=1`` defaults (the MATLAB ``get_SAEM_RL_G.m`` setting).
+    """
+    from .utils.hyperparameter_selection import default_fit_hyperparameters
+
+    depth = D if D is not None else (len(K_list) if K_list is not None else None)
+    if depth is None:
+        return []  # the model reports the missing depth itself
+    defaults = default_fit_hyperparameters(chosen, dimension, N, int(depth))
+    if chosen == "copula" and has_graph:
+        defaults.pop("tol", None)
+        defaults.pop("temp", None)
+    filled = []
+    for name, value in defaults.items():
+        if kwargs.get(name) is None:
+            kwargs[name] = value
+            filled.append(name)
+    return sorted(filled)
+
+
 def _record_active_structure(result: DDEResult) -> DDEResult:
     """Add the active latent columns and edges of every layer to the diagnostics."""
     if result.B_list:
@@ -180,6 +204,17 @@ def fit(
           layers only.  See :func:`dde.algorithms.dde.fit_parametric_dde` and
           :func:`dde.algorithms.copula.fit_copula_dde`.
 
+        ``pen_list``, ``tau``, ``t_spike``, ``temp`` and the fixed-width
+        CopDDE ``tol`` default to
+        :func:`dde.utils.hyperparameter_selection.default_fit_hyperparameters`
+        (``pen_list = N**(1/4)``, ``tau = 0.3`` or the CopDDE
+        ``max(0.3, 3 N**-0.3)``, the default CSP ``t_spike`` and
+        ``temp = 0.7`` for ``D <= 2``, else 0.9).
+
+        Every fit draws from NumPy's global generator: ``np.random.seed``
+        before the call reproduces it.  CSP and CopDDE fits also accept
+        ``random_state``, which seeds their start only.
+
     Returns
     -------
     DDEResult
@@ -193,9 +228,6 @@ def fit(
         (``pen_list``, ``tau``, ``t_spike``, ``temp``, ``C``, ``tol``).
     """
     column_names = data_column_names(Y)
-    fit_arguments = {
-        name: kwargs[name] for name in _RECORDED_ARGUMENTS if kwargs.get(name) is not None
-    }
     Y = np.asarray(Y)
     chosen = _resolve_model(model, method)
     if chosen == "auto":
@@ -217,6 +249,14 @@ def fit(
 
     if D is None and has_graph:
         D = len(K_list) if K_list is not None else len(kwargs["G_list"])
+
+    defaulted = _fill_default_hyperparameters(
+        kwargs, chosen=chosen, dimension=dimension, N=Y.shape[0], D=D, K_list=K_list,
+        has_graph=has_graph,
+    )
+    fit_arguments = {
+        name: kwargs[name] for name in _RECORDED_ARGUMENTS if kwargs.get(name) is not None
+    }
 
     if chosen == "dde":
         from .algorithms.dde import fit_parametric_dde
@@ -259,4 +299,5 @@ def fit(
         raise RuntimeError(f"Unhandled DDE model: {chosen}.")
     result = record_column_names(_record_active_structure(result), column_names)
     result.diagnostics.setdefault("fit_arguments", fit_arguments)
+    result.diagnostics.setdefault("default_arguments", defaulted)
     return result
