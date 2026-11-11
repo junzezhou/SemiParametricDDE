@@ -450,3 +450,18 @@ def test_np_random_seed_reproduces_copdde_and_fixed_paths_reject_random_state():
         with pytest.raises(ValueError, match="np.random.seed"):
             fit(np.exp(rng.normal(size=(150, 12))), model=model, family="Normal", D=2,
                 dimension_method="fixed", K_list=[4, 1], random_state=3, verbose=False)
+
+
+@pytest.mark.parametrize("model, extra", [("DDE", {"family": "Normal"}), ("SemiDDE", {}), ("CopDDE", {})])
+def test_scalar_pen_list_is_used_in_every_layer(model, extra):
+    """Manuscript Section 5.1 passes one ``pen``: a scalar penalty is broadcast
+    to every layer and gives the fit of the equivalent list."""
+    Y = np.random.default_rng(0).normal(size=(150, 18))
+    fits = []
+    for pen in (1.0, [1.0, 1.0]):
+        np.random.seed(0)
+        fits.append(fit(Y, model=model, D=2, dimension_method="fixed", K_list=[6, 2], pen_list=pen,
+                        max_it=2, verbose=False, **extra))
+    assert fits[0].diagnostics["fit_arguments"]["pen_list"] == [1.0, 1.0]
+    for B_scalar, B_list in zip(fits[0].B_list, fits[1].B_list):
+        np.testing.assert_array_equal(B_scalar, B_list)

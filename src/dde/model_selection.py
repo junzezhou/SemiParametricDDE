@@ -537,6 +537,11 @@ def _select_copula_pmse(
                 "cached_total_seconds": float(original_timing["total_seconds"]),
             }
             return None, mean_score, list(scores), timing, True
+        if random_state is not None:
+            # MARK: the CopDDE kernel draws from the global NumPy generator;
+            # seed it per candidate as the EBIC path does, so random_state
+            # reproduces the selection whatever ran before the call.
+            np.random.seed(_candidate_global_seed(random_state, idx))
         result, mean_score, scores, timing = _fit_copula_pmse_candidate(
             Y,
             hp,
@@ -891,7 +896,9 @@ def select_hyperparameters(
     to pass fixed ``fit`` arguments (a direct keyword may not repeat a
     ``fixed_hp`` entry); candidate values override them.  ``n_jobs > 1``
     evaluates the candidates in that many worker processes (spawned); a
-    custom ``scorer`` or ``init_factory`` must then be picklable.  With a
+    custom ``scorer`` or ``init_factory`` must then be picklable.  The CopDDE
+    pMSE path fits the candidates in turn and uses ``n_jobs`` for the
+    random-forest repeats of each pMSE score instead.  With a
     ``random_state``, the global NumPy generator is seeded per candidate
     from (``random_state``, candidate index) before its fits, so the results
     do not depend on the evaluation order and are identical for every
@@ -999,7 +1006,7 @@ def select_hyperparameters(
             estimate_K=not candidate_has_all_K,
         )
         if criterion == "pmse":
-            return _select_copula_pmse(
+            return record_column_names(_select_copula_pmse(
                 Y,
                 D=D,
                 candidates=candidate_list,
@@ -1015,7 +1022,7 @@ def select_hyperparameters(
                 pmse_n_estimators=pmse_n_estimators,
                 n_splits=n_splits,
                 n_jobs=n_jobs,
-            )
+            ), column_names)
     folds = (
         [] if criterion == "ebic" else
         list(KFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(Y))

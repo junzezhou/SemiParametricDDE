@@ -116,7 +116,19 @@ def _as_cv_table(result: DDEResult, cv_table=None):
 def _best_row_from_cv(cv):
     if cv is None or cv.empty or "mean_score" not in cv:
         return {}
+    # mean_score is on the maximization scale for every criterion (minus
+    # EBIC / 2N, minus pMSE), so its maximum is the selected candidate.
     return cv.loc[cv["mean_score"].astype(float).idxmax()].to_dict()
+
+
+def _selection_score_row(best: Mapping[str, Any]) -> tuple[str, str]:
+    """The selected candidate's value of the criterion it was selected by."""
+    criterion = str(best.get("criterion", "")).lower()
+    if criterion == "ebic" and "ebic" in best:
+        return "best EBIC (smaller is better)", _format_value(best["ebic"])
+    if criterion == "pmse" and "mean_pmse" in best:
+        return "best pMSE (smaller is better)", _format_value(best["mean_pmse"])
+    return "best score", _format_value(best.get("mean_score", "not available"))
 
 
 def _format_value(value: Any) -> str:
@@ -403,7 +415,7 @@ def _summary_rows(result: DDEResult, model_key: str, best: Mapping[str, Any], B_
         ("observed variables", str(B_list[0].shape[0]) if B_list else "not available"),
         ("iterations", _format_value(result.diagnostics.get("iterations", "not available"))),
         ("criterion", _format_value(best.get("criterion", "not available"))),
-        ("best score", _format_value(best.get("mean_score", "not available"))),
+        _selection_score_row(best),
         ("tau", _format_value(best.get("tau", "not available"))),
     ]
     if model_key == "dde":

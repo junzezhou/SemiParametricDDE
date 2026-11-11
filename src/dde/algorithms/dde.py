@@ -61,8 +61,10 @@ def _validate_pen_list(pen_list: Sequence[float], D: int) -> list[float]:
         values = np.asarray(pen_list, dtype=float)
     except (TypeError, ValueError) as exc:
         raise ValueError("pen_list must be a length-D numeric sequence.") from exc
+    if values.ndim == 0:
+        values = np.repeat(values, D)  # a scalar is used in every layer
     if values.ndim != 1:
-        raise ValueError("pen_list must be a one-dimensional length-D sequence.")
+        raise ValueError("pen_list must be a scalar or a one-dimensional length-D sequence.")
     penalties = values.tolist()
     if len(penalties) != D:
         raise ValueError(f"pen_list must have length D={D}; got {len(penalties)}.")

@@ -60,7 +60,12 @@ Every fit draws from NumPy's global generator, so `np.random.seed(...)` before
 `fit` (or `select_hyperparameters`) reproduces it.  CSP and CopDDE fits also
 take `random_state`, which seeds their start; it does not replace
 `np.random.seed`.  The fixed-width DDE and SemiDDE paths reject
-`random_state`.
+`random_state`.  `select_hyperparameters(..., random_state=...)` seeds the
+global generator for every candidate, so it is reproducible on its own.
+Bit-for-bit agreement across processes also needs single-threaded linear
+algebra (`OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`,
+`VECLIB_MAXIMUM_THREADS=1`); with threaded libraries a CopDDE CSP fit varies
+in about the ninth digit between runs.
 
 `method=` (the former name of `model`) still works with a
 `DeprecationWarning`, and the kernel spellings `max_iter`, `it` and

@@ -222,3 +222,13 @@ def test_fit_records_data_frame_column_names():
     assert result.diagnostics["variable_names"] == list(Y.columns)
     anchors = get_anchors(result, n_anchors=1, variable_names={"BIGFIVE_1": "Name"})
     assert set(anchors["variable"]) <= set(["Name"] + list(Y.columns[1:]))
+
+
+def test_model_summary_reports_the_selection_criterion_on_its_own_scale():
+    from dde.visualization.report import _selection_score_row
+
+    label, value = _selection_score_row({"criterion": "ebic", "ebic": 81.2, "mean_score": -0.0812})
+    assert label.startswith("best EBIC") and value == "81.2"
+    label, value = _selection_score_row({"criterion": "pmse", "mean_pmse": 0.0134, "mean_score": -0.0134})
+    assert label.startswith("best pMSE") and value == "0.0134"
+    assert _selection_score_row({"criterion": "bic", "mean_score": -3.5})[0] == "best score"
