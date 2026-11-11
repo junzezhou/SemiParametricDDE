@@ -18,9 +18,12 @@ def test_shared_utils():
 
 
 def test_fit_requires_initialized_args():
+    from dde.algorithms.semi import fit_semidde
+
     Y = np.zeros((5, 18))
+    # fit() fills pen_list and tau; the model entry point still requires them
     with pytest.raises(ValueError, match="initialized algorithm arguments"):
-        fit(Y, model="semi", dimension_method="fixed", K_list=[6, 2])
+        fit_semidde(Y, D=2, dimension_method="fixed", K_list=[6, 2], verbose=False)
 
     with pytest.raises(ValueError):
         fit(Y, model="copula", dimension_method="csp", K_list=[6, 2])

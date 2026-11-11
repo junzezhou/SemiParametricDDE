@@ -15,7 +15,6 @@ from scipy.special import gammaln
 from sklearn.model_selection import KFold
 
 from .api import ITERATION_LIMIT_NAMES, MODEL_NAMES, fit
-from .algorithms.normal_init_semi import Normal_init_semi, rank_gaussianize_columns
 from .results import DDEResult, data_column_names, record_column_names
 from .utils import validate_K_list_identifiability
 from .utils.hyperparameter_selection import (
@@ -26,6 +25,7 @@ from .utils.hyperparameter_selection import (
     auto_grid_copula_fixed,
     copula_predictive_pmse_score,
     copula_tau_default,
+    default_fit_hyperparameters,
     estimate_K_list_copula,
     estimate_K_list_semidde,
     normal_mixture_loglik_score,
@@ -136,23 +136,21 @@ def _semi_data_init(
     K_list: Sequence[int],
     context: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    X = rank_gaussianize_columns(np.asarray(Y, dtype=float))
+    """Data start of fixed-width SemiDDE candidates: the one ``fit`` uses.
+
+    MARK: this called ``Normal_init_semi`` with its default projection
+    binarization, while ``fit`` starts fixed-width SemiDDE from the
+    anchor-mixture binarization (``Results/semidde_fixed_recon``), so a
+    selected candidate and the same hyperparameters passed to ``fit``
+    started from different states.
+    """
+    from .algorithms.semi import _initialize_semidde
+
     K_tuple = tuple(int(k) for k in K_list)
     validate_K_list_identifiability(K_tuple, J=Y.shape[1])
-    prop, B_list, gamma, A_list, _ = Normal_init_semi(
-        X,
-        K_tuple[0],
-        K_tuple,
-        epsilon=context.get("epsilon", 1e-4),
-        mode="data",
-    )
-    return {
-        "X_in": X,
-        "prop_in": prop,
-        "B_list_in": B_list,
-        "gamma_in": gamma,
-        "A_list_in": A_list,
-    }
+    state: Dict[str, Any] = {"verbose": False, "epsilon": context.get("epsilon", 1e-4)}
+    _initialize_semidde(np.asarray(Y, dtype=float), K_tuple, state, dimension_method="fixed")
+    return {key: state[key] for key in ("X_in", "prop_in", "B_list_in", "gamma_in", "A_list_in")}
 
 
 
@@ -239,8 +237,9 @@ def _resolve_semidde_defaults(
     # MATLAB notebooks' ``tol = K_D / 2`` stopped every inner SAEM right
     # after its burn-in.)
     defaults["tol"] = 0.005
-    defaults["pen_list"] = [float(N ** (2 / 8))] * int(D)
-    defaults["tau"] = 0.3
+    shared = default_fit_hyperparameters("semi", "fixed", N, int(D))
+    defaults["pen_list"] = shared["pen_list"]
+    defaults["tau"] = shared["tau"]
     return defaults, diagnostics
 
 
@@ -274,17 +273,18 @@ def _resolve_dde_defaults(
             K_list = None
         if K_list is not None:
             defaults["K_list"] = K_list
-        defaults["pen_list"] = [float(Y.shape[0] ** (2 / 8))] * D
+        defaults["pen_list"] = default_fit_hyperparameters("dde", "fixed", Y.shape[0], D)["pen_list"]
     return defaults, diagnostics
 
 
 def _resolve_semidde_csp_defaults(Y: np.ndarray, D: int) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    shared = default_fit_hyperparameters("semi", "csp", Y.shape[0], D)
     return {
         # The copula CSP path updates g after every iteration (no outer loop).
         "C": 1, "max_it": 50,
         "max_enum_bits": 12, "mc_samples": 50_000,
         "initialize": "data", "verbose": False, "tol": 0.005,
-        "tau": 0.3, "temp": 0.7 if D <= 2 else 0.9,
+        "tau": shared["tau"], "temp": shared["temp"],
     }, {"K_list_source": "maximal_identifiable_widths"}
 
 
@@ -297,17 +297,22 @@ def _resolve_copula_defaults(
     estimate_K: bool = True,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     N = Y.shape[0]
+    shared = default_fit_hyperparameters("copula", dimension_method, N, int(D))
     defaults: Dict[str, Any] = {
         "C": 1,
         "max_it": 50,
-        "temp": 0.7 if int(D) <= 2 else 0.9,
-        "tau": copula_tau_default(N),
+        # MARK: fixed-width candidates ran at temp 0.7 (D <= 2) / 0.9 and
+        # tol 1e-3 while fit() runs them at its own defaults, so a selected
+        # candidate refitted by fit() was a different fit.  Both now take
+        # default_fit_hyperparameters (CSP: the CopDDE starting temperature).
+        "temp": shared["temp"],
+        "tau": shared["tau"],
         "initialize": "data",
         "verbose": False,
     }
     if dimension_method == "fixed":
-        defaults["tol"] = 1e-3
-        defaults["pen_list"] = [float(N ** (2 / 8))] * int(D)
+        defaults["tol"] = shared["tol"]
+        defaults["pen_list"] = shared["pen_list"]
     diagnostics: Dict[str, Any] = {}
     if "K_list" in fixed_hp:
         defaults["K_list"] = list(validate_K_list_identifiability(fixed_hp["K_list"], D=D, J=Y.shape[1]))

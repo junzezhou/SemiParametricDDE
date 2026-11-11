@@ -35,12 +35,32 @@ The arguments of `fit` follow Table 1 of the package manuscript:
 | `dimension_method` | `"fixed"` (widths given by `K_list`) or `"csp"` (widths inferred by cumulative shrinkage) |
 | `K_list` | layer widths `[K_1, ..., K_D]`, shallowest first; for `"csp"` optional maximal widths |
 | `G_list` | optional binary graphs of the layers (`"fixed"`), see below |
-| `pen_list` | length-`D` truncated-lasso penalties (`"fixed"`) |
-| `t_spike`, `temp` | length-`D` CSP spike scales and the initial annealing temperature (`"csp"`) |
+| `pen_list` | length-`D` truncated-lasso penalties (`"fixed"`; default `N**(1/4)` in every layer) |
+| `t_spike`, `temp` | length-`D` CSP spike scales and the initial annealing temperature (`"csp"`; defaults below) |
 | `C` | latent draws per stochastic E-step (default 1) |
-| `tol` | relative-change convergence tolerance (see each fitting routine) |
-| `tau` | truncation threshold of the coefficients |
+| `tol` | relative-change convergence tolerance (see each fitting routine; fixed widths default 0.005) |
+| `tau` | truncation threshold of the coefficients (default 0.3; CopDDE `max(0.3, 3 N**-0.3)`) |
 | `max_it` | maximum number of iterations |
+
+Hyperparameters that are not given take these defaults
+(`dde.utils.hyperparameter_selection.default_fit_hyperparameters`; the
+values `select_hyperparameters` keeps for what it does not tune):
+
+| | fixed widths | CSP |
+|---|---|---|
+| DDE, SemiDDE | `pen_list = N**(1/4)`, `tau = 0.3` | `t_spike = (0.03, 0.05)` for `D = 2`, `(0.01, 0.03, 0.005)` for `D = 3`; `temp = 0.7` (`D <= 2`) or `0.9`; `tau = 0.3` |
+| CopDDE | `pen_list = N**(1/4)`, `tau = max(0.3, 3 N**-0.3)`, `tol = 0.005`, `temp = 1` | as above, with `tau = max(0.3, 3 N**-0.3)` |
+
+`result.diagnostics["fit_arguments"]` records the hyperparameters a fit used
+and `result.diagnostics["default_arguments"]` the ones it filled in.  The
+fixed-width defaults were compared with EBIC/pMSE-selected values in
+`Results/hp_selection_validation_v2/REPORT.md`.
+
+Every fit draws from NumPy's global generator, so `np.random.seed(...)` before
+`fit` (or `select_hyperparameters`) reproduces it.  CSP and CopDDE fits also
+take `random_state`, which seeds their start; it does not replace
+`np.random.seed`.  The fixed-width DDE and SemiDDE paths reject
+`random_state`.
 
 `method=` (the former name of `model`) still works with a
 `DeprecationWarning`, and the kernel spellings `max_iter`, `it` and

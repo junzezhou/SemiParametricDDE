@@ -7,7 +7,7 @@ import pytest
 from scipy.special import expit, gammaln
 
 from dde import fit
-from dde.algorithms.dde import fit_fixed_graph_reference
+from dde.algorithms.dde import fit_fixed_graph_reference, fit_parametric_dde
 from dde.algorithms.fixed_graph import (
     _fixed_graph_estep,
     _layer_configs,
@@ -291,7 +291,7 @@ def test_exact_em_is_a_reference_implementation_outside_fit(family):
     X, B_true, _ = _simulate(family, 1500, (6, 2), seed=5)
     G = _graph(B_true)
     with pytest.raises(ValueError, match="pen_list"):
-        fit(X, model="DDE", dimension_method="fixed", family=family, G_list=G, verbose=False)
+        fit_parametric_dde(X, dimension_method="fixed", family=family, D=2, G_list=G, verbose=False)
     for removed in ({"graph_algorithm": "em"}, {"n_init": 3}, {"em_criterion": "loglik_gain"}):
         with pytest.raises(TypeError, match="fit_fixed_graph_reference"):
             fit(X, model="DDE", dimension_method="fixed", family=family, G_list=G,
@@ -348,8 +348,8 @@ def test_dde_fit_graph_argument_errors():
     with pytest.raises(ValueError, match="restrict every layer"):
         fit_fixed_graph_reference(X, family="bernoulli", G_list=[G[0], None], K_list=[6, 2])
     with pytest.raises(ValueError, match="tau is required"):
-        fit(X, model="DDE", dimension_method="fixed", family="bernoulli", D=2, K_list=[6, 2], G_list=[G[0]],
-            pen_list=[0.0, 1.0], C=1, verbose=False)
+        fit_parametric_dde(X, dimension_method="fixed", family="bernoulli", D=2, K_list=[6, 2],
+                           G_list=[G[0]], pen_list=[0.0, 1.0], C=1, verbose=False)
     with pytest.raises(ValueError, match="labels the latent columns"):
         fit(X, model="DDE", dimension_method="fixed", family="bernoulli", G_list=G, initialize="oracle",
             B_list_true=B_true, G_list_true=G, pen_list=[1.0, 1.0], tau=0.3, verbose=False)
@@ -357,7 +357,8 @@ def test_dde_fit_graph_argument_errors():
         fit(X, model="DDE", dimension_method="fixed", family="bernoulli", G_list=G,
             pen_list=[1.0, 1.0], tau=0.3, C=0, verbose=False)
     with pytest.raises(ValueError, match="pen_list"):
-        fit(X, model="DDE", dimension_method="fixed", family="bernoulli", G_list=G, tau=0.3, verbose=False)
+        fit_parametric_dde(X, dimension_method="fixed", family="bernoulli", D=2, G_list=G, tau=0.3,
+                           verbose=False)
 
 
 def test_semidde_fit_with_graph_holds_support():

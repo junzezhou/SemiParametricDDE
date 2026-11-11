@@ -125,8 +125,6 @@ def test_semidde_csp_dimension_recovery_metrics_match_primary_endpoints():
         ({"D": None}, "D is required"),
         ({"K_list": [7, 2]}, "J >= 3"),
         ({"pen_list": [0.1, 0.1]}, "pen_list.*fixed"),
-        ({"t_spike": None}, "t_spike"),
-        ({"temp": None}, "temp"),
     ],
 )
 def test_semidde_csp_rejects_incompatible_path_arguments(overrides, message):

@@ -773,8 +773,9 @@ def fit_parametric_dde(
     if method == "fixed":
         if random_state is not None and not exact_em:
             raise ValueError(
-                "random_state is supported by the CSP path and the exact EM on a "
-                "fixed graph only."
+                "random_state is used by the CSP path and the exact EM reference only; "
+                "the fixed-width SAEM draws from the global NumPy generator, so "
+                "np.random.seed(...) before fit reproduces it."
             )
         if exact_em:
             if random_state is None:

@@ -370,8 +370,6 @@ def test_fit_dde_normal_csp_uses_copula_backend_by_default():
     [
         ({"K_list": [7, 2]}, "J >= 3"),
         ({"pen_list": [0.1, 0.1]}, "pen_list.*fixed"),
-        ({"t_spike": None}, "requires t_spike and temp"),
-        ({"temp": None}, "requires t_spike and temp"),
     ],
 )
 def test_fit_dde_normal_csp_rejects_path_incompatible_arguments(overrides, message):
@@ -410,3 +408,45 @@ def test_csp_stops_on_windowed_mean_relative_change():
     strict = fit(X, tol=0.0, **common)
     assert not strict.diagnostics["stopped_by_convergence"]
     assert strict.diagnostics["iterations"] == 30
+
+
+def test_fit_fills_the_default_hyperparameters():
+    from dde.utils.hyperparameter_selection import copula_tau_default, default_fit_hyperparameters
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(256, 18))
+    np.random.seed(0)
+    fixed = fit(X, model="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
+                max_it=2, verbose=False)
+    assert fixed.diagnostics["default_arguments"] == ["pen_list", "tau"]
+    assert fixed.diagnostics["fit_arguments"] == {"pen_list": [4.0, 4.0], "tau": 0.3}
+    np.random.seed(0)
+    csp = fit(rng.normal(size=(256, 27)), model="DDE", family="Normal", D=3, dimension_method="csp",
+              K_list=[9, 3, 1], tau=0.2, max_it=2, verbose=False)
+    assert csp.diagnostics["default_arguments"] == ["t_spike", "temp"]
+    assert csp.diagnostics["fit_arguments"]["t_spike"] == [0.01, 0.03, 0.005]
+    assert csp.diagnostics["fit_arguments"]["temp"] == 0.9
+    assert csp.diagnostics["fit_arguments"]["tau"] == 0.2
+    copula = default_fit_hyperparameters("copula", "fixed", 1000, 2)
+    assert copula["tau"] == copula_tau_default(1000) and copula["tol"] == 0.005
+    assert default_fit_hyperparameters("semi", "csp", 1000, 2)["temp"] == 0.7
+    # the low-level kernel entry point still needs every hyperparameter
+    from dde.algorithms.dde import fit_parametric_dde
+
+    with pytest.raises(ValueError, match="requires t_spike and temp"):
+        fit_parametric_dde(X, family="normal", D=2, dimension_method="csp", tau=0.3, verbose=False)
+
+
+def test_np_random_seed_reproduces_copdde_and_fixed_paths_reject_random_state():
+    rng = np.random.default_rng(1)
+    Y = rng.poisson(2.0, size=(150, 12))
+    fits = []
+    for _ in range(2):
+        np.random.seed(5)
+        fits.append(fit(Y, model="CopDDE", dimension_method="fixed", K_list=[4, 1], max_it=2, verbose=False))
+    for B, B_again in zip(fits[0].B_list, fits[1].B_list):
+        np.testing.assert_array_equal(B, B_again)
+    for model in ("DDE", "SemiDDE"):
+        with pytest.raises(ValueError, match="np.random.seed"):
+            fit(np.exp(rng.normal(size=(150, 12))), model=model, family="Normal", D=2,
+                dimension_method="fixed", K_list=[4, 1], random_state=3, verbose=False)

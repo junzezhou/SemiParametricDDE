@@ -292,6 +292,49 @@ def _default_csp_t_spike_base(D: int, values: Sequence[Sequence[float]]) -> List
     return [float(layer_values[len(layer_values) // 2]) for layer_values in values]
 
 
+# Fixed-width CopDDE temperature when ``temp`` is not given (see
+# default_fit_hyperparameters).
+COPDDE_FIXED_TEMP = 1.0
+
+
+def default_fit_hyperparameters(model: str, dimension_method: str, N: int, D: int) -> Dict[str, Any]:
+    """Hyperparameters that ``fit`` uses when they are not given.
+
+    ``select_hyperparameters`` uses the same values for the hyperparameters
+    it does not tune.  ``model`` is ``"dde"``, ``"semi"`` or ``"copula"``.
+
+    * fixed widths: ``pen_list = N**(1/4)`` in every layer, the penalty of
+      the simulation studies; CopDDE also ``tol = 0.005`` (the other
+      fixed-width paths already default to it) and ``temp``
+      (``COPDDE_FIXED_TEMP``);
+    * CSP: ``t_spike`` = (0.03, 0.05) for ``D = 2``, (0.01, 0.03, 0.005)
+      for ``D = 3`` (the CopDDE paper's D = 3 setting) and the middle of
+      the default grid otherwise; ``temp`` = 0.7 for ``D <= 2`` and 0.9
+      otherwise (the CopDDE paper's starting temperatures);
+    * ``tau`` = 0.3, and for CopDDE the CopDDE paper's
+      ``max(0.3, 3 N**-0.3)``.
+
+    The fixed-path values were compared with EBIC/pMSE-selected ones in
+    ``Results/hp_selection_validation_v2/REPORT.md`` (v3 section).
+    """
+    key = str(model).strip().lower()
+    method = str(dimension_method).strip().lower()
+    D = int(D)
+    N = int(N)
+    if key not in {"dde", "semi", "copula"} or method not in {"fixed", "csp"} or D < 1:
+        raise ValueError("model must be 'dde', 'semi' or 'copula', dimension_method 'fixed' or 'csp'.")
+    out: Dict[str, Any] = {"tau": copula_tau_default(N) if key == "copula" else 0.3}
+    if method == "fixed":
+        out["pen_list"] = [float(N ** (2 / 8))] * D
+        if key == "copula":
+            out["tol"] = 0.005
+            out["temp"] = COPDDE_FIXED_TEMP
+    else:
+        out["t_spike"] = _default_csp_t_spike_base(D, _default_csp_t_spike_values(D))
+        out["temp"] = 0.7 if D <= 2 else 0.9
+    return out
+
+
 def auto_grid_copula_csp(
     N: int,
     D: int,
@@ -585,6 +628,7 @@ __all__ = [
     "auto_grid_copula_fixed",
     "copula_predictive_pmse_score",
     "copula_tau_default",
+    "default_fit_hyperparameters",
     "estimate_K_list_copula",
     "estimate_K_list_semidde",
     "normal_mixture_loglik_score",
