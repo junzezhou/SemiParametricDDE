@@ -250,6 +250,37 @@ def test_exact_em_increases_loglik_and_recovers_parameters(family):
     assert marginals[0].shape == (4000, 6) and marginals[1].shape == (4000, 2)
 
 
+def test_exact_em_stopping_criteria():
+    X, B_true, _ = _simulate("bernoulli", 1000, (6, 2), seed=3)
+    support = _graph(B_true)
+    adapter = resolve_parametric_family("bernoulli")
+    start = graph_anchored_initialize(X, support, (6, 2), family=adapter)[:3]
+    _, _, _, _, iterations, diagnostics = fit_fixed_graph_em(X, *start, support, family=adapter, tol=1e-3)
+    changes = diagnostics["relative_change_history"]
+    assert diagnostics["convergence_metric"] == "relative_parameter_change"
+    assert diagnostics["converged"] and len(changes) == iterations
+    assert changes[-1] <= 1e-3 and all(change > 1e-3 for change in changes[:-1])
+    _, _, _, _, iterations, diagnostics = fit_fixed_graph_em(
+        X, *start, support, family=adapter, tol=1e-6, criterion="loglik_gain"
+    )
+    gains = np.abs(np.diff(diagnostics["loglik_history"]))
+    assert diagnostics["converged"] and gains[-1] <= 1e-6 * X.shape[0]
+    assert np.all(gains[:-1] > 1e-6 * X.shape[0])
+    with pytest.raises(ValueError, match="criterion"):
+        fit_fixed_graph_em(X, *start, support, family=adapter, criterion="rmse")
+
+
+
+def test_reference_em_stopping_criterion():
+    X, B_true, _ = _simulate("bernoulli", 1000, (6, 2), seed=3)
+    G = _graph(B_true)
+    gain = fit_fixed_graph_reference(X, family="bernoulli", G_list=G, n_init=1, criterion="loglik_gain")
+    assert gain.diagnostics["convergence_metric"] == "loglik_gain"
+    assert gain.diagnostics["convergence_tol"] == 1e-6
+    with pytest.raises(ValueError, match="criterion"):
+        fit_fixed_graph_reference(X, family="bernoulli", G_list=G, n_init=1, criterion="rmse")
+
+
 # ---------------------------------------------------------------------------
 # Public fit paths
 # ---------------------------------------------------------------------------
@@ -261,13 +292,15 @@ def test_exact_em_is_a_reference_implementation_outside_fit(family):
     G = _graph(B_true)
     with pytest.raises(ValueError, match="pen_list"):
         fit(X, model="DDE", dimension_method="fixed", family=family, G_list=G, verbose=False)
-    for removed in ({"graph_algorithm": "em"}, {"n_init": 3}):
+    for removed in ({"graph_algorithm": "em"}, {"n_init": 3}, {"em_criterion": "loglik_gain"}):
         with pytest.raises(TypeError, match="fit_fixed_graph_reference"):
             fit(X, model="DDE", dimension_method="fixed", family=family, G_list=G,
                 pen_list=[1.0, 1.0], tau=0.3, verbose=False, **removed)
     result = fit_fixed_graph_reference(X, family=family, G_list=G)
     assert result.K_list == [6, 2]
     assert result.diagnostics["graph_algorithm"] == "em"
+    assert result.diagnostics["convergence_metric"] == "relative_parameter_change"
+    assert result.diagnostics["convergence_tol"] == 1e-4
     assert result.diagnostics["initialization"] == "data_graph"
     for B, support in zip(result.B_list, G):
         assert np.all(B[:, 1:][~support] == 0.0)

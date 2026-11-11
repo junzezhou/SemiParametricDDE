@@ -64,7 +64,7 @@ def test_fit_dde_normal_fixed_public_smoke():
     assert result.diagnostics["mc_state_update"] == "last_draw"
     assert (
         result.diagnostics["convergence_metric"]
-        == "postprocessed_parameter_rmse"
+        == "relative_parameter_change"
     )
     assert result.diagnostics["convergence_tol"] == 0.0
 
@@ -392,3 +392,21 @@ def test_fit_dde_normal_csp_rejects_path_incompatible_arguments(overrides, messa
     args.update(overrides)
     with pytest.raises(ValueError, match=message):
         fit(X, **args)
+
+
+def test_csp_stops_on_windowed_mean_relative_change():
+    rng = np.random.default_rng(4)
+    A = rng.binomial(1, 0.5, size=(300, 3))
+    X = A @ rng.normal(2.0, 0.3, size=(3, 18)) + rng.normal(size=(300, 18))
+    common = dict(model="DDE", family="Normal", D=2, dimension_method="csp", t_spike=[0.05, 0.1],
+                  temp=0.8, tau=0.3, C=1, max_it=30, random_state=0, verbose=False)
+    loose = fit(X, tol=10.0, **common)
+    history = np.asarray(loose.diagnostics["relative_history"], dtype=float)
+    window = loose.diagnostics["convergence_window"]
+    # Every layer's mean change over the window is far below 10, so the fit
+    # stops as soon as the window is full.
+    assert loose.diagnostics["stopped_by_convergence"]
+    assert loose.diagnostics["iterations"] == window == history.shape[1]
+    strict = fit(X, tol=0.0, **common)
+    assert not strict.diagnostics["stopped_by_convergence"]
+    assert strict.diagnostics["iterations"] == 30

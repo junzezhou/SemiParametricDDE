@@ -235,8 +235,10 @@ def _resolve_semidde_defaults(
         defaults["K_list"] = K_list
         diagnostics["K_list_source"] = "estimated"
         diagnostics["K_list_estimation"] = K_details
-    if "K_list" in defaults:
-        defaults["tol"] = float(defaults["K_list"][-1]) / 2.0
+    # The relative-change tolerance of the other fixed-width fits.  (The
+    # MATLAB notebooks' ``tol = K_D / 2`` stopped every inner SAEM right
+    # after its burn-in.)
+    defaults["tol"] = 0.005
     defaults["pen_list"] = [float(N ** (2 / 8))] * int(D)
     defaults["tau"] = 0.3
     return defaults, diagnostics
@@ -712,8 +714,6 @@ def _evaluate_candidate(context: Mapping[str, Any], c_idx: int, candidate: Mappi
             raise ValueError("Each candidate, fixed_hp, or base_fit_kwargs must provide K_list.")
         K_list = list(validate_K_list_identifiability(K_list, D=D, J=Y.shape[1]))
         hp["K_list"] = K_list
-        if chosen == "semi" and method == "fixed" and "tol" not in fit_candidate and "tol" not in fixed and "tol" not in base:
-            hp["tol"] = float(K_list[-1]) / 2.0
 
     full_result = None
     if criterion == "ebic":
@@ -1091,8 +1091,6 @@ def select_hyperparameters(
     final_kwargs.update(final_fit_candidate)
     if random_state is not None and (chosen == "copula" or method == "csp"):
         final_kwargs.setdefault("random_state", random_state)
-    if chosen == "semi" and method == "fixed" and "tol" not in final_fit_candidate and "tol" not in fixed and "tol" not in base:
-        final_kwargs["tol"] = float(final_kwargs["K_list"][-1]) / 2.0
     final_kwargs["dimension_method"] = method
     if chosen == "copula":
         final_kwargs = _with_copula_method_defaults(final_kwargs, D)

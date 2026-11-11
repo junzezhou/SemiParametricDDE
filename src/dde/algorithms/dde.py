@@ -173,6 +173,9 @@ def _layerwise_warm_start(
             deep_widths
         ) <= EXACT_EM_MAX_WIDTH:
             deep_kwargs["_exact_em"] = True
+            # This EM only builds the start; it keeps its earlier stopping
+            # rule (see ``criterion`` of :func:`fit_fixed_graph_reference`).
+            deep_kwargs["_em_criterion"] = "loglik_gain"
     if oracle:
         deep_kwargs.update(
             initialize="oracle",
@@ -281,7 +284,8 @@ def fit_parametric_dde(
     estimates aligned with known generating parameters.  Ordinary data fits
     should use the default ``initialize="data"``.
 
-    For fixed-width fits, ``tol`` is the postprocessed parameter-update RMSE.
+    For fixed-width fits, ``tol`` bounds the relative parameter change
+    ``||theta_new - theta_old|| / ||theta_old||`` of a postprocessed update.
     Its default is ``0.005`` for a dimension-independent convergence scale.
     ``tol=None`` and ``max_it=None`` select ``0.005`` and 50 iterations,
     except for the copula-backend Bernoulli/Poisson CSP (their default CSP
@@ -416,10 +420,11 @@ def fit_parametric_dde(
     # start's deep stage, which pass these private flags.
     exact_em = bool(kwargs.pop("_exact_em", False))
     n_init = kwargs.pop("_n_init", None)
-    removed = sorted({"graph_algorithm", "n_init"} & set(kwargs))
+    em_criterion = kwargs.pop("_em_criterion", "relative_parameter_change")
+    removed = sorted({"graph_algorithm", "n_init", "em_criterion"} & set(kwargs))
     if removed:
         raise TypeError(
-            f"{' and '.join(removed)} is not an argument of fit(): fits on a graph use "
+            f"{', '.join(removed)} is not an argument of fit(): fits on a graph use "
             "the penalized SAEM kernel. The unpenalized exact EM is kept for "
             "comparison as dde.algorithms.dde.fit_fixed_graph_reference."
         )
@@ -516,9 +521,14 @@ def fit_parametric_dde(
             max_it = 500
         else:
             max_it = _DISCRETE_COPULA_CSP_MAX_IT if discrete_copula_csp else 50
+    if em_criterion not in ("relative_parameter_change", "loglik_gain"):
+        raise ValueError("criterion must be 'relative_parameter_change' or 'loglik_gain'.")
     if tol is None:
         if exact_em:
-            tol = 1e-6
+            # The relative parameter change at which the earlier rule (a
+            # log-likelihood gain of 1e-6 per observation) stopped: 1.5e-4
+            # to 6e-4 on the B_s s18 design.
+            tol = 1e-4 if em_criterion == "relative_parameter_change" else 1e-6
         else:
             tol = 0.0 if discrete_copula_csp else DEFAULT_PARAMETRIC_CONVERGENCE_TOL
     graph_fixed = any(support is not None for support in support_list)
@@ -785,6 +795,7 @@ def fit_parametric_dde(
                     rng=start_rng,
                     max_iter=max_it,
                     tol=tol,
+                    criterion=em_criterion,
                     bound_val=bound_val,
                     row_chunk_size=estep_row_chunk_size,
                     verbose=bool(verbose),
@@ -798,7 +809,7 @@ def fit_parametric_dde(
                 "dimension_method": "fixed",
                 "initialization": initialization,
                 "graph_algorithm": "em",
-                "convergence_metric": "loglik_gain_per_observation",
+                "convergence_metric": em_criterion,
                 "convergence_tol": tol,
                 "converged": em_diagnostics["converged"],
                 "loglik": em_diagnostics["loglik"],
@@ -806,6 +817,7 @@ def fit_parametric_dde(
                 "start_logliks": em_diagnostics["start_logliks"],
                 "best_start": em_diagnostics["best_start"],
                 "loglik_history": em_diagnostics["loglik_history"],
+                "relative_change_history": em_diagnostics["relative_change_history"],
                 "posterior_marginals": em_diagnostics["posterior_marginals"],
                 "fixed_graph_layers": [True] * D,
                 "G_list": [support.astype(np.uint8) for support in support_list],
@@ -883,7 +895,7 @@ def fit_parametric_dde(
             "initialization": initialization,
             "latent_transition": "systematic_coordinate_gibbs",
             "mc_state_update": "last_draw",
-            "convergence_metric": "postprocessed_parameter_rmse",
+            "convergence_metric": "relative_parameter_change",
             "convergence_tol": tol,
             "sa_burn_in": sa_burn_in,
             "fixed_init_binarize": fixed_init_binarize,
@@ -983,7 +995,7 @@ def fit_parametric_dde(
         bound_val=bound_val,
         n_jobs=n_jobs,
         convergence_window=convergence_window,
-        convergence_std=tol,
+        convergence_tol=tol,
         burn=burn,
         threshold_rule=csp_threshold_rule,
         mstep_solver=csp_mstep_solver,
@@ -1114,6 +1126,7 @@ def fit_fixed_graph_reference(
     n_init: int = 10,
     tol=None,
     max_it=None,
+    criterion: str = "relative_parameter_change",
     initialize: str = "data",
     random_state=None,
     verbose: bool = False,
@@ -1132,7 +1145,13 @@ def fit_fixed_graph_reference(
     ``2**K_d`` states are enumerated, and the coefficients on the graph are
     neither penalized nor thresholded, so ``pen_list``, ``tau`` and ``C``
     are not used.  ``max_it`` defaults to 500 M-steps and ``tol`` (default
-    ``1e-6``) bounds the log-likelihood gain per observation.  The
+    ``1e-4``) bounds the relative parameter change of an M-step, as for the
+    other estimators; ``criterion="loglik_gain"`` makes ``tol`` (default
+    ``1e-6``) bound the log-likelihood gain per observation instead (the
+    layer-wise warm start of :func:`fit_parametric_dde` uses it for its
+    deep stage, which the EM only initializes: run to a small relative
+    change on the noisy layer-1 states of a small sample, it gives a worse
+    start, e.g. Normal B_s s54 at N = 500, layer-2 RMSE 0.33 -> 0.40).  The
     likelihood on a graph can be multimodal on real data (TIMSS response
     times, ``K_list=[7, 1]``: 20 random starts reach 9 local optima
     spanning 140 log-likelihood units, and the graph-anchored start is not
@@ -1159,6 +1178,7 @@ def fit_fixed_graph_reference(
         verbose=verbose,
         _exact_em=True,
         _n_init=n_init,
+        _em_criterion=criterion,
         **kwargs,
     )
 

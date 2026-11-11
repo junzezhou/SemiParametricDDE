@@ -86,6 +86,10 @@ def get_SAEM_RL_D(
     The interface follows the SemiDDE style: ``B_list_in`` and ``A_list_in`` are
     lists ordered from the shallowest latent layer to the deepest.
 
+    The iterations stop when the relative parameter change
+    ``||theta_new - theta_old|| / ||theta_old||`` (prevalences, variances
+    and coefficients) is at most ``tol``, or after ``it`` iterations.
+
     ``support_list`` gives the allowable connections of some layers
     (manuscript Section 5.1): ``support_list[d]`` is a boolean
     ``(rows of B_list[d]) x K_d`` mask of allowable slopes, or ``None`` for a
@@ -185,11 +189,18 @@ def get_SAEM_RL_D(
         for d in range(D):
             B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
 
-        err = np.sqrt(
+        # Relative parameter change ||theta_new - theta_old|| / ||theta_old||.
+        change = np.sqrt(
             np.linalg.norm(prop - prop_update) ** 2
             + np.linalg.norm(gamma - gamma_update) ** 2
             + sum(np.linalg.norm(B_list[d] - B_update[d]) ** 2 for d in range(D))
         )
+        size = np.sqrt(
+            np.linalg.norm(prop) ** 2
+            + np.linalg.norm(gamma) ** 2
+            + sum(np.linalg.norm(B_list[d]) ** 2 for d in range(D))
+        )
+        err = change / max(size, 1e-12)
 
         if gibbs:
             # the chain continues from its last sweep

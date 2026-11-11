@@ -170,7 +170,7 @@ def paper_candidates(
     *,
     smoke: bool = False,
     optimizer_maxiter: int | None = None,
-    convergence_std: float | None = None,
+    convergence_tol: float | None = None,
 ) -> list[dict[str, Any]]:
     taus = PAPER_TAUS
     t_values = PAPER_T_SPIKES
@@ -193,8 +193,8 @@ def paper_candidates(
         }
         if optimizer_maxiter is not None:
             candidate["optimizer_maxiter"] = int(optimizer_maxiter)
-        if convergence_std is not None:
-            candidate["convergence_std"] = float(convergence_std)
+        if convergence_tol is not None:
+            candidate["convergence_tol"] = float(convergence_tol)
         if smoke:
             candidate["it"] = 1
             candidate["optimizer_maxiter"] = 1
@@ -397,7 +397,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pmse-n-estimators", type=int, default=100)
     parser.add_argument("--random-state", type=int, default=20260712)
     parser.add_argument("--optimizer-maxiter", type=int, default=50)
-    parser.add_argument("--convergence-std", type=float, default=0.01)
+    parser.add_argument("--convergence-tol", type=float, default=0.01)
     parser.add_argument("--epsilon", type=float, default=1e-5, help="Normal initialization epsilon; B5.m uses 1e-5.")
     return parser.parse_args()
 
@@ -426,7 +426,7 @@ def main() -> None:
     candidates = paper_candidates(
         smoke=args.smoke,
         optimizer_maxiter=args.optimizer_maxiter,
-        convergence_std=args.convergence_std,
+        convergence_tol=args.convergence_tol,
     )
     n_repeats = args.n_repeats if args.n_repeats is not None else (1 if args.smoke else 50)
 
@@ -439,7 +439,7 @@ def main() -> None:
         "pmse_n_estimators": int(args.pmse_n_estimators),
         "random_state": int(args.random_state),
         "optimizer_maxiter": args.optimizer_maxiter,
-        "convergence_std": float(args.convergence_std),
+        "convergence_tol": float(args.convergence_tol),
         "epsilon": float(args.epsilon),
         "shared_initialization": True,
         "paper_grid": {

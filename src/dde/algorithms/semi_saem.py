@@ -1288,7 +1288,11 @@ def _postprocess_and_measure_fixed_update(
     depth,
     support_list=None,
 ):
-    """Postprocess an M-step and return its parameter-normalised change.
+    """Postprocess an M-step and return its relative parameter change.
+
+    The change is ``||theta_new - theta_old|| / ||theta_old||`` over the
+    prevalences, every coefficient (intercepts included) and the
+    dispersion, after the coefficient postprocessing.
 
     Every layer is thresholded; the slopes of a layer with a graph
     (``support_list[d]`` not ``None``) outside the graph are set to zero.
@@ -1311,12 +1315,13 @@ def _postprocess_and_measure_fixed_update(
         )
         + family.dispersion_distance_sq(dispersion, dispersion_update)
     )
-    n_parameters = np.asarray(prop).size + sum(
-        np.asarray(B).size for B in B_list
+    squared_norm = (
+        np.sum(np.asarray(prop, dtype=float) ** 2)
+        + sum(np.sum(np.asarray(B, dtype=float) ** 2) for B in B_list)
     )
     if dispersion is not None:
-        n_parameters += np.asarray(dispersion).size
-    return B_processed, float(np.sqrt(squared_error / n_parameters))
+        squared_norm += np.sum(np.asarray(dispersion, dtype=float) ** 2)
+    return B_processed, float(np.sqrt(squared_error / max(squared_norm, 1e-12)))
 
 
 def _owned_array_nbytes(owner):
@@ -1391,8 +1396,9 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                         sa_burn_in=0, observed_solver=None, support_list=None):
     """Run fixed-width SAEM with observed behavior supplied by ``family``.
 
-    ``tol`` is compared with the root-mean-square parameter change after the
-    family coefficient postprocessor has been applied.
+    ``tol`` is compared with the relative parameter change
+    ``||theta_new - theta_old|| / ||theta_old||`` after the family
+    coefficient postprocessor has been applied.
 
     ``support_list`` (length ``D``; entry ``d`` a ``rows x K_d`` boolean
     graph or ``None``) gives the allowable connections of the given layers

@@ -124,7 +124,7 @@ def test_normal_two_layer_recovery_with_oracle_labels_under_defaults():
     X, A_true, B_true, G_true = _design((6, 2), seed=11, N=4000)
     np.random.seed(11)
     result = fit(X, model="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
-                 pen_list=[4000 ** 0.25] * 2, tau=0.3, C=1, tol=0.01, max_it=50,
+                 pen_list=[4000 ** 0.25] * 2, tau=0.3, C=1,
                  initialize="oracle", B_list_true=B_true, G_list_true=G_true, verbose=False)
     for B_hat, G_t in zip(result.B_list, G_true):
         assert np.mean((np.asarray(B_hat)[:, 1:] != 0) == G_t) == 1.0
