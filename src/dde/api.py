@@ -7,7 +7,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from .results import DDEResult
+from .results import DDEResult, data_column_names, record_column_names
 
 
 # Manuscript names of the three formulations, keyed by the internal path key.
@@ -97,6 +97,9 @@ def _pop_iteration_limit(kwargs: dict, max_it: Optional[int]) -> Optional[int]:
     return limit
 
 
+_RECORDED_ARGUMENTS = ("pen_list", "tau", "t_spike", "temp", "C", "tol")
+
+
 def _record_active_structure(result: DDEResult) -> DDEResult:
     """Add the active latent columns and edges of every layer to the diagnostics."""
     if result.B_list:
@@ -183,8 +186,16 @@ def fit(
         ``model`` is ``"DDE"``, ``"SemiDDE"`` or ``"CopDDE"``;
         ``diagnostics["active_by_layer"]`` and
         ``diagnostics["n_active_edges"]`` count the nonzero slope columns and
-        entries of every coefficient matrix.
+        entries of every coefficient matrix.  When ``Y`` is a data frame,
+        ``diagnostics["variable_names"]`` keeps its column names (the default
+        labels of the observed variables in :mod:`dde.visualization`), and
+        ``diagnostics["fit_arguments"]`` the hyperparameters given to the call
+        (``pen_list``, ``tau``, ``t_spike``, ``temp``, ``C``, ``tol``).
     """
+    column_names = data_column_names(Y)
+    fit_arguments = {
+        name: kwargs[name] for name in _RECORDED_ARGUMENTS if kwargs.get(name) is not None
+    }
     Y = np.asarray(Y)
     chosen = _resolve_model(model, method)
     if chosen == "auto":
@@ -246,4 +257,6 @@ def fit(
         result = fit_copula_dde(Y, K_list=K_list, dimension_method=dimension, **kwargs)
     else:
         raise RuntimeError(f"Unhandled DDE model: {chosen}.")
-    return _record_active_structure(result)
+    result = record_column_names(_record_active_structure(result), column_names)
+    result.diagnostics.setdefault("fit_arguments", fit_arguments)
+    return result

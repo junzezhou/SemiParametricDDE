@@ -187,23 +187,34 @@ layer) and a stopping rule that also waits for stable widths
 
 Two interfaces summarize a fitted model (`fit` or `select_hyperparameters`
 result).  `plot_weights` draws the estimated weight matrices from the observed
-layer upward (one heatmap per layer, or a chosen `layer`); for CSP fits the
-columns are labelled by their original latent indices.  `get_anchors` returns
-the observed variables that anchor each shallow-layer latent feature, ranked
-by the relative-loading score `r_jk = max(min_{l != k}(b_jk - b_jl), 0)`:
+layer upward (one heatmap per layer, or a chosen `layer`).  For CSP fits the
+columns are labelled by their original latent indices, and each matrix ends in
+one hatched blank column labelled with the number of latent columns the CSP
+shrank away (`show_shrunk=False` drops it).  `get_anchors` returns the observed
+variables that anchor each shallow-layer latent feature, ranked by the
+relative-loading score `r_jk = max(min_{l != k}(b_jk - b_jl), 0)`.
+
+The observed variables are labelled by the column names of the data frame the
+model was fitted on (kept in `result.diagnostics["variable_names"]`), otherwise
+`y1, y2, ...`.  `variable_names` replaces them, either with one name per
+variable or with a mapping that renames only some of them:
 
 ```python
 from dde.visualization import plot_weights, get_anchors
 
-figures = plot_weights(result, variable_names=Y.columns, output_dir="plots")
-anchors = get_anchors(result, n_anchors=3, variable_names=Y.columns)
+figures = plot_weights(result, output_dir="plots")            # data-frame column names
+figures = plot_weights(result, variable_names={"BIGFIVE_1": "Name"}, output_dir="plots")
+anchors = get_anchors(result, n_anchors=3, variable_names=item_texts)
 anchors[anchors["latent_feature"] == 1]
 ```
 
-`visualization_report` writes the standard bundle of diagnostic plots of a
-SemiDDE or CopDDE fit (model summary, weight heatmaps, top loadings, item
-clusters, latent profiles and, for CopDDE, an optional theme table) and
-returns their paths keyed `model_summary`, `B1_heatmap`, ...:
+`visualization_report` writes the standard bundle of diagnostic plots of any
+fitted `DDEResult` (DDE, SemiDDE or CopDDE; fixed or CSP widths) and returns
+their paths keyed `model_summary`, `B1_heatmap`, `B2_heatmap`, ...,
+`top_loadings`, `item_cluster_heatmap`, `latent_profiles` and
+`latent_profiles_prevalence`; SemiDDE adds `posterior_quality_table` and CopDDE
+an optional `theme_table`.  `feature_names` labels the observed variables as
+`variable_names` does above:
 
 ```python
 from dde.visualization import visualization_report

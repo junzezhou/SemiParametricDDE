@@ -24,3 +24,19 @@ class DDEResult:
     transformed: Optional[np.ndarray] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     raw: Any = None
+
+
+def data_column_names(Y):
+    """Column names of a data frame (``None`` for arrays), as strings."""
+    columns = getattr(Y, "columns", None)
+    if columns is None:
+        return None
+    return [str(name) for name in columns]
+
+
+def record_column_names(result, names):
+    """Store the data's column names in ``diagnostics["variable_names"]``."""
+    if names is not None and result is not None:
+        result.diagnostics = dict(result.diagnostics or {})
+        result.diagnostics.setdefault("variable_names", list(names))
+    return result

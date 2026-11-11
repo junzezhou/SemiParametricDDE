@@ -121,3 +121,104 @@ def test_legacy_names_are_reachable_with_a_deprecation_warning():
         assert viz.plot_model_summary is plot_model_summary
     # visualization_report is a primary interface (manuscript Appendix C)
     assert "visualization_report" in viz.__all__
+
+
+def _csp_result(model="DDE"):
+    """Two active columns of four in layer 1, one of two in layer 2."""
+    result = _result(model)
+    result.diagnostics.update(
+        dimension_method="csp",
+        original_K_list=(4, 2),
+        active_columns_original_index={"layer_1": [1, 3], "layer_2": [2]},
+        family="normal",
+    )
+    return result
+
+
+def test_visualization_report_supports_every_model(tmp_path):
+    from dde.visualization import visualization_report as report
+
+    expected = {"B1_heatmap", "B2_heatmap", "item_cluster_heatmap", "latent_profiles",
+                "latent_profiles_prevalence", "model_summary", "top_loadings"}
+    paths = report(_result("DDE"), output_dir=tmp_path / "dde")
+    assert set(paths) == expected
+    assert all(name.startswith(str(tmp_path / "dde" / "dde_")) for name in paths.values())
+    semi = report(_result("SemiDDE"), output_dir=tmp_path / "semi")
+    assert set(semi) == (expected | {"posterior_quality_table"})
+    copula = report(_result("CopDDE"), output_dir=tmp_path / "copula",
+                    theme_table={"theme": ["a"], "count": [1]})
+    assert set(copula) == (expected | {"theme_table"})
+    with pytest.raises(ValueError, match="DDE"):
+        report(_result("other"), output_dir=tmp_path)
+    import matplotlib.pyplot as plt
+    plt.close("all")
+
+
+def test_variable_names_rename_recorded_column_names(tmp_path):
+    result = _result("DDE")
+    result.diagnostics["variable_names"] = ["BIGFIVE_1", "BIGFIVE_2", "BIGFIVE_3"]
+    figure = plot_weights(result, layer=1)
+    assert [t.get_text() for t in figure.axes[0].get_yticklabels()] == ["BIGFIVE_1", "BIGFIVE_2", "BIGFIVE_3"]
+    figure = plot_weights(result, layer=1, variable_names={"BIGFIVE_1": "Name"})
+    assert [t.get_text() for t in figure.axes[0].get_yticklabels()] == ["Name", "BIGFIVE_2", "BIGFIVE_3"]
+    anchors = get_anchors(result, n_anchors=1, variable_names={"BIGFIVE_1": "Name"})
+    assert anchors.iloc[0]["variable"] == "Name"
+    with pytest.raises(ValueError, match="BIGFIVE_9"):
+        plot_weights(result, layer=1, variable_names={"BIGFIVE_9": "Name"})
+    # without recorded names the defaults are y1, y2, ... and can be renamed too
+    plain = plot_weights(_result("DDE"), layer=1, variable_names={"y2": "Name"})
+    assert [t.get_text() for t in plain.axes[0].get_yticklabels()] == ["y1", "Name", "y3"]
+    import matplotlib.pyplot as plt
+    plt.close("all")
+
+
+def test_csp_weights_end_in_a_column_counting_the_shrunk_columns(tmp_path):
+    result = _csp_result()
+    figures = plot_weights(result)
+    labels = [t.get_text() for t in figures[1].axes[0].get_xticklabels()]
+    assert labels == ["A1_1", "A1_3", "+2 shrunk"]
+    assert "4 before CSP shrinkage" in figures[1].axes[0].get_title()
+    assert [t.get_text() for t in figures[2].axes[0].get_xticklabels()] == ["A2_2", "+1 shrunk"]
+    plain = plot_weights(result, layer=1, show_shrunk=False)
+    assert [t.get_text() for t in plain.axes[0].get_xticklabels()] == ["A1_1", "A1_3"]
+    fixed = plot_weights(_result("DDE"), layer=1)  # no original widths: nothing added
+    assert [t.get_text() for t in fixed.axes[0].get_xticklabels()] == ["A1_1", "A1_2"]
+    paths = visualization_report(result, output_dir=tmp_path, feature_names={"y1": "Name"})
+    assert "B1_heatmap" in paths
+    import matplotlib.pyplot as plt
+    plt.close("all")
+
+
+def test_report_top_loadings_include_the_first_latent_column(monkeypatch, tmp_path):
+    from dde.visualization import report as report_module
+
+    frames = []
+    original = report_module._plot_bar_frame
+
+    def capture(df, *args, **kwargs):
+        frames.append(df.copy())
+        return original(df, *args, **kwargs)
+
+    monkeypatch.setattr(report_module, "_plot_bar_frame", capture)
+    report_module.plot_model_summary(_csp_result(), output_dir=tmp_path, feature_names=["a", "b", "c"])
+    top = frames[0]
+    first = top[top["latent"] == "A1_1"]
+    # column A1_1 loads 0.7 on "a" and 0.4 on "c" (B1 above)
+    assert list(first.sort_values("rank")["row"])[:2] == ["a", "c"]
+    assert set(top["latent"]) == {"A1_1", "A1_3", "A2_2"}
+    import matplotlib.pyplot as plt
+    plt.close("all")
+
+
+def test_fit_records_data_frame_column_names():
+    pd = pytest.importorskip("pandas")
+    from dde import fit
+
+    rng = np.random.default_rng(0)
+    Y = pd.DataFrame(rng.normal(size=(200, 6)), columns=[f"BIGFIVE_{j}" for j in range(1, 7)])
+    np.random.seed(0)
+    result = fit(Y, model="DDE", family="Normal", D=1, dimension_method="fixed", K_list=[2],
+                 pen_list=[1.0], tau=0.3, max_it=3, verbose=False)
+    assert result.diagnostics["variable_names"] == list(Y.columns)
+    anchors = get_anchors(result, n_anchors=1, variable_names={"BIGFIVE_1": "Name"})
+    assert set(anchors["variable"]) <= set(["Name"] + list(Y.columns[1:]))

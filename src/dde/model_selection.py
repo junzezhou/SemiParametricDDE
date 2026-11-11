@@ -16,7 +16,7 @@ from sklearn.model_selection import KFold
 
 from .api import ITERATION_LIMIT_NAMES, MODEL_NAMES, fit
 from .algorithms.normal_init_semi import Normal_init_semi, rank_gaussianize_columns
-from .results import DDEResult
+from .results import DDEResult, data_column_names, record_column_names
 from .utils import validate_K_list_identifiability
 from .utils.hyperparameter_selection import (
     _default_csp_t_spike_base,
@@ -892,6 +892,7 @@ def select_hyperparameters(
     do not depend on the evaluation order and are identical for every
     ``n_jobs``.  ``method`` is the deprecated spelling of ``model``.
     """
+    column_names = data_column_names(Y)
     Y = np.asarray(Y)
     if Y.ndim != 2 or min(Y.shape) < 1:
         raise ValueError("Y must be a non-empty two-dimensional matrix.")
@@ -1056,7 +1057,10 @@ def select_hyperparameters(
         cv_table=cv_table,
         fold_scores=fold_scores,
     )
-    record = partial(_record_selection, dimension_method=method, criterion=criterion, selection=selection)
+    _record = partial(_record_selection, dimension_method=method, criterion=criterion, selection=selection)
+
+    def record(result):
+        return record_column_names(_record(result), column_names)
 
     if not refit:
         return record(DDEResult(
