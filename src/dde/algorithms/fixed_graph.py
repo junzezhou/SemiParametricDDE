@@ -1,15 +1,25 @@
 """User-specified graphs for fixed-width DDE fits.
 
-A DDE whose graphical matrices are known (a Q-matrix in cognitive
-diagnosis, a designed measurement structure) is fitted by holding the
-graph fixed and estimating only the coefficients on it, the confirmatory
-analysis of the TIMSS data in Lee and Gu (2025, Supplement S.5.1;
-``get_EM_multimodal_confirm.m`` in the Deep-Discrete-Encoders code).
-``G_list`` gives the graph of the shallowest ``m`` layers (``G_list[0]``
-is ``J x K_1``, ``G_list[d]`` is ``K_d x K_{d+1}``); deeper layers, if
-any, keep the penalized graph estimation.  Only a prefix can be fixed: the
-rows of ``G_list[d]`` name the latent variables of layer ``d``, and those
-are labelled only when the graph below them is fixed.
+``G_list`` gives prespecified sparsity patterns of the shallowest ``m``
+layers (``G_list[0]`` is ``J x K_1``, ``G_list[d]`` is ``K_d x K_{d+1}``):
+as in Section 5.1 of the package manuscript, an entry ``G = 1`` marks an
+allowable connection and ``G = 0`` a coefficient held at zero.  The
+allowable coefficients are estimated by the penalized fixed-width SAEM
+with the same TLP penalty (``pen_list``) and threshold (``tau``) as a fit
+without a graph, so they can still be shrunk to zero; deeper layers, if
+any, keep the penalized estimation over all connections.  A layer whose
+graph allows every connection restricts nothing and is treated as free.
+Only a prefix can be restricted: the rows of ``G_list[d]`` name the latent
+variables of layer ``d``, and those are labelled only when the graph below
+them is informative.
+
+The unpenalized exact EM on a graph (``fit_fixed_graph_em``; the
+confirmatory analysis of the TIMSS data in Lee and Gu, 2025, Supplement
+S.5.1, ``get_EM_multimodal_confirm.m`` in the Deep-Discrete-Encoders code)
+is not part of the fitting interface.  It is kept as a reference
+implementation, ``dde.algorithms.dde.fit_fixed_graph_reference``, to compare
+the SAEM kernel with the maximum-likelihood estimate on the graph; every
+layer must then be restricted.
 
 The fixed layers are initialized from the graph instead of the spectral
 estimate, whose columns come in an arbitrary order.  Each latent column is
@@ -37,7 +47,7 @@ from .parametric_families import resolve_parametric_family
 from .poisson_init import _two_component_poisson_mixture
 
 
-def resolve_graph_list(G_list, *, D: int, J: int, K_list=None):
+def resolve_graph_list(G_list, *, D: int, J: int, K_list=None, drop_unrestricted: bool = True):
     """Validate a user graph and return ``(K_tuple, support_list)``.
 
     ``G_list`` has at most ``D`` entries; missing trailing entries and
@@ -47,6 +57,10 @@ def resolve_graph_list(G_list, *, D: int, J: int, K_list=None):
     ``J`` observed variables.  Widths of fixed layers come from the graph;
     ``K_list`` must agree with them and supplies the free widths, which keep
     the ``K_d >= 3 K_{d+1}`` identifiability ordering below them.
+
+    With ``drop_unrestricted`` (the penalized fits), trailing graphs that
+    allow every connection are returned as ``None``: they restrict nothing.
+    The exact EM keeps them, since it fits exactly the given support.
     """
     D = int(D)
     if isinstance(G_list, (str, bytes)) or not isinstance(G_list, Sequence):
@@ -114,7 +128,26 @@ def resolve_graph_list(G_list, *, D: int, J: int, K_list=None):
                 "Layers with an estimated graph need K_list[d-1] >= 3 * K_list[d]; "
                 f"got {tuple(widths)}."
             )
-    support_list += [None] * (D - n_fixed)
+    # A layer whose graph allows every connection restricts nothing: it is
+    # fitted like a layer without a graph.  Such a layer cannot sit below a
+    # restricted one, whose rows would then name unlabelled latent variables.
+    n_restricted = n_fixed
+    while drop_unrestricted and n_restricted > 0 and support_list[n_restricted - 1].all():
+        n_restricted -= 1
+    if drop_unrestricted and any(support.all() for support in support_list[:n_restricted]):
+        raise ValueError(
+            "A graph that allows every connection does not label its latent "
+            "variables, so the graphs of the layers above it cannot be given."
+        )
+    for d in range(n_restricted, n_fixed):
+        lower_width = int(J) if d == 0 else widths[d - 1]
+        if lower_width < 3 * widths[d]:
+            raise ValueError(
+                "Layers without a restricting graph need K_list[d-1] >= 3 * K_list[d] "
+                f"(and J >= 3 * K_list[0]); got J={int(J)} and {tuple(widths)}."
+            )
+    support_list = support_list[:n_restricted]
+    support_list += [None] * (D - n_restricted)
     return tuple(widths), support_list
 
 

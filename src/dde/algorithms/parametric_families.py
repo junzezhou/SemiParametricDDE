@@ -577,7 +577,8 @@ def _update_deep_normal_observed(X, Q, q_all, tau, *, x_sq_sum=None, support=Non
     """MATLAB D>=3 closed-form observed-layer update and variances.
 
     With ``support`` the least-squares solve is restricted to each row's
-    graph and the coefficients are not thresholded.
+    graph.  ``tau=None`` skips the threshold (the unpenalized fit on a graph
+    used by the graph initializer).
     """
     X = np.asarray(X, dtype=float)
     if support is not None:
@@ -588,6 +589,7 @@ def _update_deep_normal_observed(X, Q, q_all, tau, *, x_sq_sum=None, support=Non
         except np.linalg.LinAlgError:
             coefficients_t = np.linalg.lstsq(Q, q_all.T, rcond=1e-10)[0]
         B_update = coefficients_t.T
+    if tau is not None:
         B_update[:, 1:] = thres(B_update[:, 1:], tau)
 
     quadratic = np.einsum("jp,pq,jq->j", B_update, Q, B_update, optimize=True)
@@ -983,16 +985,17 @@ class NormalFamilyAdapter:
     ):
         """Perform the existing fixed-width Normal observed-layer update.
 
-        With a fixed graph (``support``) every depth solves the
-        stochastic-approximation objective exactly: least squares on the
-        averaged statistics, restricted to each row's parents, without
-        penalty or threshold.
+        With a graph (``support``, the allowable connections) the update is
+        the one without a graph restricted to each row's allowable parents:
+        for ``D >= 3`` the least-squares solve on the averaged statistics
+        with the ``tau`` threshold, otherwise the TLP-penalized row solve
+        with the slopes outside the graph held at zero.
         """
         N, J = X.shape
         K1 = B_start.shape[1] - 1
         C = A_samples.shape[2]
         Q_current, q_current = accumulator.update(X, A_samples, iteration)
-        if support is not None:
+        if support is not None and depth >= 3:
             return _update_deep_normal_observed(
                 X,
                 accumulator.Q,
@@ -1011,6 +1014,10 @@ class NormalFamilyAdapter:
             )
 
         B_update = np.zeros_like(B_start)
+        bounds = [(-bound_val, bound_val)] * (K1 + 1)
+        row_bounds = (
+            [bounds] * J if support is None else _support_row_bounds(bounds, support)
+        )
         for j in range(J):
 
             def obj(x, __j=j, __pen=penalty):
@@ -1021,13 +1028,12 @@ class NormalFamilyAdapter:
                 grad[1:] += pen_grad
                 return value + pen_value, grad
 
-            bounds = [(-bound_val, bound_val)] * (K1 + 1)
             res = minimize(
                 obj,
                 B_start[j, :],
                 method="L-BFGS-B",
                 jac=True,
-                bounds=bounds,
+                bounds=row_bounds[j],
                 options={"maxiter": 10},
             )
             B_update[j, :] = res.x

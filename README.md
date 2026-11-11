@@ -333,14 +333,17 @@ Run `scripts/evaluate_poisson_csp_recovery.py` for checkpointed dimension
 recovery experiments. Its primary summary columns are the exact shrinkage
 recovery rate and the mean L1 distance between fitted and true width vectors.
 
-## Fixed (user-specified) graph
+## Prespecified sparsity (`G_list`)
 
-When the graph is known, as for a Q-matrix in a cognitive assessment, pass it
-as `G_list` and only the coefficients on the graph are estimated (the
-confirmatory analysis of the paper's TIMSS application). `G_list[0]` is the
+When part of the network structure is known, as a Q-matrix in a cognitive
+assessment, pass it as `G_list` (fixed widths only).  `G_list[0]` is the
 `J x K_1` observed-layer graph and `G_list[d]` the `K_d x K_{d+1}` graph above
 it, binary with a nonempty column for every latent variable; the widths follow
-from the graphs:
+from the graphs.  As in Section 5.1 of the package manuscript, `G = 1` marks an
+allowable connection and `G = 0` a coefficient held at exactly zero.  The
+allowable coefficients are estimated by the same penalized SAEM as without a
+graph, so `pen_list` and `tau` are required and can still shrink an allowable
+coefficient to zero:
 
 ```python
 result = fit(
@@ -349,44 +352,55 @@ result = fit(
     family="Normal",
     dimension_method="fixed",
     G_list=[Q, np.ones((7, 1))],
+    pen_list=[N ** 0.25] * 2,
+    tau=0.3,
 )
 ```
 
-The fixed layers are neither penalized nor thresholded (`tau` and `pen_list`
-may be omitted when every layer is fixed), and their coefficients outside the
-graph are exactly zero. The start is graph-anchored: each latent column is
-read off its children with the fewest parents, oriented so that the value one
-raises their means. With every layer fixed and no layer wider than 10, the
-default `graph_algorithm="auto"` runs an exact EM over each layer's `2**K_d`
-states, which reaches the maximum-likelihood estimate on the graph; it keeps
-the best of `n_init=10` starts (the graph-anchored one and random starts on
-the graph, drawn from `random_state`), because the likelihood can be
-multimodal on real data. Wider layers, or a `G_list` that fixes only the
-shallowest layers (`K_list` then gives the free widths, which keep the
-penalized estimation), use the fixed-width SAEM kernel with the graph held
-(`graph_algorithm="saem"`, with `C=1` by default). SemiDDE (`model="SemiDDE"`,
-fixed mode) accepts `G_list` with the SAEM path. The paper-format study is
-`scripts/evaluate_fixed_graph_paper.py` and the TIMSS replication
-`scripts/realdata_timss_fixed_graph.py`.
+A layer whose graph allows every connection restricts nothing and is fitted as
+without a graph (all-ones `G_list` give exactly the fit without a graph; a
+restricted layer cannot sit above such a layer, whose latent variables would
+then be unlabelled).  A `G_list` shorter than `D` restricts the shallowest
+layers only; `K_list` then gives the widths of the deeper layers.  The start
+is graph-anchored: each latent column is read off its children with the
+fewest parents, oriented so that the value one raises their means.  When the
+graphs restrict every deeper layer and none is wider than 10, the layer-wise
+warm start fits the deeper layers by exact EM on the first-stage latent
+states; this only builds the start, and the full SAEM that follows
+penalizes and thresholds the allowable connections.  SemiDDE
+(`model="SemiDDE"`, fixed mode) accepts `G_list` the same way.
+
+Fits on a graph always use the penalized SAEM kernel.  An unpenalized exact
+EM over each layer's `2**K_d` states (every layer restricted, widths up to 16)
+is kept outside `fit()` as a reference implementation for checking the kernel
+against the maximum-likelihood estimate on the graph:
+`dde.algorithms.dde.fit_fixed_graph_reference(Y, family=..., G_list=...)`.
+It does not use `pen_list` or `tau` and keeps the best of `n_init=10` starts
+(the graph-anchored one and random starts on the graph, drawn from
+`random_state`), because the likelihood can be multimodal on real data.  The
+paper-format study `scripts/evaluate_fixed_graph_paper.py` and the TIMSS
+confirmatory replication `scripts/realdata_timss_fixed_graph.py` call it.
 
 CopDDE takes `G_list` the same way:
 
 ```python
 result = fit(X_counts, model="CopDDE", dimension_method="fixed",
-             G_list=[G1, G2], random_state=0)
+             G_list=[G1, G2], pen_list=[N ** 0.25] * 2, tau=0.3,
+             random_state=0)
 ```
 
-The fixed layers are fitted by the rank-likelihood kernel (`get_SAEM_RL_D`)
-on their graph, unpenalized and unthresholded, with coordinate-Gibbs latent
-draws, as in the CopDDE code's fixed-graph refit (`get_SAEM_RL_G.m`); the
-defaults are `C=1`, `max_it=50`, `tol=0` and `temp=1`. The start matches the
-spectral estimate's columns to the graph, which needs no child with a single
-parent. With every layer fixed and deep layers no wider than 10, the layers
-above the first are then refitted by exact EM on the first layer's states
-after `graph_warmup_it=10` kernel iterations, keeping the best of `n_init=20`
-starts. A binary graph fixes the labels of the latent variables but not their
-0/1 coding, and variables with identical graph columns (and rows above) are
-interchangeable. The paper-format study is
+The rank-likelihood kernel (`get_SAEM_RL_D`) holds the coefficients outside
+the graph at zero and penalizes and thresholds the allowable ones; with a
+restricting graph its latent draws are coordinate-Gibbs sweeps, as in the
+CopDDE code's fixed-graph refit (`get_SAEM_RL_G.m`), and the defaults are
+`C=1`, `max_it=50`, `tol=0` and `temp=1`.  The start matches the spectral
+estimate's columns to the graph, which needs no child with a single parent.
+With every layer restricted and deep layers no wider than 10, the layers above
+the first are then refitted by exact EM on the first layer's states after
+`graph_warmup_it=10` kernel iterations, keeping the best of `n_init=20`
+starts.  A binary graph fixes the labels of the latent variables but not
+their 0/1 coding, and variables with identical graph columns (and rows above)
+are interchangeable.  The paper-format study is
 `scripts/evaluate_copdde_fixed_graph.py`.
 
 ## Hyperparameter selection

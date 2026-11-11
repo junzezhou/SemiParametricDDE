@@ -163,7 +163,9 @@ def run_one(task):
 
         np.random.seed(seed % (2**32))
         started = time.perf_counter()
-        result = fit(X, method="CopDDE", G_list=[G.astype(int) for G in G_list],
+        # unpenalized fit on the true graph: no penalty and a negligible threshold
+        result = fit(X, model="CopDDE", dimension_method="fixed", G_list=[G.astype(int) for G in G_list],
+                     pen_list=0.0, tau=1e-8,
                      random_state=seed, verbose=False)
         seconds = time.perf_counter() - started
 

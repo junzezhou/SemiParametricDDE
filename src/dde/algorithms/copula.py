@@ -158,14 +158,16 @@ def fit_copula_dde(
     unless ``temp`` is given; for CSP fits ``tol`` sets the stopping rule's
     ``convergence_std``.
 
-    ``G_list`` fixes a user-specified graph, as in
+    ``G_list`` gives the allowable connections, as in
     :func:`dde.algorithms.dde.fit_parametric_dde`: binary matrices
     ``G_list[0]`` (``J x K_1``) and ``G_list[d]`` (``K_d x K_{d+1}``), a
-    prefix of the layers.  The fixed layers are fitted on their graph by the
-    fixed-width kernel without the TLP penalty or threshold (``pen_list`` and
-    ``tau`` then matter only for free deeper layers), with systematic
-    coordinate-Gibbs latent draws (``latent_transition``) as in the MATLAB
-    ``get_SAEM_RL_G.m``.  The defaults are ``C=1``, ``it=50``, ``tol=0``
+    prefix of the layers.  The coefficients outside the graph are held at
+    zero; the allowable ones get the fixed-width kernel's TLP penalty
+    (``pen_list``) and ``tau`` threshold.  A graph that allows every
+    connection restricts nothing (all-ones ``G_list`` give the fit without
+    a graph).  With a restricting graph the latent draws are systematic
+    coordinate-Gibbs sweeps (``latent_transition``) as in the MATLAB
+    ``get_SAEM_RL_G.m``, and the defaults are ``C=1``, ``it=50``, ``tol=0``
     (run all iterations) and ``temp=1``.  The start matches the spectral
     estimate to the graph and, when every layer is fixed and the deep widths
     are at most 10, refits the deep layers by exact EM after
@@ -187,16 +189,16 @@ def fit_copula_dde(
         K_tuple, support_list = resolve_graph_list(G_list, D=D_graph, J=X.shape[1], K_list=K_list)
         K_list = list(K_tuple)
         n_fixed = sum(support is not None for support in support_list)
-        all_fixed = n_fixed == D_graph
-        kwargs.setdefault("C", 1)
-        kwargs.setdefault("it", 50)
-        kwargs.setdefault("tol", 0.0)
-        kwargs.setdefault("temp", 1.0)
-        kwargs.setdefault("latent_transition", "systematic_coordinate_gibbs")
-        if all_fixed:
-            kwargs.setdefault("pen_list", 0.0)
-            kwargs.setdefault("tau", 1.0)
-        kwargs["support_list"] = support_list
+        if n_fixed == 0:
+            # Every graph allows every connection: the fit without a graph.
+            support_list = None
+        else:
+            kwargs.setdefault("C", 1)
+            kwargs.setdefault("it", 50)
+            kwargs.setdefault("tol", 0.0)
+            kwargs.setdefault("temp", 1.0)
+            kwargs.setdefault("latent_transition", "systematic_coordinate_gibbs")
+            kwargs["support_list"] = support_list
     elif n_init is not None or graph_warmup_it is not None:
         raise ValueError("n_init and graph_warmup_it apply only to fits with G_list.")
     if method not in {"fixed", "csp"}:
@@ -250,7 +252,7 @@ def fit_copula_dde(
         if support_list is not None:
             missing = [name for name in ("C", "temp", "pen_list", "tau") if name not in kwargs]
             if missing:
-                raise ValueError("fit_copula_dde with a partial G_list needs: " + ", ".join(missing))
+                raise ValueError("fit_copula_dde with G_list needs: " + ", ".join(missing))
             if isinstance(random_state, np.random.Generator):
                 rng = random_state
             else:

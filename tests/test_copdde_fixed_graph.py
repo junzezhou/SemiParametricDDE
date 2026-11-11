@@ -2,16 +2,11 @@
 
 import numpy as np
 import pytest
-from scipy.optimize import minimize
 
 from dde import fit
 from dde.algorithms.copula import fit_copula_dde, prepare_rank_likelihood_inputs
 from dde.algorithms.fixed_graph import spectral_graph_initialize
-from dde.algorithms.get_SAEM_RL_D import (
-    _gaussian_layer_on_support,
-    _logistic_layer_on_support,
-    get_SAEM_RL_D,
-)
+from dde.algorithms.get_SAEM_RL_D import get_SAEM_RL_D
 from dde.copula import simulate_gaussian_mixture
 from dde.simulation import generate_X_Cop_marg_emp_D
 
@@ -47,78 +42,24 @@ def _state_agreement(fitted, true):
     return np.maximum(same, 1.0 - same)
 
 
-def test_gaussian_layer_on_support_is_restricted_least_squares():
-    rng = np.random.default_rng(0)
-    N, J, K, C = 200, 5, 3, 2
-    A = np.concatenate([np.ones((N, 1, C)), rng.integers(0, 2, size=(N, K, C)).astype(float)], axis=1)
-    Z = rng.normal(size=(N, J))
-    support = np.array([[1, 0, 0], [1, 1, 0], [0, 1, 1], [1, 1, 1], [0, 0, 1]], dtype=bool)
-    lb, ub = np.full(K + 1, -10.0), np.full(K + 1, 10.0)
-    B, gamma = _gaussian_layer_on_support(Z, A, np.zeros((J, K + 1)), support, lb, ub, 50)
-    design = np.transpose(A, (0, 2, 1)).reshape(N * C, K + 1)
-    for j in range(J):
-        columns = np.concatenate(([0], 1 + np.flatnonzero(support[j])))
-        expected = np.linalg.lstsq(design[:, columns], np.repeat(Z[:, j], C), rcond=None)[0]
-        np.testing.assert_allclose(B[j, columns], expected, atol=1e-8)
-        assert np.all(B[j, 1:][~support[j]] == 0.0)
-    assert gamma.shape == (J,) and np.all(gamma > 0)
-
-
-def test_gaussian_layer_on_support_respects_bounds():
-    rng = np.random.default_rng(1)
-    N, C = 300, 1
-    A = np.concatenate([np.ones((N, 1, C)), rng.integers(0, 2, size=(N, 1, C)).astype(float)], axis=1)
-    Z = (30.0 * A[:, 1, 0])[:, None] + rng.normal(size=(N, 1))
-    lb, ub = np.array([-10.0, -10.0]), np.array([10.0, 10.0])
-    B, _ = _gaussian_layer_on_support(Z, A, np.zeros((1, 2)), np.ones((1, 1), bool), lb, ub, 200)
-    assert B[0, 1] == pytest.approx(10.0)
-
-
-def test_logistic_layer_on_support_matches_unaggregated_fit():
-    rng = np.random.default_rng(2)
-    N, K_child, K_parent, C = 400, 4, 3, 2
-    parents = np.concatenate(
-        [np.ones((N, 1, C)), rng.integers(0, 2, size=(N, K_parent, C)).astype(float)], axis=1
-    )
-    children = np.concatenate(
-        [np.ones((N, 1, C)), rng.integers(0, 2, size=(N, K_child, C)).astype(float)], axis=1
-    )
-    support = np.array([[1, 0, 0], [1, 1, 0], [0, 1, 1], [0, 0, 1]], dtype=bool)
-    lb, ub = np.array([-5.0, -10.0, -10.0, -10.0]), np.full(K_parent + 1, 10.0)
-    temp = 0.8
-    B = _logistic_layer_on_support(
-        children, parents, np.zeros((K_child, K_parent + 1)), support, temp, lb, ub, 500, 1
-    )
-    design = np.transpose(parents, (0, 2, 1)).reshape(N * C, K_parent + 1)
-    for k in range(K_child):
-        columns = np.concatenate(([0], 1 + np.flatnonzero(support[k])))
-        y = children[:, k + 1, :].reshape(N * C)
-        X = design[:, columns]
-
-        def objective(x):
-            eta = X @ x
-            return temp / C * np.sum(np.logaddexp(0.0, eta) - y * eta)
-
-        expected = minimize(objective, np.zeros(columns.size), method="L-BFGS-B",
-                            bounds=list(zip(lb[columns], ub[columns]))).x
-        np.testing.assert_allclose(B[k, columns], expected, atol=1e-4)
-        assert np.all(B[k, 1:][~support[k]] == 0.0)
-
-
-def test_kernel_holds_graph_and_skips_threshold():
+def test_kernel_holds_graph_and_thresholds_allowable_slopes():
     sim, G = _simulate(400, seed=3)
     X = sim["X"]
     Z, R, Rlevels = prepare_rank_likelihood_inputs(X)
     prop, B, gamma, A, _ = spectral_graph_initialize(Z, G, (6, 2))
+    args = (X, Z, R, Rlevels, prop, gamma, B, A, 1, 0.0, 3, 1.0)
+    # The graph only marks allowable connections: a huge tau zeroes them all.
     np.random.seed(0)
-    raw = get_SAEM_RL_D(
-        X, Z, R, Rlevels, prop, gamma, B, A, 1, 0.0, 3, 1.0, 0.0, 50.0,
-        verbose=False, support_list=G, latent_transition="systematic_coordinate_gibbs",
-    )
+    huge = get_SAEM_RL_D(*args, 0.0, 50.0, verbose=False, support_list=G,
+                         latent_transition="systematic_coordinate_gibbs")
+    assert all(np.all(B_d[:, 1:] == 0.0) for B_d in huge["B_list"])
+    np.random.seed(0)
+    raw = get_SAEM_RL_D(*args, 1.0, 0.1, verbose=False, support_list=G,
+                        latent_transition="systematic_coordinate_gibbs")
     for B_d, G_d in zip(raw["B_list"], G):
         assert np.all(B_d[:, 1:][~G_d] == 0.0)
-        # tau = 50 would zero every slope of a thresholded layer
-        assert np.count_nonzero(B_d[:, 1:][G_d]) == np.count_nonzero(G_d)
+        slopes = B_d[:, 1:][G_d]
+        assert np.all((slopes == 0.0) | (np.abs(slopes) >= 0.1))
     assert raw["latent_transition"] == "systematic_coordinate_gibbs"
     assert raw["p"] is None and raw["top_probabilities"].shape == (400, 2)
 
@@ -148,7 +89,7 @@ def test_fit_copdde_on_a_given_graph():
     sim, G = _simulate(1500, seed=6)
     np.random.seed(6)
     result = fit(sim["X"], model="CopDDE", dimension_method="fixed", G_list=[g.astype(int) for g in G],
-                 random_state=6, verbose=False, it=20, n_init=5)
+                 pen_list=0.0, tau=0.05, random_state=6, verbose=False, it=20, n_init=5)
     assert result.K_list == [6, 2]
     assert result.diagnostics["dimension_method"] == "fixed"
     assert result.diagnostics["fixed_graph_layers"] == 2
@@ -176,7 +117,9 @@ def test_graph_argument_errors():
         fit_copula_dde(X, G_list=G, dimension_method="csp", verbose=False)
     with pytest.raises(ValueError, match="only to fits with G_list"):
         fit_copula_dde(X, K_list=[6, 2], dimension_method="fixed", n_init=3, verbose=False)
-    with pytest.raises(ValueError, match="partial G_list needs"):
+    with pytest.raises(ValueError, match="G_list needs: pen_list, tau"):
+        fit_copula_dde(X, G_list=G, verbose=False)
+    with pytest.raises(ValueError, match="G_list needs"):
         fit_copula_dde(X, K_list=[6, 2], G_list=[G[0]], verbose=False)
     with pytest.raises(ValueError, match="rows"):
         fit_copula_dde(X, G_list=[G[0][:-1]], verbose=False)
@@ -193,3 +136,17 @@ def test_partial_graph_keeps_free_layer_penalized():
     assert np.all(result.B_list[0][:, 1:][~G[0]] == 0.0)
     free_slopes = result.B_list[1][:, 1:]
     assert np.all((free_slopes == 0.0) | (np.abs(free_slopes) >= 0.3))
+
+
+def test_all_ones_graph_gives_the_fit_without_a_graph():
+    sim, _ = _simulate(300, seed=9)
+    args = dict(dimension_method="fixed", pen_list=[1.0, 1.0], tau=0.3, tol=0.0, it=3,
+                random_state=9, verbose=False)
+    np.random.seed(9)
+    plain = fit_copula_dde(sim["X"], K_list=[6, 2], **args)
+    np.random.seed(9)
+    ones = fit_copula_dde(sim["X"], G_list=[np.ones((30, 6), int), np.ones((6, 2), int)], **args)
+    assert ones.K_list == plain.K_list == [6, 2]
+    assert "G_list" not in ones.diagnostics
+    for B_ones, B_plain in zip(ones.B_list, plain.B_list):
+        np.testing.assert_array_equal(B_ones, B_plain)

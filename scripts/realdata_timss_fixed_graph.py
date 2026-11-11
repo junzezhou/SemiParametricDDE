@@ -79,14 +79,17 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
 
     from dde import fit
+    from dde.algorithms.dde import fit_fixed_graph_reference
 
     Y, Q, survey = load_timss()
     G_list = [Q, np.ones((7, 1))]
     summary = {"N": int(Y.shape[0]), "J": int(Y.shape[1]), "K_list": [7, 1]}
     tables = {}
 
-    normal = fit(
-        Y, method="DDE", family="normal", G_list=G_list, n_init=args.n_init,
+    # The confirmatory fit is the unpenalized exact EM on the graph, the
+    # package's reference implementation (not part of fit()).
+    normal = fit_fixed_graph_reference(
+        Y, family="normal", G_list=G_list, n_init=args.n_init,
         random_state=args.random_state, verbose=False,
     )
     tables["normal_dde_em"] = survey_table(normal.A_list[0], normal.A_list[1], survey)
@@ -130,7 +133,9 @@ def main():
             "layer2_slopes": B_m[1][:, 1].tolist(),
         }
 
-    semi = fit(Y, method="SemiDDE", G_list=G_list, C=1, tol=0.005, verbose=False)
+    # Confirmatory (unpenalized) fit on the graph: no penalty and a negligible threshold.
+    semi = fit(Y, model="SemiDDE", dimension_method="fixed", G_list=G_list,
+               pen_list=[0.0, 0.0], tau=1e-8, C=1, tol=0.005, verbose=False)
     tables["semidde_saem"] = survey_table(semi.A_list[0], semi.A_list[1], survey)
     B1s, B2s = semi.B_list
     summary["semidde_saem"] = {

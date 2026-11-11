@@ -158,14 +158,10 @@ def _initialize_semidde(Y, K_list, kwargs, *, dimension_method, support_list=Non
 
 def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization, support_list=None):
     if support_list is not None and any(support is not None for support in support_list):
-        # Fixed layers are neither penalized nor thresholded; with every
-        # layer fixed, pen_list and tau are not used.
-        if all(support is not None for support in support_list):
-            kwargs.setdefault("pen_list", [0.0] * len(K_list))
-            if kwargs.get("tau") is None:
-                kwargs["tau"] = 1.0
-        # The graph-anchored start pins the layer-1 states (see the Normal
-        # DDE default in fit_parametric_dde).
+        # The graph only restricts the allowable connections; pen_list and
+        # tau act on them as without a graph.  The graph-anchored start pins
+        # the layer-1 states (see the Normal DDE default in
+        # fit_parametric_dde).
         kwargs.setdefault("sa_burn_in", 0)
         kwargs["support_list"] = support_list
     if kwargs.get("C") is None:
@@ -344,13 +340,13 @@ def fit_semidde(
 ) -> DDEResult:
     """Fit fixed-width or CSP-selected SemiDDE.
 
-    ``G_list`` (fixed mode) fixes a user-specified graph of the shallowest
-    layers as in :func:`dde.algorithms.dde.fit_parametric_dde`: the fixed
-    layers are fitted on the graph without penalty or threshold in every
-    inner SAEM fit of the pseudo-observations, start from the
-    graph-anchored initialization, and run without the unit-step burn-in
-    (``sa_burn_in=0``) unless it is given.  ``pen_list`` and ``tau`` may be
-    omitted when every layer is fixed.
+    ``G_list`` (fixed mode) gives the allowable connections of the
+    shallowest layers as in :func:`dde.algorithms.dde.fit_parametric_dde`:
+    every inner SAEM fit of the pseudo-observations holds the coefficients
+    outside the graph at zero and penalizes and thresholds the allowable
+    ones with ``pen_list`` and ``tau``; the fit starts from the
+    graph-anchored initialization and runs without the unit-step burn-in
+    (``sa_burn_in=0``) unless it is given.
 
     Fixed mode uses the supplied ``K_list``.  CSP mode starts from the
     maximal widths ``K_list`` when given and otherwise from the recursive

@@ -114,9 +114,14 @@ def _layerwise_warm_start(
     each deeper layer is identified from the layer below), so each stage
     solves an identified sub-problem from its own initialization instead of
     letting the deep layers drift while the observed layer is still far from
-    its optimum.  With a fixed graph (``support_list``) stage 1 holds the
+    its optimum.  With a graph (``support_list``) stage 1 holds the
     observed-layer graph and stage 2 passes the deeper graphs on as its
-    ``G_list``.
+    ``G_list``; when they restrict every deeper layer and no deeper layer is
+    wider than ``EXACT_EM_MAX_WIDTH``, stage 2 is the exact (unpenalized) EM
+    on those graphs.  It only builds the start: the full SAEM that follows
+    penalizes and thresholds the allowable connections.  (Normal B_s design
+    (54, 18, 6), 10 replicates: layer-2 RMSE 0.33 / 0.15 / 0.11 at N = 500 /
+    2000 / 8000 with the EM start, 0.57 / 0.19 / 0.11 with a SAEM start.)
     """
     D = len(B_list)
     if support_list is None:
@@ -164,6 +169,10 @@ def _layerwise_warm_start(
     )
     if any(support is not None for support in support_list[1:]):
         deep_kwargs["G_list"] = list(support_list[1:])
+        if all(support is not None for support in support_list[1:]) and max(
+            deep_widths
+        ) <= EXACT_EM_MAX_WIDTH:
+            deep_kwargs["_exact_em"] = True
     if oracle:
         deep_kwargs.update(
             initialize="oracle",
@@ -202,8 +211,6 @@ def fit_parametric_dde(
     tau=None,
     C=None,
     G_list=None,
-    graph_algorithm=None,
-    n_init=None,
     tol=None,
     max_it=None,
     initialize: str = "data",
@@ -372,40 +379,28 @@ def fit_parametric_dde(
     0.07 at N=16000), so they are kept for wide layers where the dense
     solve is too slow.
 
-    ``G_list`` fixes a user-specified graph (fixed-width fits only):
-    ``G_list[0]`` is the ``J x K_1`` observed-layer graph and ``G_list[d]``
-    the ``K_d x K_{d+1}`` graph of layer ``d + 1``, binary with a nonempty
-    column for every latent variable.  A shorter list (or trailing ``None``
-    entries) fixes only the shallowest layers; the deeper graphs are still
-    estimated, and ``K_list`` gives their widths (the fixed widths follow
-    from the graphs).  The fixed layers are fitted without penalty or
-    threshold, their coefficients outside the graph held at exactly zero
-    (the confirmatory EM of the paper's TIMSS analysis), so ``tau`` and the
-    ``pen_list`` entries of fixed layers are not used; ``tau`` and
-    ``pen_list`` may be omitted when every layer is fixed.  The data
+    ``G_list`` gives prespecified sparsity patterns (fixed-width fits only,
+    manuscript Section 5.1): ``G_list[0]`` is the ``J x K_1`` observed-layer
+    graph and ``G_list[d]`` the ``K_d x K_{d+1}`` graph of layer ``d + 1``,
+    binary with a nonempty column for every latent variable.  ``G = 1``
+    marks an allowable connection and ``G = 0`` a coefficient held at
+    exactly zero; the allowable coefficients get the same TLP penalty
+    (``pen_list``) and ``tau`` threshold as a fit without a graph, so the
+    penalty can still remove them.  A graph that allows every connection
+    restricts nothing (all-ones ``G_list`` give the fit without a graph).  A
+    shorter list (or trailing ``None`` entries) restricts only the
+    shallowest layers; ``K_list`` gives the widths of the deeper layers
+    (the restricted widths follow from the graphs).  The data
     initialization is then graph-anchored (see
     :mod:`dde.algorithms.fixed_graph`): each latent column is read off its
     children with the fewest parents, oriented so that the value one raises
     their means, which fixes the column labels to the graph's.  The
     layer-wise warm start passes the graphs to its stages.
-    ``graph_algorithm`` chooses the estimator: ``"em"`` is the exact EM of
-    :func:`dde.algorithms.fixed_graph.fit_fixed_graph_em` (every layer
-    fixed; it enumerates the ``2**K_d`` states of each layer and reaches
-    the maximum-likelihood estimate on the graph without Monte Carlo
-    error), ``"saem"`` the fixed-width SAEM kernel above (any width, and
-    the only choice when deeper graphs are estimated), and the default
-    ``"auto"`` takes ``"em"`` when every layer is fixed and no layer is
-    wider than ``EXACT_EM_MAX_WIDTH`` (10).  For ``"em"`` ``C`` is not
-    used, ``max_it`` defaults to 500 M-steps and ``tol`` (default
-    ``1e-6``) bounds the log-likelihood gain per observation.  The EM
-    likelihood on a fixed graph can be multimodal on real data (TIMSS
-    response times, ``K_list=[7, 1]``: 20 random starts reach 9 local
-    optima spanning 140 log-likelihood units, and the graph-anchored start
-    is not the best), so ``"em"`` runs ``n_init`` starts (default 10): the
-    graph-anchored start (or the supplied state) and random starts on the
-    graph (:func:`dde.algorithms.fixed_graph.random_graph_start`, drawn
-    from ``random_state`` or else from the global NumPy generator), and
-    keeps the largest log-likelihood.
+    Fits on a graph always use the penalized SAEM kernel above.  The
+    unpenalized exact EM on a fully specified graph is not part of this
+    interface: it is kept as a reference implementation,
+    :func:`fit_fixed_graph_reference`, to check the kernel against the
+    maximum-likelihood estimate on the graph.
 
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
@@ -415,6 +410,19 @@ def fit_parametric_dde(
     scale; the hard threshold therefore acts on standardized loadings.
     """
     family_adapter = resolve_parametric_family(family)
+    # The unpenalized exact EM on a fully specified graph is not part of the
+    # fitting interface: it is reached only through the reference
+    # implementation ``fit_fixed_graph_reference`` and the layer-wise warm
+    # start's deep stage, which pass these private flags.
+    exact_em = bool(kwargs.pop("_exact_em", False))
+    n_init = kwargs.pop("_n_init", None)
+    removed = sorted({"graph_algorithm", "n_init"} & set(kwargs))
+    if removed:
+        raise TypeError(
+            f"{' and '.join(removed)} is not an argument of fit(): fits on a graph use "
+            "the penalized SAEM kernel. The unpenalized exact EM is kept for "
+            "comparison as dde.algorithms.dde.fit_fixed_graph_reference."
+        )
     if kwargs:
         unknown = ", ".join(sorted(kwargs))
         raise TypeError(
@@ -445,16 +453,18 @@ def fit_parametric_dde(
             raise ValueError(
                 "t_spike and temp are only used by dimension_method='csp'."
             )
+        # The unpenalized exact EM on a graph does not use pen_list and fits
+        # the given support as it is, all-ones graphs included.
         if G_list is not None:
             K_tuple, support_list = resolve_graph_list(
-                G_list, D=D, J=X.shape[1], K_list=K_list
+                G_list, D=D, J=X.shape[1], K_list=K_list,
+                drop_unrestricted=not exact_em,
             )
         else:
             if K_list is None:
                 raise ValueError("K_list is required when dimension_method='fixed'.")
             K_tuple = validate_K_list_identifiability(K_list, D=D, J=X.shape[1])
-        all_fixed = all(support is not None for support in support_list)
-        if pen_list is None and all_fixed:
+        if pen_list is None and exact_em:
             penalties = [0.0] * D
         else:
             penalties = _validate_pen_list(pen_list, D)
@@ -479,31 +489,15 @@ def fit_parametric_dde(
         )
         penalties = None
 
-    if graph_algorithm is None:
-        graph_algorithm = "auto"
-    graph_algorithm = str(graph_algorithm).strip().lower()
-    if graph_algorithm not in {"auto", "em", "saem"}:
-        raise ValueError("graph_algorithm must be 'auto', 'em' or 'saem'.")
-    every_layer_fixed = all(support is not None for support in support_list)
-    if graph_algorithm == "auto":
-        graph_algorithm = (
-            "em"
-            if every_layer_fixed and max(K_tuple) <= EXACT_EM_MAX_WIDTH
-            else "saem"
-        )
-    if graph_algorithm == "em" and not every_layer_fixed:
+    # The penalized SAEM is the manuscript's fixed-width estimator, with or
+    # without a graph.
+    if exact_em and not all(support is not None for support in support_list):
+        raise ValueError("The exact EM needs G_list to restrict every layer.")
+    if exact_em and max(K_tuple) > 16:
         raise ValueError(
-            "graph_algorithm='em' needs G_list to fix every layer; partially fixed "
-            "graphs use 'saem'."
+            "The exact EM enumerates 2**K_d states per layer; widths above 16 "
+            "are not supported."
         )
-    if graph_algorithm == "em" and max(K_tuple) > 16:
-        raise ValueError(
-            "graph_algorithm='em' enumerates 2**K_d states per layer; widths above 16 "
-            "need graph_algorithm='saem'."
-        )
-    exact_em = graph_algorithm == "em"
-    if n_init is not None and not exact_em:
-        raise ValueError("n_init applies to the exact EM on a fixed graph only.")
     n_init_value = 10 if n_init is None else int(n_init)
     if n_init_value < 1:
         raise ValueError("n_init must be a positive integer.")
@@ -529,9 +523,11 @@ def fit_parametric_dde(
             tol = 0.0 if discrete_copula_csp else DEFAULT_PARAMETRIC_CONVERGENCE_TOL
     graph_fixed = any(support is not None for support in support_list)
     if tau is None:
-        if not all(support is not None for support in support_list):
-            raise ValueError("tau is required unless G_list fixes every layer.")
-        # Unused: fixed layers are neither penalized nor thresholded.
+        if not exact_em:
+            raise ValueError(
+                "tau is required."
+            )
+        # Unused: the exact EM neither penalizes nor thresholds.
         tau = 1.0
         tau_used = None
     else:
@@ -1107,6 +1103,63 @@ def fit_parametric_dde(
         transformed=X_result,
         diagnostics=compressed["diagnostics"],
         raw=compressed["raw"],
+    )
+
+
+def fit_fixed_graph_reference(
+    Y,
+    *,
+    family,
+    G_list,
+    n_init: int = 10,
+    tol=None,
+    max_it=None,
+    initialize: str = "data",
+    random_state=None,
+    verbose: bool = False,
+    **kwargs,
+) -> DDEResult:
+    """Unpenalized exact EM on a fully specified graph (reference implementation).
+
+    Not reachable from :func:`dde.fit`, whose fits on a graph use the
+    penalized SAEM kernel; kept to compare that kernel with the
+    maximum-likelihood estimate on the graph, and for the confirmatory
+    analysis of Lee and Gu's TIMSS data (``get_EM_multimodal_confirm.m``
+    in the Deep-Discrete-Encoders code).
+
+    Every layer must be restricted (``len(G_list)`` is the depth; all-ones
+    graphs are kept as given), widths are at most 16 because each layer's
+    ``2**K_d`` states are enumerated, and the coefficients on the graph are
+    neither penalized nor thresholded, so ``pen_list``, ``tau`` and ``C``
+    are not used.  ``max_it`` defaults to 500 M-steps and ``tol`` (default
+    ``1e-6``) bounds the log-likelihood gain per observation.  The
+    likelihood on a graph can be multimodal on real data (TIMSS response
+    times, ``K_list=[7, 1]``: 20 random starts reach 9 local optima
+    spanning 140 log-likelihood units, and the graph-anchored start is not
+    the best), so ``n_init`` starts are run: the graph-anchored start (or
+    the supplied state) and random starts on the graph
+    (:func:`dde.algorithms.fixed_graph.random_graph_start`, drawn from
+    ``random_state`` or else from the global NumPy generator); the largest
+    log-likelihood is kept.  Other keyword arguments are those of
+    :func:`fit_parametric_dde` (for instance ``prop_in``, ``B_list_in``,
+    ``bound_val``).
+    """
+    if isinstance(G_list, (str, bytes)) or not isinstance(G_list, Sequence):
+        raise ValueError("G_list must be a sequence of graphical matrices.")
+    return fit_parametric_dde(
+        Y,
+        family=family,
+        D=len(G_list),
+        G_list=G_list,
+        dimension_method="fixed",
+        tol=tol,
+        max_it=max_it,
+        initialize=initialize,
+        random_state=random_state,
+        verbose=verbose,
+        _exact_em=True,
+        _n_init=n_init,
+        **kwargs,
     )
 
 
