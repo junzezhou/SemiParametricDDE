@@ -27,7 +27,9 @@ that is removed.  Every other component is reused unchanged:
 5. the Gamma(1, 1) MAP update of the conditional variances;
 6. hard thresholding of the shallow layers, hierarchical row gating of
    inactive children, the linear temperature schedule, and the rolling
-   relative-Frobenius-change stopping rule.
+   relative-Frobenius-change stopping rule (the mean over the last
+   ``convergence_window`` iterations of each layer's relative change is at
+   most ``convergence_tol``).
 
 Optional departures from the CopDDE kernel, all off by default
 (see ``Results/normal_dde_csp_copula_kernel/REPORT_top_layer.md``):
@@ -329,7 +331,7 @@ def fit_parametric_csp_copula(
     bound_val: float = 10.0,
     n_jobs: int = 1,
     convergence_window: int = 7,
-    convergence_std: float = 0.005,
+    convergence_tol: float = 0.005,
     burn: int = 5,
     threshold_rule: str = "first_two",
     mstep_solver: str = "fista_lower",
@@ -566,7 +568,7 @@ def fit_parametric_csp_copula(
     burn = int(burn)
     temp = float(temp)
     tau = float(tau)
-    convergence_std = float(convergence_std)
+    convergence_tol = float(convergence_tol)
     if C < 1 or it < 1 or optimizer_maxiter < 1 or convergence_window < 1:
         raise ValueError(
             "C, it, optimizer_maxiter, and convergence_window must be positive."
@@ -577,8 +579,8 @@ def fit_parametric_csp_copula(
         raise ValueError("temp must lie in (0, 1].")
     if not np.isfinite(tau) or tau < 0:
         raise ValueError("tau must be finite and nonnegative.")
-    if not np.isfinite(convergence_std) or convergence_std < 0:
-        raise ValueError("convergence_std must be finite and nonnegative.")
+    if not np.isfinite(convergence_tol) or convergence_tol < 0:
+        raise ValueError("convergence_tol must be finite and nonnegative.")
     threshold_rule = str(threshold_rule).strip().lower()
     if threshold_rule not in _THRESHOLD_RULES:
         raise ValueError(
@@ -1086,7 +1088,10 @@ def fit_parametric_csp_copula(
             temp = min(1.0, temp + 0.01 * ((it_num - burn) - 1))
 
         # 9) Rolling relative-change stopping rule (never during the
-        #    slab-start burn-in).
+        #    slab-start burn-in): every layer's relative coefficient change,
+        #    averaged over the last ``convergence_window`` iterations, is at
+        #    most ``convergence_tol``.  The average smooths the Monte Carlo
+        #    noise of single iterations.
         stop_now = shrinkage_active and all(stage_open)
         current_rel = []
         for d in range(D):
@@ -1097,7 +1102,7 @@ def fit_parametric_csp_copula(
             current_rel.append(float(rel))
             if (
                 len(rel_hist[d]) < convergence_window
-                or np.std(rel_hist[d][-convergence_window:]) >= convergence_std
+                or np.mean(rel_hist[d][-convergence_window:]) > convergence_tol
             ):
                 stop_now = False
         width_hist.append(tuple(int(value) for value in num_act))

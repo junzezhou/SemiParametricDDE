@@ -164,6 +164,9 @@ def _layerwise_warm_start(
     )
     if any(support is not None for support in support_list[1:]):
         deep_kwargs["G_list"] = list(support_list[1:])
+        # When the deep graph is fully given this stage is the exact EM; it
+        # keeps its earlier stopping rule (see ``em_criterion``).
+        deep_kwargs["em_criterion"] = "loglik_gain"
     if oracle:
         deep_kwargs.update(
             initialize="oracle",
@@ -204,6 +207,7 @@ def fit_parametric_dde(
     G_list=None,
     graph_algorithm=None,
     n_init=None,
+    em_criterion: str = "relative_parameter_change",
     tol=None,
     max_it=None,
     initialize: str = "data",
@@ -274,7 +278,8 @@ def fit_parametric_dde(
     estimates aligned with known generating parameters.  Ordinary data fits
     should use the default ``initialize="data"``.
 
-    For fixed-width fits, ``tol`` is the postprocessed parameter-update RMSE.
+    For fixed-width fits, ``tol`` bounds the relative parameter change
+    ``||theta_new - theta_old|| / ||theta_old||`` of a postprocessed update.
     Its default is ``0.005`` for a dimension-independent convergence scale.
     ``tol=None`` and ``max_it=None`` select ``0.005`` and 50 iterations,
     except for the copula-backend Bernoulli/Poisson CSP (their default CSP
@@ -397,7 +402,7 @@ def fit_parametric_dde(
     ``"auto"`` takes ``"em"`` when every layer is fixed and no layer is
     wider than ``EXACT_EM_MAX_WIDTH`` (10).  For ``"em"`` ``C`` is not
     used, ``max_it`` defaults to 500 M-steps and ``tol`` (default
-    ``1e-6``) bounds the log-likelihood gain per observation.  The EM
+    ``1e-4``) bounds the relative parameter change of an M-step.  The EM
     likelihood on a fixed graph can be multimodal on real data (TIMSS
     response times, ``K_list=[7, 1]``: 20 random starts reach 9 local
     optima spanning 140 log-likelihood units, and the graph-anchored start
@@ -405,7 +410,12 @@ def fit_parametric_dde(
     graph-anchored start (or the supplied state) and random starts on the
     graph (:func:`dde.algorithms.fixed_graph.random_graph_start`, drawn
     from ``random_state`` or else from the global NumPy generator), and
-    keeps the largest log-likelihood.
+    keeps the largest log-likelihood.  ``em_criterion="loglik_gain"`` makes
+    ``tol`` bound the EM's log-likelihood gain per observation instead (the
+    layer-wise warm start uses it for its deep stage, which the EM only
+    initializes: run to a small relative change on the noisy layer-1
+    states of a small sample, it gives a worse start, e.g. Normal B_s s54
+    at N = 500, layer-2 RMSE 0.33 -> 0.40).
 
     ``standardize`` (default ``True`` for the copula backend, ``False``
     otherwise) runs a Normal CSP fit on column-standardized observations, the
@@ -522,9 +532,14 @@ def fit_parametric_dde(
             max_it = 500
         else:
             max_it = _DISCRETE_COPULA_CSP_MAX_IT if discrete_copula_csp else 50
+    if em_criterion not in ("relative_parameter_change", "loglik_gain"):
+        raise ValueError("em_criterion must be 'relative_parameter_change' or 'loglik_gain'.")
     if tol is None:
         if exact_em:
-            tol = 1e-6
+            # The relative parameter change at which the earlier rule (a
+            # log-likelihood gain of 1e-6 per observation) stopped: 1.5e-4
+            # to 6e-4 on the B_s s18 design.
+            tol = 1e-4 if em_criterion == "relative_parameter_change" else 1e-6
         else:
             tol = 0.0 if discrete_copula_csp else DEFAULT_PARAMETRIC_CONVERGENCE_TOL
     graph_fixed = any(support is not None for support in support_list)
@@ -789,6 +804,7 @@ def fit_parametric_dde(
                     rng=start_rng,
                     max_iter=max_it,
                     tol=tol,
+                    criterion=em_criterion,
                     bound_val=bound_val,
                     row_chunk_size=estep_row_chunk_size,
                     verbose=bool(verbose),
@@ -802,7 +818,7 @@ def fit_parametric_dde(
                 "dimension_method": "fixed",
                 "initialization": initialization,
                 "graph_algorithm": "em",
-                "convergence_metric": "loglik_gain_per_observation",
+                "convergence_metric": em_criterion,
                 "convergence_tol": tol,
                 "converged": em_diagnostics["converged"],
                 "loglik": em_diagnostics["loglik"],
@@ -810,6 +826,7 @@ def fit_parametric_dde(
                 "start_logliks": em_diagnostics["start_logliks"],
                 "best_start": em_diagnostics["best_start"],
                 "loglik_history": em_diagnostics["loglik_history"],
+                "relative_change_history": em_diagnostics["relative_change_history"],
                 "posterior_marginals": em_diagnostics["posterior_marginals"],
                 "fixed_graph_layers": [True] * D,
                 "G_list": [support.astype(np.uint8) for support in support_list],
@@ -887,7 +904,7 @@ def fit_parametric_dde(
             "initialization": initialization,
             "latent_transition": "systematic_coordinate_gibbs",
             "mc_state_update": "last_draw",
-            "convergence_metric": "postprocessed_parameter_rmse",
+            "convergence_metric": "relative_parameter_change",
             "convergence_tol": tol,
             "sa_burn_in": sa_burn_in,
             "fixed_init_binarize": fixed_init_binarize,
@@ -987,7 +1004,7 @@ def fit_parametric_dde(
         bound_val=bound_val,
         n_jobs=n_jobs,
         convergence_window=convergence_window,
-        convergence_std=tol,
+        convergence_tol=tol,
         burn=burn,
         threshold_rule=csp_threshold_rule,
         mstep_solver=csp_mstep_solver,

@@ -420,7 +420,7 @@ def get_SAEM_RL_CSP_D(
     n_jobs: int = 1,
     verbose: bool = True,
     convergence_window: int = 7,
-    convergence_std: float = 0.005,
+    convergence_tol: float = 0.005,
     burn: int = 5,
     trace_callback=None,
     observed_scale: str = "declared",
@@ -435,6 +435,12 @@ def get_SAEM_RL_CSP_D(
     the M-step: ``"declared"`` uses temp / gamma_j (the argument order that
     ``F_1_SAEM_cop.m`` declares); ``"matlab"`` uses gamma_j / temp, which is what
     the MATLAB routines actually compute because they pass (temp, gamma(j)).
+
+    The kernel stops once every layer's relative coefficient change
+    ``||B_new - B_old||_F / ||B_old||_F`` (slopes), averaged over the last
+    ``convergence_window`` iterations, is at most ``convergence_tol``.  (The
+    MATLAB routine thresholds the standard deviation of that window
+    instead, which measures how steady the change is, not how small.)
     """
     if observed_scale not in {"declared", "matlab"}:
         raise ValueError("observed_scale must be 'declared' or 'matlab'.")
@@ -540,7 +546,7 @@ def get_SAEM_RL_CSP_D(
             rel_hist[d].append(rel)
             if (
                 len(rel_hist[d]) < convergence_window
-                or np.std(rel_hist[d][-convergence_window:]) >= convergence_std
+                or np.mean(rel_hist[d][-convergence_window:]) > convergence_tol
             ):
                 stop_now = False
 

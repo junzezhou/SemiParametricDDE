@@ -119,6 +119,7 @@ def _graph_start(X, Z, R, Rlevels, K_tuple, support_list, *, epsilon, n_init, wa
     fit = fit_fixed_graph_em_multistart(
         children, warm["prop"], warm["B_list"][1:], None, support_list[1:],
         family="bernoulli", n_init=int(n_init), rng=rng, max_iter=500, tol=1e-6,
+        criterion="loglik_gain",
     )
     info["deep_em_start_logliks"] = fit[5]["start_logliks"]
     info["deep_em_best_start"] = fit[5]["best_start"]
@@ -155,8 +156,9 @@ def fit_copula_dde(
     ``dimension_method`` is ``"csp"`` (default) or ``"fixed"``; it defaults
     to ``"fixed"`` when ``G_list`` is given.  ``C`` defaults to 1 and the
     iteration limit ``it`` to 50.  Fixed-width fits run at ``temp=1``
-    unless ``temp`` is given; for CSP fits ``tol`` sets the stopping rule's
-    ``convergence_std``.
+    unless ``temp`` is given; for CSP fits ``tol`` bounds every layer's
+    relative coefficient change averaged over the last seven iterations
+    (``convergence_tol``).
 
     ``G_list`` fixes a user-specified graph, as in
     :func:`dde.algorithms.dde.fit_parametric_dde`: binary matrices
@@ -211,14 +213,14 @@ def fit_copula_dde(
     if method == "fixed":
         kwargs.setdefault("temp", 1.0)
     elif "tol" in kwargs:
-        # The CSP kernel stops when the relative coefficient change is stable
-        # over ``convergence_window`` iterations; ``tol`` bounds its spread,
-        # as in the DDE and SemiDDE CSP paths.
+        # The CSP kernel stops when every layer's relative coefficient
+        # change, averaged over ``convergence_window`` iterations, is at
+        # most ``tol``, as in the DDE and SemiDDE CSP paths.
         tol = kwargs.pop("tol")
         if tol is not None:
-            if "convergence_std" in kwargs and float(kwargs["convergence_std"]) != float(tol):
-                raise ValueError("tol conflicts with convergence_std.")
-            kwargs["convergence_std"] = float(tol)
+            if "convergence_tol" in kwargs and float(kwargs["convergence_tol"]) != float(tol):
+                raise ValueError("tol conflicts with convergence_tol.")
+            kwargs["convergence_tol"] = float(tol)
     graph_info = None
     if Z is None or R is None or Rlevels is None:
         _, R0, Rlevels0 = prepare_rank_likelihood_inputs(X)

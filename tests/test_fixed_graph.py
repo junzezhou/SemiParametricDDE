@@ -219,6 +219,26 @@ def test_exact_em_increases_loglik_and_recovers_parameters(family):
     assert marginals[0].shape == (4000, 6) and marginals[1].shape == (4000, 2)
 
 
+def test_exact_em_stopping_criteria():
+    X, B_true, _ = _simulate("bernoulli", 1000, (6, 2), seed=3)
+    support = _graph(B_true)
+    adapter = resolve_parametric_family("bernoulli")
+    start = graph_anchored_initialize(X, support, (6, 2), family=adapter)[:3]
+    _, _, _, _, iterations, diagnostics = fit_fixed_graph_em(X, *start, support, family=adapter, tol=1e-3)
+    changes = diagnostics["relative_change_history"]
+    assert diagnostics["convergence_metric"] == "relative_parameter_change"
+    assert diagnostics["converged"] and len(changes) == iterations
+    assert changes[-1] <= 1e-3 and all(change > 1e-3 for change in changes[:-1])
+    _, _, _, _, iterations, diagnostics = fit_fixed_graph_em(
+        X, *start, support, family=adapter, tol=1e-6, criterion="loglik_gain"
+    )
+    gains = np.abs(np.diff(diagnostics["loglik_history"]))
+    assert diagnostics["converged"] and gains[-1] <= 1e-6 * X.shape[0]
+    assert np.all(gains[:-1] > 1e-6 * X.shape[0])
+    with pytest.raises(ValueError, match="criterion"):
+        fit_fixed_graph_em(X, *start, support, family=adapter, criterion="rmse")
+
+
 # ---------------------------------------------------------------------------
 # Public fit paths
 # ---------------------------------------------------------------------------

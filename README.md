@@ -38,7 +38,7 @@ The arguments of `fit` follow Table 1 of the package manuscript:
 | `pen_list` | length-`D` truncated-lasso penalties (`"fixed"`) |
 | `t_spike`, `temp` | length-`D` CSP spike scales and the initial annealing temperature (`"csp"`) |
 | `C` | latent draws per stochastic E-step (default 1) |
-| `tol` | convergence tolerance |
+| `tol` | relative-change convergence tolerance (see each fitting routine) |
 | `tau` | truncation threshold of the coefficients |
 | `max_it` | maximum number of iterations |
 
@@ -88,9 +88,9 @@ an exact proximal weighted-lasso step (`csp_mstep_solver="fista_lower"`,
 `csp_penalty_scaling_reference=500`); the deepest layer keeps the CopDDE
 inexact L-BFGS-B step (`optimizer_maxiter=15`) with the unscaled penalty.
 Observed-layer coefficients and variances are returned on the original
-scale; the hard threshold `tau` acts on standardized loadings.  `tol` is the
-rolling standard deviation of the relative coefficient change (window 7)
-that stops the kernel.  `csp_mstep_solver="lbfgsb"` together with
+scale; the hard threshold `tau` acts on standardized loadings.  The kernel
+stops when every layer's relative coefficient change, averaged over the last
+seven iterations, is at most `tol`.  `csp_mstep_solver="lbfgsb"` together with
 `csp_penalty_scaling_power=0` restores the CopDDE M-step in every layer;
 `csp_slab_shape` and `csp_slab_rate` set the CUSP slab hyperprior (CopDDE
 1 and 5); `standardize=False` and `csp_threshold_rule` expose the remaining
@@ -147,8 +147,9 @@ removed; the git tag `csp-mcem-last` holds the last version with them.
 
 Bernoulli DDE uses the same fixed and CSP interfaces, requires a binary 0/1
 matrix, and has no `gamma` dispersion parameter. For fixed-width parametric
-DDEs, `tol` is the RMSE of the postprocessed parameter update and defaults to
-`0.005`.  Fixed-width Bernoulli fits start from the anchor latent-class
+DDEs, fixed-width SemiDDE (its inner SAEM fits) and fixed-width CopDDE, `tol`
+bounds the relative parameter change `||theta_new - theta_old|| /
+||theta_old||` of an update and defaults to `0.005`.  Fixed-width Bernoulli fits start from the anchor latent-class
 initialization (`fixed_init_binarize="anchor_lca"`) and run ten unit-step
 burn-in sweeps (`sa_burn_in=10`); see the fixed-width controls below:
 
@@ -361,7 +362,9 @@ default `graph_algorithm="auto"` runs an exact EM over each layer's `2**K_d`
 states, which reaches the maximum-likelihood estimate on the graph; it keeps
 the best of `n_init=10` starts (the graph-anchored one and random starts on
 the graph, drawn from `random_state`), because the likelihood can be
-multimodal on real data. Wider layers, or a `G_list` that fixes only the
+multimodal on real data. The EM stops when an M-step changes the parameters
+by at most `tol` relative to their norm (default `1e-4`, at most 500
+M-steps). Wider layers, or a `G_list` that fixes only the
 shallowest layers (`K_list` then gives the free widths, which keep the
 penalized estimation), use the fixed-width SAEM kernel with the graph held
 (`graph_algorithm="saem"`, with `C=1` by default). SemiDDE (`model="SemiDDE"`,

@@ -408,7 +408,7 @@ def spectral_graph_initialize(
                 A_list[d - 1].astype(float),
                 np.clip(A_list[d].mean(axis=0), 0.05, 0.95),
                 [B_list[d]], None, [support], family="bernoulli",
-                n_init=layer_em_starts, rng=rng, max_iter=300, tol=1e-6,
+                n_init=layer_em_starts, rng=rng, max_iter=300, tol=1e-6, criterion="loglik_gain",
             )
             B_list[d] = fit[1][0]
             A_list[d] = np.asarray(fit[3][0], dtype=float)
@@ -554,7 +554,8 @@ def fit_fixed_graph_em(
     *,
     family,
     max_iter: int = 500,
-    tol: float = 1e-6,
+    tol: float = 1e-4,
+    criterion: str = "relative_parameter_change",
     bound_val: float = 10.0,
     mstep_maxiter: int = 50,
     row_chunk_size: int = 2048,
@@ -575,9 +576,14 @@ def fit_fixed_graph_em(
     squares and variances for Normal responses, bounded logistic or
     log-link fits (the fixed kernel's coefficient bounds) otherwise.  This
     is the confirmatory EM of the paper's TIMSS analysis
-    (``get_EM_multimodal_confirm.m``) for any depth.  EM stops when the
-    log-likelihood gain per observation falls below ``tol`` (or after
-    ``max_iter`` M-steps).
+    (``get_EM_multimodal_confirm.m``) for any depth.  With
+    ``criterion="relative_parameter_change"`` (default) EM stops when an
+    M-step changes the parameters (top-layer probabilities, every
+    coefficient and the variances) by at most ``tol`` relative to their
+    norm, ``||theta_new - theta_old|| / ||theta_old||``, the stopping rule
+    of the package's other fitting routines; ``criterion="loglik_gain"``
+    stops when the log-likelihood gain per observation falls below ``tol``.
+    Either way EM ends after ``max_iter`` M-steps.
 
     Returns ``(prop, B_list, dispersion, A_list, iterations, diagnostics)``;
     ``A_list`` holds each layer's most probable state given the data, and
@@ -603,7 +609,10 @@ def fit_fixed_graph_em(
         from scipy.special import gammaln
 
         constant = -float(gammaln(X + 1.0).sum())
+    if criterion not in ("relative_parameter_change", "loglik_gain"):
+        raise ValueError("criterion must be 'relative_parameter_change' or 'loglik_gain'.")
     loglik_history = []
+    change_history = []
     converged = False
     iterations = 0
     while True:
@@ -613,11 +622,16 @@ def fit_fixed_graph_em(
         loglik_history.append(stats["loglik"] + constant)
         if verbose:
             print(f"Fixed-graph EM iteration {iterations}, loglik {loglik_history[-1]:.4f}")
-        if len(loglik_history) > 1 and abs(loglik_history[-1] - loglik_history[-2]) <= tol * N:
+        if criterion == "loglik_gain":
+            stop = len(loglik_history) > 1 and abs(loglik_history[-1] - loglik_history[-2]) <= tol * N
+        else:
+            stop = bool(change_history) and change_history[-1] <= tol
+        if stop:
             converged = True
             break
         if iterations >= int(max_iter):
             break
+        theta_old = _em_parameter_vector(prop, B_list, dispersion)
 
         log_priors = stats["log_priors"]
         message_sums = stats["message_sums"]
@@ -656,6 +670,10 @@ def fit_fixed_graph_em(
                 B_list[d], support_list[d], designs[d], pair.sum(axis=0),
                 pair.T @ configs[d - 1], "logistic", latent_bounds[d], mstep_maxiter,
             )
+        theta_new = _em_parameter_vector(prop, B_list, dispersion)
+        change_history.append(
+            float(np.linalg.norm(theta_new - theta_old) / max(np.linalg.norm(theta_old), 1e-12))
+        )
         iterations += 1
 
     final = _fixed_graph_estep(
@@ -668,10 +686,20 @@ def fit_fixed_graph_em(
     diagnostics = {
         "loglik": loglik_history[-1],
         "loglik_history": loglik_history,
+        "relative_change_history": change_history,
+        "convergence_metric": criterion,
         "converged": converged,
         "posterior_marginals": [posteriors[d] @ configs[d] for d in range(D)],
     }
     return prop, B_list, dispersion, A_list, iterations, diagnostics
+
+
+def _em_parameter_vector(prop, B_list, dispersion):
+    """The parameters whose relative change stops the exact EM."""
+    parts = [np.ravel(prop)] + [np.ravel(B) for B in B_list]
+    if dispersion is not None:
+        parts.append(np.ravel(dispersion))
+    return np.concatenate(parts).astype(float)
 
 
 def random_graph_start(X, support_list, *, family, rng):

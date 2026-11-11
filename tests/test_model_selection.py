@@ -498,7 +498,7 @@ def test_select_hyperparameters_semidde_defaults_smoke():
     assert len(cv_table) == 2
     assert all(row["K_list"] == K_list for row in cv_table)
     assert all("tau" in row for row in cv_table)
-    assert {row["tol"] for row in cv_table} == {K_list[-1] / 2}
+    assert {row["tol"] for row in cv_table} == {0.005}
     assert len(result.diagnostics["timing_table"]) == 4
     assert all("fit_seconds" in row for row in result.diagnostics["timing_table"])
     assert all("score_seconds" in row for row in cv_table)

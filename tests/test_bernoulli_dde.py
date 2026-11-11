@@ -269,7 +269,7 @@ def test_bernoulli_csp_initial_ordering_is_model_invariant():
         assert np.all(strength[:-1] >= strength[1:])
 
 
-def test_fixed_convergence_error_uses_postprocessed_parameter_scale():
+def test_fixed_convergence_error_is_relative_to_the_previous_parameters():
     prop = np.array([0.4])
     prop_update = np.array([0.5])
     B_list = [np.zeros((1, 2)), np.zeros((1, 2))]
@@ -288,7 +288,8 @@ def test_fixed_convergence_error_uses_postprocessed_parameter_scale():
     )
 
     assert processed[0][0, 1] == 0.0
-    assert error == pytest.approx(np.sqrt((0.1**2 + 1.0**2) / 5.0))
+    # ||theta_new - theta_old|| / ||theta_old|| after thresholding the slope
+    assert error == pytest.approx(np.sqrt(0.1**2 + 1.0**2) / 0.4)
 
 
 def test_bernoulli_family_registry_validation_and_dispersion_semantics():
@@ -1158,7 +1159,7 @@ def test_public_fixed_bernoulli_matches_direct_kernel_with_provided_state():
     assert actual.diagnostics["mc_state_update"] == "last_draw"
     assert (
         actual.diagnostics["convergence_metric"]
-        == "postprocessed_parameter_rmse"
+        == "relative_parameter_change"
     )
     assert actual.diagnostics["convergence_tol"] == common["tol"]
 

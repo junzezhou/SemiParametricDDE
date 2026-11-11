@@ -170,6 +170,9 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization, support_list=None):
         kwargs["support_list"] = support_list
     if kwargs.get("C") is None:
         kwargs["C"] = 1
+    if kwargs.get("tol") is None:
+        # The relative-change tolerance of the fixed-width DDE kernels.
+        kwargs["tol"] = 0.005
     required = [
         "X_in",
         "prop_in",
@@ -178,7 +181,6 @@ def _fit_semidde_fixed(Y, K_list, kwargs, *, initialization, support_list=None):
         "pen_list",
         "tau",
         "A_list_in",
-        "tol",
         "C",
     ]
     missing = [name for name in required if kwargs.get(name) is None]
