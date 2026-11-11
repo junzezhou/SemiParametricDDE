@@ -353,18 +353,14 @@ def graph_anchored_initialize(
     return prop, B_list, gamma, A_list, diagnostics
 
 
-def _match_columns_to_graph(children, states, support):
-    """Estimated latent column matched to each graph column (Hungarian assignment).
+def _marginal_graph_matching(children, states, support):
+    """Hungarian assignment on the summed squared marginal correlations.
 
-    The assignment maximizes the variance of the graph's children explained
-    by their matched parents: estimated column ``c`` scores
-    ``sum_{j in S_k} corr(child_j, state_c)**2`` for graph column ``k``.
-    The score is read from the data, not from the spectral loadings, whose
-    small entries are too noisy to tell apart graph columns that share their
-    strongly loading children; it ignores signs, as a binary graph does.
+    Estimated column ``c`` scores ``sum_{j in S_k} corr(child_j, state_c)**2``
+    for graph column ``k``.  The score is separable, so it cannot tell a
+    child's own parents from the latent variables correlated with them; it
+    is only the starting point of ``_match_columns_to_graph``.
     """
-    children = np.asarray(children, dtype=float)
-    states = np.asarray(states, dtype=float)
     centred_children = children - children.mean(axis=0)
     centred_states = states - states.mean(axis=0)
     scale = np.outer(
@@ -377,6 +373,84 @@ def _match_columns_to_graph(children, states, support):
     )
     score = support.T.astype(float) @ correlation**2
     _, columns = linear_sum_assignment(-score)
+    return columns
+
+
+def _graph_matching_rss(children, states, support):
+    """Residual sum of squares of each child regressed on the parents its graph row allows.
+
+    Returns ``rss(columns, rows)``: for the labelling ``columns`` (graph
+    column ``k`` read from estimated column ``columns[k]``), the residual sum
+    of squares of the least-squares fit of each child in ``rows`` on an
+    intercept and its allowable parents, computed from cross products.
+    """
+    N = children.shape[0]
+    design = np.column_stack((np.ones(N), states))
+    gram = design.T @ design
+    gram[np.diag_indices_from(gram)] += 1e-9 * N
+    cross = design.T @ children
+    total = np.sum(children**2, axis=0)
+    parents = [np.flatnonzero(row) for row in support]
+
+    def rss(columns, rows):
+        out = np.empty(len(rows))
+        for i, j in enumerate(rows):
+            idx = np.r_[0, 1 + columns[parents[j]]]
+            c = cross[idx, j]
+            out[i] = total[j] - c @ np.linalg.solve(gram[np.ix_(idx, idx)], c)
+        return out
+
+    return rss
+
+
+def _match_columns_to_graph(children, states, support):
+    """Estimated latent column matched to each graph column.
+
+    The labelling minimizes the residual sum of squares of the graph-
+    constrained regression of every child on its allowable parents, i.e. it
+    maximizes the Gaussian profile likelihood of the labelling given the
+    estimated states.  The criterion is invariant to each state's 0/1 coding,
+    as a binary graph is, and is minimized by the true labelling whenever the
+    graph contains the true edges and no other labelling fits as well.  The
+    search starts from the Hungarian answer on the summed squared marginal
+    correlations (``_marginal_graph_matching``) and applies transpositions and
+    3-cycles of the labels while they lower the criterion.  The marginal rule
+    alone mislabels latent variables whose children overlap: in the CopDDE
+    paper's ``J = 100`` design every child has a strong and a weak parent and
+    the strong/weak pairs (4, 8), (6, 4), (8, 6) make the 3-cycle 4 -> 6 -> 8
+    score as well as the truth even with the true states.
+    """
+    children = np.asarray(children, dtype=float)
+    states = np.asarray(states, dtype=float)
+    support = np.asarray(support, dtype=bool)
+    columns = _marginal_graph_matching(children, states, support)
+    K = support.shape[1]
+    if K < 2:
+        return columns
+    rss = _graph_matching_rss(children, states, support)
+    all_rows = np.arange(support.shape[0])
+    row_rss = rss(columns, all_rows)
+    moves = [(a, b) for a in range(K) for b in range(a + 1, K)]
+    moves += [
+        (a, b, c) if forward else (a, c, b)
+        for a in range(K) for b in range(a + 1, K) for c in range(b + 1, K)
+        for forward in (True, False)
+    ]
+    improved = True
+    while improved:
+        improved = False
+        for move in moves:
+            positions = np.asarray(move)
+            rows = np.flatnonzero(support[:, positions].any(axis=1))
+            if rows.size == 0:
+                continue
+            candidate = columns.copy()
+            candidate[positions] = columns[np.roll(positions, 1)]
+            new = rss(candidate, rows)
+            if np.sum(new) < np.sum(row_rss[rows]) - 1e-9 * max(1.0, np.sum(row_rss[rows])):
+                columns = candidate
+                row_rss[rows] = new
+                improved = True
     return columns
 
 
