@@ -83,16 +83,26 @@ def normal_initialize_copula_dde(
     }
 
 
+# MARK: the deep-layer exact EM of the graph start used to run only when
+# every layer had a graph.  It now also runs when the layers above the first
+# graph are free (fitted on the full graph): without it a superset graph whose
+# top layer allows every connection left layer 2 of the D = 3 paper design on
+# a plateau in N (Results/copdde_kernel_fix/REPORT.md).  False restores the
+# old rule; kept for that comparison.
+_DEEP_EM_FREE_LAYERS = True
+
+
 def _graph_start(X, Z, R, Rlevels, K_tuple, support_list, *, epsilon, n_init, warmup_it, rng, kernel_kwargs):
     """Start of a CopDDE fit on a given graph.
 
     The spectral estimate is matched to the graph (``spectral_graph_initialize``)
     and ``warmup_it`` kernel iterations settle the first latent layer, which the
-    latent Gaussian ``Z`` determines closely.  When every layer has a fixed
-    graph and the latent layers above the first are at most
-    ``EXACT_EM_MAX_WIDTH`` wide, those layers are then refitted as a Bernoulli
-    DDE on the first layer's states by exact EM from the warm-up estimate and
-    ``n_init - 1`` random starts on the graph, keeping the largest likelihood:
+    latent Gaussian ``Z`` determines closely.  When the first layer has a
+    graph and the latent layers above it are at most ``EXACT_EM_MAX_WIDTH``
+    wide, those layers are then refitted as a Bernoulli DDE on the first
+    layer's states by exact EM (a layer without a graph on the full graph)
+    from the warm-up estimate and ``n_init - 1`` random starts on the graph,
+    keeping the largest likelihood:
     from the spectral start alone the kernel leaves deep layers in poor modes
     (``D = 3`` paper design, ``N = 2000``: layer-2/3 MSE 0.1-0.9 / ~2 versus
     0.02 / 0.04-0.13 from the truth).
@@ -102,9 +112,20 @@ def _graph_start(X, Z, R, Rlevels, K_tuple, support_list, *, epsilon, n_init, wa
     )
     info = {"spectral_matches": init_info["spectral_matches"], "warmup_it": 0}
     D = len(K_tuple)
+    restricted = [support is not None for support in support_list]
+    if _DEEP_EM_FREE_LAYERS:
+        # layers above the restricted prefix are fitted on the full graph
+        deep_supports = [
+            support if support is not None else np.ones((K_tuple[d - 1], K_tuple[d]), dtype=bool)
+            for d, support in enumerate(support_list) if d >= 1
+        ]
+        eligible = restricted[0]
+    else:
+        deep_supports = support_list[1:]
+        eligible = all(restricted)
     deep_em = (
         D >= 2
-        and all(support is not None for support in support_list)
+        and eligible
         and max(K_tuple[1:]) <= EXACT_EM_MAX_WIDTH
         and int(n_init) >= 1
     )
@@ -117,7 +138,7 @@ def _graph_start(X, Z, R, Rlevels, K_tuple, support_list, *, epsilon, n_init, wa
     info["warmup_it"] = int(warm["it_num"])
     children = np.asarray(warm["A_list"][0], dtype=float)
     fit = fit_fixed_graph_em_multistart(
-        children, warm["prop"], warm["B_list"][1:], None, support_list[1:],
+        children, warm["prop"], warm["B_list"][1:], None, deep_supports,
         family="bernoulli", n_init=int(n_init), rng=rng, max_iter=500, tol=1e-6,
         criterion="loglik_gain",
     )
@@ -156,7 +177,11 @@ def fit_copula_dde(
     ``dimension_method`` is ``"csp"`` (default) or ``"fixed"``; it defaults
     to ``"fixed"`` when ``G_list`` is given.  ``C`` defaults to 1 and the
     iteration limit ``it`` to 50.  Fixed-width fits run at ``temp=1``
-    unless ``temp`` is given; for CSP fits ``tol`` bounds every layer's
+    unless ``temp`` is given and draw the latent states by systematic
+    coordinate-Gibbs sweeps (``latent_transition``), as the DDE and SemiDDE
+    fixed-width kernels do; ``latent_transition="synchronous_mean_field"``
+    gives the CopDDE code's draw, which attenuates the deep layers.  For CSP
+    fits ``tol`` bounds every layer's
     relative coefficient change averaged over the last seven iterations
     (``convergence_tol``).
 
@@ -171,7 +196,7 @@ def fit_copula_dde(
     coordinate-Gibbs sweeps (``latent_transition``) as in the MATLAB
     ``get_SAEM_RL_G.m``, and the defaults are ``C=1``, ``it=50``, ``tol=0``
     (run all iterations) and ``temp=1``.  The start matches the spectral
-    estimate to the graph and, when every layer is fixed and the deep widths
+    estimate to the graph and, when the deep widths
     are at most 10, refits the deep layers by exact EM after
     ``graph_warmup_it`` (default 10) kernel iterations, keeping the best of
     ``n_init`` (default 20) starts.  A binary graph identifies each latent
@@ -228,6 +253,16 @@ def fit_copula_dde(
         kwargs["it"] = 50
     if method == "fixed":
         kwargs.setdefault("temp", 1.0)
+        # MARK: fixed-width fits draw the latent states by systematic
+        # coordinate-Gibbs sweeps, like the DDE and SemiDDE fixed-width
+        # kernels.  The synchronous mean-field draw (manuscript eq. 16, the
+        # CopDDE code's get_SAEM_RL) draws every layer from its conditional at
+        # the previous states, so consecutive layers are drawn independently
+        # and the logistic M-step attenuates the deep coefficients at every
+        # iteration; on the D = 3 paper design the top layer decays with the
+        # iterations and its error grows with N
+        # (Results/copdde_kernel_fix/REPORT.md).
+        kwargs.setdefault("latent_transition", "systematic_coordinate_gibbs")
     elif "tol" in kwargs:
         # The CSP kernel stops when every layer's relative coefficient
         # change, averaged over ``convergence_window`` iterations, is at

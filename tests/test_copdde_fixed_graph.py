@@ -85,6 +85,37 @@ def test_spectral_graph_initialize_labels_columns_by_the_graph():
         assert np.all(B_d[:, 1:][~G_d] == 0.0)
 
 
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_graph_matching_separates_overlapping_parents(seed):
+    """Three correlated latent variables whose children pair them cyclically,
+    (strong, weak) = (0, 2), (1, 0), (2, 1), as latent variables 4, 6, 8 of the
+    CopDDE paper's J = 100 design.  Given the true states, summed squared
+    marginal correlations prefer a cyclic relabelling; the joint
+    least-squares criterion returns the truth, and is invariant to a state's
+    0/1 coding."""
+    from scipy.special import expit
+
+    from dde.algorithms.fixed_graph import _marginal_graph_matching, _match_columns_to_graph
+
+    rng = np.random.default_rng(seed)
+    N = 2000
+    top = rng.binomial(1, 0.5, N)
+    A = np.column_stack([rng.binomial(1, expit(-2.0 + 4.0 * top)) for _ in range(3)]).astype(float)
+    children, G = [], []
+    for strong, weak in [(0, 2), (1, 0), (2, 1)]:
+        for _ in range(8):
+            children.append(-2.0 + 4.0 * A[:, strong] - 1.5 * A[:, weak] + rng.normal(size=N))
+            row = np.zeros(3, dtype=bool)
+            row[[strong, weak]] = True
+            G.append(row)
+    children, G = np.column_stack(children), np.array(G)
+    assert not np.array_equal(_marginal_graph_matching(children, A, G), np.arange(3))
+    order = np.array([2, 0, 1])
+    states = A[:, order]
+    states[:, 1] = 1.0 - states[:, 1]
+    assert np.array_equal(_match_columns_to_graph(children, states, G), np.argsort(order))
+
+
 def test_fit_copdde_on_a_given_graph():
     sim, G = _simulate(1500, seed=6)
     np.random.seed(6)
@@ -133,6 +164,8 @@ def test_partial_graph_keeps_free_layer_penalized():
         pen_list=[0.0, 1.0], tau=0.3, it=3,
     )
     assert result.diagnostics["fixed_graph_layers"] == 1
+    # the free layer above the graph is refitted by the start's exact EM too
+    assert "deep_em_best_start" in result.diagnostics["graph_start"]
     assert np.all(result.B_list[0][:, 1:][~G[0]] == 0.0)
     free_slopes = result.B_list[1][:, 1:]
     assert np.all((free_slopes == 0.0) | (np.abs(free_slopes) >= 0.3))
@@ -150,3 +183,19 @@ def test_all_ones_graph_gives_the_fit_without_a_graph():
     assert "G_list" not in ones.diagnostics
     for B_ones, B_plain in zip(ones.B_list, plain.B_list):
         np.testing.assert_array_equal(B_ones, B_plain)
+
+
+def test_fixed_fits_draw_latent_states_by_gibbs_sweeps_by_default():
+    """Fixed-width CopDDE fits use systematic Gibbs sweeps with or without a
+    graph; the synchronous mean-field draw is still available."""
+    sim, _ = _simulate(200, seed=10)
+    args = dict(K_list=[6, 2], dimension_method="fixed", pen_list=[1.0, 1.0], tau=0.3, tol=0.0, it=2,
+                random_state=10, verbose=False)
+    np.random.seed(10)
+    default = fit_copula_dde(sim["X"], **args)
+    assert default.diagnostics["latent_transition"] == "systematic_coordinate_gibbs"
+    assert default.raw["p"] is None
+    np.random.seed(10)
+    synchronous = fit_copula_dde(sim["X"], latent_transition="synchronous_mean_field", **args)
+    assert synchronous.diagnostics["latent_transition"] == "synchronous_mean_field"
+    assert synchronous.raw["p"][0].shape == (200, 6)

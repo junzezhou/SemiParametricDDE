@@ -171,7 +171,17 @@ DDEs, fixed-width SemiDDE (its inner SAEM fits) and fixed-width CopDDE, `tol`
 bounds the relative parameter change `||theta_new - theta_old|| /
 ||theta_old||` of an update and defaults to `0.005`.  Fixed-width Bernoulli fits start from the anchor latent-class
 initialization (`fixed_init_binarize="anchor_lca"`) and run ten unit-step
-burn-in sweeps (`sa_burn_in=10`); see the fixed-width controls below:
+burn-in sweeps (`sa_burn_in=10`); see the fixed-width controls below.
+
+Every fixed-width kernel draws the latent states by systematic coordinate-Gibbs
+sweeps.  For CopDDE this replaces the CopDDE code's synchronous mean-field draw
+(manuscript eq. 16; still available as
+`latent_transition="synchronous_mean_field"`), which draws every layer from
+its conditional at the previous states, so consecutive layers are drawn
+independently and the logistic M-step attenuates the deep coefficients at
+every iteration: on the D = 3 paper design the top layer decays as the
+iterations proceed and its error does not fall with N
+(`Results/copdde_kernel_fix/REPORT.md`).
 
 ```python
 result = fit(
@@ -439,8 +449,12 @@ the graph at zero and penalizes and thresholds the allowable ones; with a
 restricting graph its latent draws are coordinate-Gibbs sweeps, as in the
 CopDDE code's fixed-graph refit (`get_SAEM_RL_G.m`), and the defaults are
 `C=1`, `max_it=50`, `tol=0` and `temp=1`.  The start matches the spectral
-estimate's columns to the graph, which needs no child with a single parent.
-With every layer restricted and deep layers no wider than 10, the layers above
+estimate's columns to the graph, which needs no child with a single parent:
+the labelling minimizes the residual sum of squares of every child regressed
+on the parents its graph row allows (searched by transpositions and 3-cycles
+from the Hungarian answer on squared marginal correlations, which alone
+mislabels latent variables whose children overlap).
+With deep layers no wider than 10 (restricted or not), the layers above
 the first are then refitted by exact EM on the first layer's states after
 `graph_warmup_it=10` kernel iterations, keeping the best of `n_init=20`
 starts.  A binary graph fixes the labels of the latent variables but not
