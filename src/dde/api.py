@@ -195,7 +195,7 @@ def fit(
           criterion);
         * ``tau`` -- truncation threshold of the coefficients;
         * ``pen_list`` -- length-``D`` truncated-lasso penalties
-          (``"fixed"``);
+          (``"fixed"``); a scalar is used in every layer;
         * ``t_spike``, ``temp`` -- length-``D`` CSP spike parameters and the
           initial annealing temperature (``"csp"``);
         * ``G_list`` (``"fixed"``) -- a user-specified graph: binary
@@ -249,6 +249,12 @@ def fit(
 
     if D is None and has_graph:
         D = len(K_list) if K_list is not None else len(kwargs["G_list"])
+
+    depth = D if D is not None else (len(K_list) if K_list is not None else None)
+    if depth is not None and kwargs.get("pen_list") is not None and np.ndim(kwargs["pen_list"]) == 0:
+        # A scalar penalty stands for the same value in every layer (as a
+        # scalar candidate in select_hyperparameters does).
+        kwargs["pen_list"] = [float(kwargs["pen_list"])] * int(depth)
 
     defaulted = _fill_default_hyperparameters(
         kwargs, chosen=chosen, dimension=dimension, N=Y.shape[0], D=D, K_list=K_list,

@@ -219,6 +219,36 @@ def test_select_hyperparameters_copula_pmse_fixed_smoke():
     assert np.isfinite(cv_table[0]["mean_pmse"])
 
 
+def test_copula_pmse_selection_is_reproduced_by_random_state_and_keeps_column_names():
+    """The CopDDE kernel draws from the global generator: the pMSE path seeds
+    it per candidate from random_state, as the EBIC path does, so the
+    selection does not depend on the generator's state before the call."""
+    pd = pytest.importorskip("pandas")
+    J = 18
+    K_list = [6, 2]
+    prop, B_list, gamma = _parameters(J, K_list)
+    sim = generate_X_Cop_marg_emp_D(
+        120, prop, lambdas=np.ones(J) * 2.0, gamma=gamma, B_list=B_list, random_state=46,
+    )
+    frame = pd.DataFrame(sim["X"], columns=[f"item{j}" for j in range(J)])
+    args = dict(
+        D=2, model="CopDDE", dimension_method="fixed", K_list=K_list, max_it=3,
+        candidates={"pen_list": [0.5, 1.0], "tau": [0.3]}, n_repeats=2,
+        pmse_n_estimators=5, random_state=3, verbose=False,
+    )
+    results = []
+    for state in (1, 2):
+        np.random.seed(state)
+        results.append(select_hyperparameters(frame, **args))
+    first, second = results
+    assert [row["mean_pmse"] for row in first.diagnostics["cv_table"]] == [
+        row["mean_pmse"] for row in second.diagnostics["cv_table"]
+    ]
+    for B_first, B_second in zip(first.B_list, second.B_list):
+        np.testing.assert_array_equal(B_first, B_second)
+    assert first.diagnostics["variable_names"] == list(frame.columns)
+
+
 def test_select_hyperparameters_copula_csp_uses_default_t_spike():
     J = 6
     K_list = [2]

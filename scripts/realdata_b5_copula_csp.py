@@ -428,7 +428,8 @@ def main() -> None:
         optimizer_maxiter=args.optimizer_maxiter,
         convergence_tol=args.convergence_tol,
     )
-    n_repeats = args.n_repeats if args.n_repeats is not None else (1 if args.smoke else 50)
+    # 25 synthetic data sets per candidate, as in the manuscript (Section 5.2); was 50
+    n_repeats = args.n_repeats if args.n_repeats is not None else (1 if args.smoke else 25)
 
     config = {
         "sav_path": args.sav_path,

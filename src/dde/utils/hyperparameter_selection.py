@@ -594,13 +594,17 @@ def copula_predictive_pmse_score(
     Y: np.ndarray,
     result: DDEResult,
     *,
-    n_repeats: int = 10,
+    n_repeats: int = 25,
     random_state: Optional[int] = None,
     n_estimators: int = 100,
     n_splits: int = 5,
     n_jobs: int = 1,
 ) -> tuple[float, List[float]]:
-    """Compute pMSE, optionally distributing independent repeats across jobs."""
+    """Compute pMSE, optionally distributing independent repeats across jobs.
+
+    The defaults are the manuscript's (Section 5.2): 25 synthetic data sets,
+    each scored by a five-fold cross-validated random forest.
+    """
     if n_repeats < 1:
         raise ValueError("n_repeats must be at least 1.")
     if int(n_jobs) < 1:

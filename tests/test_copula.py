@@ -195,3 +195,37 @@ def test_rescale_and_format_estimates_D_shapes():
     assert [B.shape for B in formatted["B_list"]] == [B.shape for B in B_list]
     assert formatted["prop"].shape == prop.shape
     assert len(formatted["assignments"]) == len(K_list)
+
+
+def test_rank_likelihood_draws_stay_in_the_rank_set_in_far_tails():
+    """With a small residual variance the truncation intervals of the extreme
+    ranks lie many standard deviations from the mean, where the plain
+    inverse-cdf draw saturates; the draws must still respect the ranks of Y
+    (Algorithm 4) and follow the truncated normal there."""
+    from scipy.stats import truncnorm
+
+    from dde.algorithms.copula import prepare_rank_likelihood_inputs
+    from dde.algorithms.get_SAEM_RL_CSP_D import (
+        _prepare_rank_groups,
+        _sample_rank_likelihood_Z,
+        _truncated_normal_far_tail,
+    )
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(800, 6))
+    X[:, 3:] = np.digitize(X[:, 3:], [-1.0, 0.0, 1.0])  # tied ordinal columns too
+    Z, R, Rlevels = prepare_rank_likelihood_inputs(X)
+    groups = _prepare_rank_groups(R, Rlevels)
+    mu = rng.normal(size=Z.shape) * 0.3
+    gamma = np.full(6, 0.01)  # sd 0.1: the extreme ranks are > 20 sd from the mean
+    np.random.seed(0)
+    for _ in range(5):
+        _sample_rank_likelihood_Z(Z, mu, gamma, 1.0, groups)
+        for j in range(6):
+            levels = np.unique(X[:, j])
+            highest_below = np.maximum.accumulate([Z[X[:, j] == v, j].max() for v in levels])
+            lowest_above = np.array([Z[X[:, j] == v, j].min() for v in levels])
+            assert np.all(highest_below[:-1] < lowest_above[1:])
+    draws = _truncated_normal_far_tail(rng.random(100000), 0.0, 1.0, 9.0, 10.0)
+    assert np.all((draws >= 9.0) & (draws <= 10.0))
+    assert abs(draws.mean() - truncnorm.mean(9.0, 10.0)) < 1e-3

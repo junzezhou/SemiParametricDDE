@@ -24,7 +24,7 @@ from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import minimize
-from scipy.special import expit
+from scipy.special import expit, log_ndtr, ndtri_exp
 from scipy.stats import norm
 
 from .csp import update_csp_layer
@@ -100,6 +100,28 @@ def _prepare_rank_groups(R: np.ndarray, Rlevels: np.ndarray) -> Tuple[_RankGroup
     return tuple(out)
 
 
+def _truncated_normal_far_tail(r, m, sd, lb, ub):
+    """Inverse-cdf draw from ``N(m, sd**2)`` truncated to ``(lb, ub)`` in log space.
+
+    ``r`` are the uniforms of the plain inverse-cdf draw.  The interval is
+    reflected to the upper side of the mean and the survival function is
+    inverted on the log scale (``log_ndtr`` / ``ndtri_exp``), which stays
+    exact where the plain draw's cdf values saturate at ``_EPS_PROB``.
+    """
+    r = np.asarray(r, dtype=float)
+    a = (np.asarray(lb, dtype=float) - m) / sd
+    b = (np.asarray(ub, dtype=float) - m) / sd
+    flip = (a + b) < 0.0
+    lo = np.where(flip, -b, a)
+    hi = np.where(flip, -a, b)
+    log_s_lo = log_ndtr(-lo)
+    log_s_hi = log_ndtr(-hi)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_p = log_s_lo + np.log1p(r * np.expm1(log_s_hi - log_s_lo))
+    x = np.clip(-ndtri_exp(log_p), lo, hi)
+    return m + sd * np.where(flip, -x, x)
+
+
 def _sample_rank_likelihood_Z(
     Z: np.ndarray,
     mu: np.ndarray,
@@ -145,8 +167,14 @@ def _sample_rank_likelihood_Z(
                     pu = min(max(_scalar_norm_cdf(ub, m, sd_j), _EPS_PROB), 1.0 - _EPS_PROB)
                     if pu <= pl:
                         pl = pu = 0.5 * (pl + pu)
-                    u = pl + (pu - pl) * float(np.random.rand(1)[0])
+                    r = float(np.random.rand(1)[0])
+                    u = pl + (pu - pl) * r
                     z = m + sd_j * _STD_NORMAL.inv_cdf(min(max(u, 1e-300), 1.0 - 1e-16))
+                    if lb < ub and not lb < z < ub:
+                        # MARK: beyond ~7 sd both cdf values clip to _EPS_PROB and
+                        # the plain draw leaves (lb, ub), i.e. Z leaves R(Y);
+                        # redraw from the same uniform in log space.
+                        z = float(_truncated_normal_far_tail(r, m, sd_j, lb, ub))
                     Zj[i] = z
                     group_min[rr] = z
                     group_max[rr] = z
@@ -160,8 +188,16 @@ def _sample_rank_likelihood_Z(
                     mid = 0.5 * (pL[bad] + pU[bad])
                     pL[bad] = mid
                     pU[bad] = mid
-                u = pL + (pU - pL) * np.random.rand(idx.size)
-                Zj[idx] = norm.ppf(u, loc=mu_j[idx], scale=sd_j)
+                r = np.random.rand(idx.size)
+                u = pL + (pU - pL) * r
+                draws = norm.ppf(u, loc=mu_j[idx], scale=sd_j)
+                outside = ~((draws > lb) & (draws < ub))
+                if lb < ub and np.any(outside):
+                    # MARK: as in the scalar path, redraw the saturated tail draws
+                    draws[outside] = _truncated_normal_far_tail(
+                        r[outside], mu_j[idx][outside], sd_j, lb, ub
+                    )
+                Zj[idx] = draws
                 group_min[rr] = np.min(Zj[idx])
                 group_max[rr] = np.max(Zj[idx])
 
