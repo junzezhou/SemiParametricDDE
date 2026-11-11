@@ -77,7 +77,7 @@ def test_normal_init_rejects_unknown_binarize_rule():
 def test_normal_fixed_defaults_record_burn_in_anchor_mixture_and_warm_start():
     X, _, _, _ = _design((6, 2), seed=5, N=600)
     np.random.seed(5)
-    result = fit(X, method="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
+    result = fit(X, model="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
                  pen_list=[2.0, 2.0], tau=0.3, C=1, tol=0.01, max_it=14, verbose=False)
     d = result.diagnostics
     assert d["sa_burn_in"] == 10 and d["fixed_init_binarize"] == "anchor_mixture"
@@ -90,10 +90,10 @@ def test_normal_fixed_defaults_record_burn_in_anchor_mixture_and_warm_start():
 
 def test_normal_one_layer_and_provided_state_skip_the_warm_start():
     X, A_true, B_true, _ = _design((6, 2), seed=6, N=500)
-    one = fit(X, method="DDE", family="Normal", D=1, dimension_method="fixed", K_list=[6],
+    one = fit(X, model="DDE", family="Normal", D=1, dimension_method="fixed", K_list=[6],
               pen_list=[2.0], tau=0.3, C=1, tol=0.01, max_it=12, verbose=False)
     assert one.diagnostics["fixed_warm_start"] == "none" and "warm_start" not in one.diagnostics
-    provided = fit(X, method="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
+    provided = fit(X, model="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
                    pen_list=[2.0, 2.0], tau=0.3, C=1, tol=0.01, max_it=12, verbose=False,
                    prop_in=np.full(2, 0.5), B_list_in=B_true, gamma_in=np.full(18, 0.25), A_list_in=A_true)
     assert provided.diagnostics["fixed_warm_start"] == "none" and "warm_start" not in provided.diagnostics
@@ -102,29 +102,29 @@ def test_normal_one_layer_and_provided_state_skip_the_warm_start():
 def test_normal_fixed_plain_kernel_and_csp_path_remain_available():
     X, _, _, _ = _design((6, 2), seed=6, N=400)
     np.random.seed(6)
-    plain = fit(X, method="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
+    plain = fit(X, model="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
                 pen_list=[2.0, 2.0], tau=0.3, C=1, tol=0.01, max_it=4, verbose=False,
                 sa_burn_in=0, fixed_init_binarize="projection", fixed_warm_start="none")
     d = plain.diagnostics
     assert d["sa_burn_in"] == 0 and d["fixed_init_binarize"] == "projection"
     assert d["fixed_warm_start"] == "none" and "warm_start" not in d
     with pytest.raises(ValueError):
-        fit(X, method="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
+        fit(X, model="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
             pen_list=[2.0, 2.0], tau=0.3, C=1, max_it=2, verbose=False, fixed_init_binarize="anchor_lca")
     # the CSP path never burns in or re-binarizes
     with pytest.raises(ValueError):
-        fit(X, method="DDE", family="Normal", D=2, dimension_method="csp", t_spike=[0.03, 0.05], temp=0.9,
+        fit(X, model="DDE", family="Normal", D=2, dimension_method="csp", t_spike=[0.03, 0.05], temp=0.9,
             tau=0.3, C=1, max_it=2, verbose=False, sa_burn_in=10)
     with pytest.raises(ValueError):
-        fit(X, method="DDE", family="Normal", D=2, dimension_method="csp", t_spike=[0.03, 0.05], temp=0.9,
+        fit(X, model="DDE", family="Normal", D=2, dimension_method="csp", t_spike=[0.03, 0.05], temp=0.9,
             tau=0.3, C=1, max_it=2, verbose=False, fixed_init_binarize="anchor_mixture")
 
 
 def test_normal_two_layer_recovery_with_oracle_labels_under_defaults():
     X, A_true, B_true, G_true = _design((6, 2), seed=11, N=4000)
     np.random.seed(11)
-    result = fit(X, method="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
-                 pen_list=[4000 ** 0.25] * 2, tau=0.3, C=1, tol=0.01, max_it=50,
+    result = fit(X, model="DDE", family="Normal", D=2, dimension_method="fixed", K_list=[6, 2],
+                 pen_list=[4000 ** 0.25] * 2, tau=0.3, C=1,
                  initialize="oracle", B_list_true=B_true, G_list_true=G_true, verbose=False)
     for B_hat, G_t in zip(result.B_list, G_true):
         assert np.mean((np.asarray(B_hat)[:, 1:] != 0) == G_t) == 1.0

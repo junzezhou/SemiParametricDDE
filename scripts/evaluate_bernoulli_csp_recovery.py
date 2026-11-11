@@ -425,6 +425,7 @@ def run_one(task):
                 verbose=False,
                 **overrides,
                 **initialization_arguments,
+                **settings.get("fit_kwargs", {}),
             )
         metrics = calculate_metrics(result, X, A_true, scenario, settings["tau"])
         finite = bool(
@@ -645,6 +646,10 @@ def parse_args():
     parser.add_argument("--optimizer-maxiter", type=int, default=None, help="kernel default when omitted (15)")
     parser.add_argument("--tol", type=float, default=None, help="kernel default when omitted (0: no early stop)")
     parser.add_argument("--tau", type=float, default=0.3)
+    parser.add_argument(
+        "--fit-kwargs", default="",
+        help="JSON object of extra keyword arguments for fit (kernel options)",
+    )
     parser.add_argument("--t-spike-multiplier", type=float, default=1.0)
     parser.add_argument(
         "--initialization", choices=("data", "truth"), default="data"
@@ -690,6 +695,8 @@ def main():
         "base_seed": args.base_seed,
         "keep_trace": args.keep_trace,
     }
+    if args.fit_kwargs:
+        settings["fit_kwargs"] = json.loads(args.fit_kwargs)
     completed = {
         (row["scenario"], int(row["N"]), int(row["replicate"])) for row in rows
     }

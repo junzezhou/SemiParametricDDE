@@ -12,8 +12,9 @@ identifiable coefficients B_s ((J, K1, K2) = (18, 6, 2), (54, 18, 6),
 (90, 30, 10); cross coefficients -4/3 as in the MATLAB code, the graph is the
 same for either sign), prevalences 0.5 and unit Normal variances.
 
-Arms: ``em`` is the exact EM on the fixed graph (the default for layers of
-width <= 10, here (18, 6, 2); package defaults, including ``n_init``);
+Arms: ``em`` is the exact EM on the fixed graph, the package's reference
+implementation ``dde.algorithms.dde.fit_fixed_graph_reference`` (not part of
+``fit()``; its defaults, including ``n_init=10``);
 ``saem`` is the fixed-width SAEM kernel with the graph held fixed (C = 1,
 the package defaults otherwise).  ``--arms`` restricts the run.
 
@@ -129,6 +130,7 @@ def run_one(task):
     family, design, arm, N, replicate = task
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     from dde import fit
+    from dde.algorithms.dde import fit_fixed_graph_reference
 
     seed = seed_for(family, design, N, replicate)
     row = {
@@ -138,14 +140,15 @@ def run_one(task):
     try:
         X, B_true, A_true = simulate(family, design, N, seed)
         G = [B[:, 1:] != 0 for B in B_true]
-        kwargs = dict(method="DDE", family=family, D=2, G_list=G, verbose=False)
-        if arm == "saem":
-            kwargs.update(C=1, graph_algorithm="saem")
-        else:
-            kwargs.update(graph_algorithm="em")
         np.random.seed(seed % (2**32))
         started = time.perf_counter()
-        result = fit(X, **kwargs)
+        if arm == "saem":
+            # unpenalized SAEM on the graph: no penalty and a negligible threshold
+            result = fit(X, model="DDE", family=family, D=2, dimension_method="fixed", G_list=G,
+                         C=1, pen_list=[0.0, 0.0], tau=1e-8, verbose=False)
+        else:
+            # the exact EM reference implementation (not part of fit())
+            result = fit_fixed_graph_reference(X, family=family, G_list=G, verbose=False)
         seconds = time.perf_counter() - started
         prop_err = np.ravel(result.prop - 0.5)
         layer_err = [np.ravel(B - Bt) for B, Bt in zip(result.B_list, B_true)]

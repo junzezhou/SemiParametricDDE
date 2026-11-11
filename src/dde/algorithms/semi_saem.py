@@ -1288,22 +1288,21 @@ def _postprocess_and_measure_fixed_update(
     depth,
     support_list=None,
 ):
-    """Postprocess an M-step and return its parameter-normalised change.
+    """Postprocess an M-step and return its relative parameter change.
 
-    Layers with a fixed graph (``support_list[d]`` not ``None``) are not
-    thresholded; their slopes outside the graph are set to zero.
+    The change is ``||theta_new - theta_old|| / ||theta_old||`` over the
+    prevalences, every coefficient (intercepts included) and the
+    dispersion, after the coefficient postprocessing.
+
+    Every layer is thresholded; the slopes of a layer with a graph
+    (``support_list[d]`` not ``None``) outside the graph are set to zero.
     """
     family = resolve_parametric_family(family)
     if support_list is None:
         support_list = [None] * len(B_updates)
-    free = [d for d, support in enumerate(support_list) if support is None]
-    B_processed = list(B_updates)
-    if free:
-        thresholded = family.postprocess_fixed_coefficients(
-            [B_updates[d] for d in free], tau=tau, depth=depth
-        )
-        for d, B in zip(free, thresholded):
-            B_processed[d] = B
+    B_processed = list(
+        family.postprocess_fixed_coefficients(list(B_updates), tau=tau, depth=depth)
+    )
     for d, support in enumerate(support_list):
         if support is not None:
             B_processed[d] = np.asarray(B_processed[d], dtype=float)
@@ -1316,12 +1315,13 @@ def _postprocess_and_measure_fixed_update(
         )
         + family.dispersion_distance_sq(dispersion, dispersion_update)
     )
-    n_parameters = np.asarray(prop).size + sum(
-        np.asarray(B).size for B in B_list
+    squared_norm = (
+        np.sum(np.asarray(prop, dtype=float) ** 2)
+        + sum(np.sum(np.asarray(B, dtype=float) ** 2) for B in B_list)
     )
     if dispersion is not None:
-        n_parameters += np.asarray(dispersion).size
-    return B_processed, float(np.sqrt(squared_error / n_parameters))
+        squared_norm += np.sum(np.asarray(dispersion, dtype=float) ** 2)
+    return B_processed, float(np.sqrt(squared_error / max(squared_norm, 1e-12)))
 
 
 def _owned_array_nbytes(owner):
@@ -1396,16 +1396,15 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                         sa_burn_in=0, observed_solver=None, support_list=None):
     """Run fixed-width SAEM with observed behavior supplied by ``family``.
 
-    ``tol`` is compared with the root-mean-square parameter change after the
-    family coefficient postprocessor has been applied.
+    ``tol`` is compared with the relative parameter change
+    ``||theta_new - theta_old|| / ||theta_old||`` after the family
+    coefficient postprocessor has been applied.
 
     ``support_list`` (length ``D``; entry ``d`` a ``rows x K_d`` boolean
-    graph or ``None``) fixes the graph of the given layers: their slopes
-    outside the graph are held at zero by the M-step bounds, and they are
-    neither penalized nor thresholded, so the M-step maximizes the
-    stochastic-approximation likelihood over the graph's coefficients (the
-    confirmatory EM of Lee and Gu's TIMSS analysis).  ``None`` entries keep
-    the TLP-penalized, thresholded update.
+    graph or ``None``) gives the allowable connections of the given layers
+    (manuscript Section 5.1): their slopes outside the graph are held at
+    zero by the M-step bounds, and the allowable slopes get the same
+    TLP-penalized, thresholded update as a layer without a graph.
 
     ``sa_burn_in`` is the number of initial sweeps run with step size one
     (plain Monte Carlo EM: every accumulated objective is replaced by the
@@ -1447,10 +1446,7 @@ def get_SAEM_parametric(X, prop_in, B_list_in, dispersion_in,
                 f"{(B_list[d].shape[0], K[d])}."
             )
         B_list[d][:, 1:] *= support
-    penalties = [
-        0.0 if support is not None else pen_list[d]
-        for d, support in enumerate(support_list)
-    ]
+    penalties = [pen_list[d] for d in range(D)]
  
     # Only the deepest-layer running probabilities contribute to ``prop``.
     # Keeping the unused lower-layer arrays costs N * sum(K[:-1]) float64s.

@@ -627,7 +627,7 @@ def test_public_fixed_poisson_matches_shared_kernel_with_provided_state():
     np.random.seed(46)
     actual = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=2,
         dimension_method="fixed",
@@ -664,7 +664,7 @@ def test_matlab_poisson_setting_runs_through_fixed_family_kernel():
     np.random.seed(48)
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=2,
         dimension_method="fixed",
@@ -721,7 +721,7 @@ def test_public_fixed_poisson_supports_three_latent_layers():
     np.random.seed(55)
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=3,
         dimension_method="fixed",
@@ -760,7 +760,7 @@ def test_public_fixed_poisson_smoke_tests_depth_four_and_five(K_list):
     np.random.seed(580 + len(K_list))
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=len(K_list),
         dimension_method="fixed",
@@ -790,7 +790,7 @@ def test_public_fixed_poisson_smoke_tests_depth_four_and_five(K_list):
 def test_poisson_fixed_lightweight_trace_is_output_equivalent_and_scalar_only():
     X, prop, B_list, A_list = _small_poisson_state(530)
     common = dict(
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=2,
         dimension_method="fixed",
@@ -878,7 +878,7 @@ def test_poisson_conditional_scoring_and_d_layer_simulation():
 def test_public_poisson_csp_uses_maximum_width_and_is_reproducible():
     X, _, _, _ = _small_poisson_state(52)
     arguments = dict(
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=2,
         dimension_method="csp",
@@ -927,7 +927,7 @@ def test_public_poisson_csp_supports_arbitrary_depth():
 
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=3,
         dimension_method="csp",
@@ -980,7 +980,7 @@ def test_poisson_csp_recovers_matlab_dimensions_from_maximum_width():
 
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=2,
         dimension_method="csp",
@@ -1011,7 +1011,7 @@ def test_poisson_csp_data_initialization_recovers_matlab_dimensions():
 
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         family="Poisson",
         D=2,
         dimension_method="csp",
@@ -1036,7 +1036,7 @@ def test_public_poisson_rejects_gamma():
     with pytest.raises(ValueError, match="no dispersion"):
         fit(
             X,
-            method="DDE",
+            model="DDE",
             family="Poisson",
             D=2,
             dimension_method="fixed",

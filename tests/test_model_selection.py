@@ -129,11 +129,12 @@ def test_select_hyperparameters_copula_smoke():
             },
         ],
         n_splits=2,
+        criterion="bic",
         random_state=1,
     )
 
     cv_table = result.diagnostics["cv_table"]
-    assert result.model == "copula"
+    assert result.model == "CopDDE"
     assert len(cv_table) == 2
     assert all(np.isfinite(row["mean_score"]) for row in cv_table)
     assert result.diagnostics["hyperparameter_selection"].best_index in {0, 1}
@@ -212,7 +213,7 @@ def test_select_hyperparameters_copula_pmse_fixed_smoke():
     )
 
     cv_table = result.diagnostics["cv_table"]
-    assert result.model == "copula"
+    assert result.model == "CopDDE"
     assert len(cv_table) == 1
     assert cv_table[0]["criterion"] == "pmse"
     assert np.isfinite(cv_table[0]["mean_pmse"])
@@ -318,7 +319,7 @@ def test_selection_accepts_one_pass_candidate_generator():
         for pen in (0.1, 0.2)
     )
     result = select_hyperparameters(
-        Y, D=1, method="DDE", family="Normal", criterion="ebic",
+        Y, D=1, model="DDE", dimension_method="fixed", family="Normal", criterion="ebic",
         candidates=candidates, base_fit_kwargs={"max_iter": 1, "verbose": False},
         refit=False,
     )
@@ -383,7 +384,7 @@ def test_selection_connects_every_supported_method_and_refits(method, path, fami
     if method == "CopDDE":
         base["optimizer_maxiter"] = 1
     result = select_hyperparameters(
-        Y, D=1, method=method, family=family, dimension_method=path,
+        Y, D=1, model=method, family=family, dimension_method=path,
         candidates=candidates, criterion="pmse" if method == "CopDDE" else "ebic",
         base_fit_kwargs=base, n_repeats=1, pmse_n_estimators=5,
         random_state=4,
@@ -401,7 +402,7 @@ def test_three_layer_default_csp_search_evaluates_all_spike_combinations(method)
     if method == "CopDDE":
         base["optimizer_maxiter"] = 1
     result = select_hyperparameters(
-        Y, D=3, method=method, family="Normal" if method == "DDE" else None,
+        Y, D=3, model=method, family="Normal" if method == "DDE" else None,
         dimension_method="csp", criterion="pmse" if method == "CopDDE" else "ebic",
         base_fit_kwargs=base, n_repeats=1, pmse_n_estimators=5,
         random_state=11, refit=False,
@@ -472,7 +473,7 @@ def test_select_hyperparameters_semidde_defaults_smoke():
     result = select_hyperparameters(
         X,
         D=2,
-        model="semi",
+        model="semi", dimension_method="fixed",
         candidates=[
             {
                 "name": "default_penalty",
@@ -488,15 +489,16 @@ def test_select_hyperparameters_semidde_defaults_smoke():
         ],
         fixed_hp={"K_list": K_list},
         n_splits=2,
+        criterion="bic",
         random_state=1,
     )
 
     cv_table = result.diagnostics["cv_table"]
-    assert result.model == "semi"
+    assert result.model == "SemiDDE"
     assert len(cv_table) == 2
     assert all(row["K_list"] == K_list for row in cv_table)
     assert all("tau" in row for row in cv_table)
-    assert {row["tol"] for row in cv_table} == {K_list[-1] / 2}
+    assert {row["tol"] for row in cv_table} == {0.005}
     assert len(result.diagnostics["timing_table"]) == 4
     assert all("fit_seconds" in row for row in result.diagnostics["timing_table"])
     assert all("score_seconds" in row for row in cv_table)
@@ -511,10 +513,11 @@ def test_select_hyperparameters_semidde_default_grid_has_full_penalty_product():
     result = select_hyperparameters(
         X,
         D=2,
-        model="semi",
+        model="semi", dimension_method="fixed",
         fixed_hp={"K_list": K_list},
         base_fit_kwargs={"max_outer_iter": 1, "max_inner_iter": 1, "tol": 0.0},
         n_splits=2,
+        criterion="bic",
         random_state=1,
         refit=False,
     )
@@ -596,8 +599,8 @@ def _small_selection_data(kind):
 @pytest.mark.parametrize(
     ("kind", "spec"),
     [
-        ("normal", dict(method="DDE", family="Normal")),  # draws from the global generator
-        ("binary", dict(method="DDE", family="Bernoulli")),
+        ("normal", dict(model="DDE", family="Normal")),  # draws from the global generator
+        ("binary", dict(model="DDE", family="Bernoulli")),
         ("normal", dict(model="SemiDDE")),
     ],
 )
@@ -621,7 +624,7 @@ def test_parallel_candidates_match_serial_bitwise_cross_validated_bic():
     prop, B_list, gamma = _parameters(18, K_list)
     X, _ = generate_X_normal(40, prop, B_list, gamma)
     args = dict(
-        D=2, method="DDE", family="Normal", dimension_method="fixed", criterion="bic",
+        D=2, model="DDE", family="Normal", dimension_method="fixed", criterion="bic",
         n_splits=2, random_state=5, fixed_hp={"K_list": K_list},
         candidates=[{"pen_list": [0.5, 0.5], "tau": 0.3}, {"pen_list": [2.0, 2.0], "tau": 0.3}],
         base_fit_kwargs={"max_iter": 2, "verbose": False},
@@ -636,5 +639,5 @@ def test_parallel_candidates_match_serial_bitwise_cross_validated_bic():
 
 def test_selection_rejects_nonpositive_n_jobs():
     with pytest.raises(ValueError, match="n_jobs"):
-        select_hyperparameters(_small_selection_data("normal"), D=2, method="DDE", family="Normal",
+        select_hyperparameters(_small_selection_data("normal"), D=2, model="DDE", family="Normal",
                                dimension_method="csp", n_jobs=0)

@@ -301,6 +301,22 @@ def _make_bounds(K, D):
     return lb, ub
 
 
+def _support_row_limits(lb, ub, support, n_rows):
+    """Per-row box limits; slopes outside ``support`` are pinned to zero."""
+    if support is None:
+        return [lb] * n_rows, [ub] * n_rows
+    support = np.asarray(support, dtype=bool)
+    row_lb, row_ub = [], []
+    for mask in support:
+        lower = np.asarray(lb, dtype=float).copy()
+        upper = np.asarray(ub, dtype=float).copy()
+        lower[1:][~mask] = 0.0
+        upper[1:][~mask] = 0.0
+        row_lb.append(lower)
+        row_ub.append(upper)
+    return row_lb, row_ub
+
+
 def _optimize_gaussian_layer(
     Z,
     A_sample,
@@ -315,12 +331,17 @@ def _optimize_gaussian_layer(
     penalty_kind,
     tau,
     observed_scale="declared",
+    support=None,
 ):
+    """Row-wise observed-layer M-step; ``support`` holds the slopes outside
+    each row's allowable parents at zero (``rows x K`` boolean graph)."""
     N, K1_plus_1, C = A_sample.shape
     X_design = np.transpose(A_sample, (0, 2, 1)).reshape(N * C, K1_plus_1)
     J = Z.shape[1]
+    row_lb, row_ub = _support_row_limits(lb, ub, support, J)
 
     def solve_row(j):
+        lb, ub = row_lb[j], row_ub[j]
         y = np.repeat(Z[:, j], C)
         if observed_scale == "matlab":
             # get_SAEM_RL_CSP_D.m calls F_1_SAEM_cop(..., temp, gamma(j)) although
@@ -366,12 +387,16 @@ def _optimize_logistic_layer(
     n_jobs,
     penalty_kind,
     tau,
+    support=None,
 ):
+    """Row-wise latent-layer M-step; ``support`` as in ``_optimize_gaussian_layer``."""
     N, K_parent_plus_1, C = A_parent_sample.shape
     X_design = np.transpose(A_parent_sample, (0, 2, 1)).reshape(N * C, K_parent_plus_1)
     K_child = A_child_sample.shape[1] - 1
+    row_lb, row_ub = _support_row_limits(lb, ub, support, K_child)
 
     def solve_row(k):
+        lb, ub = row_lb[k], row_ub[k]
         y = A_child_sample[:, k + 1, :].reshape(N * C)
         if penalty_kind == "weighted_l1":
             weights = np.concatenate(([0.0], 1.0 / np.asarray(theta_or_penalty[k], dtype=float)))
@@ -420,7 +445,7 @@ def get_SAEM_RL_CSP_D(
     n_jobs: int = 1,
     verbose: bool = True,
     convergence_window: int = 7,
-    convergence_std: float = 0.005,
+    convergence_tol: float = 0.005,
     burn: int = 5,
     trace_callback=None,
     observed_scale: str = "declared",
@@ -435,6 +460,12 @@ def get_SAEM_RL_CSP_D(
     the M-step: ``"declared"`` uses temp / gamma_j (the argument order that
     ``F_1_SAEM_cop.m`` declares); ``"matlab"`` uses gamma_j / temp, which is what
     the MATLAB routines actually compute because they pass (temp, gamma(j)).
+
+    The kernel stops once every layer's relative coefficient change
+    ``||B_new - B_old||_F / ||B_old||_F`` (slopes), averaged over the last
+    ``convergence_window`` iterations, is at most ``convergence_tol``.  (The
+    MATLAB routine thresholds the standard deviation of that window
+    instead, which measures how steady the change is, not how small.)
     """
     if observed_scale not in {"declared", "matlab"}:
         raise ValueError("observed_scale must be 'declared' or 'matlab'.")
@@ -540,7 +571,7 @@ def get_SAEM_RL_CSP_D(
             rel_hist[d].append(rel)
             if (
                 len(rel_hist[d]) < convergence_window
-                or np.std(rel_hist[d][-convergence_window:]) >= convergence_std
+                or np.mean(rel_hist[d][-convergence_window:]) > convergence_tol
             ):
                 stop_now = False
 

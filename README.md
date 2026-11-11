@@ -25,15 +25,42 @@ automatic grids) is in the executed notebook `examples/package_demo.ipynb` (abou
 jupyter nbconvert --to notebook --execute --inplace examples/package_demo.ipynb
 ```
 
+The arguments of `fit` follow Table 1 of the package manuscript:
+
+| Argument | Purpose |
+|---|---|
+| `model` | `"DDE"` (parametric), `"SemiDDE"` or `"CopDDE"` |
+| `D` | number of binary latent layers |
+| `family` | `"Normal"`, `"Bernoulli"` or `"Poisson"` (`model="DDE"` only) |
+| `dimension_method` | `"fixed"` (widths given by `K_list`) or `"csp"` (widths inferred by cumulative shrinkage) |
+| `K_list` | layer widths `[K_1, ..., K_D]`, shallowest first; for `"csp"` optional maximal widths |
+| `G_list` | optional binary graphs of the layers (`"fixed"`), see below |
+| `pen_list` | length-`D` truncated-lasso penalties (`"fixed"`) |
+| `t_spike`, `temp` | length-`D` CSP spike scales and the initial annealing temperature (`"csp"`) |
+| `C` | latent draws per stochastic E-step (default 1) |
+| `tol` | relative-change convergence tolerance (see each fitting routine) |
+| `tau` | truncation threshold of the coefficients |
+| `max_it` | maximum number of iterations |
+
+`method=` (the former name of `model`) still works with a
+`DeprecationWarning`, and the kernel spellings `max_iter`, `it` and
+`max_inner_iter` are accepted for `max_it`.  Omitting `dimension_method`
+warns (`FutureWarning`) and falls back to `"fixed"` (CopDDE: `"csp"`, or
+`"fixed"` with `G_list`).  Every fit returns a `DDEResult` with the fields
+`model` (`"DDE"`, `"SemiDDE"` or `"CopDDE"`), `prop`, `B_list`, `gamma`,
+`A_list`, `K_list`, `transformed`, `diagnostics` (including `iterations`,
+`active_by_layer` and `n_active_edges`) and `raw` (a dict of the kernel's
+outputs).
+
 A fixed-width Normal DDE supplies its latent widths and layer penalties.  A
-CSP fit omits `K_list`; the package initializes the recursive maximal widths
-`floor(J / 3), floor(floor(J / 3) / 3), ...` and returns the CSP-active widths
-in `result.diagnostics["K_list"]`:
+CSP fit may omit `K_list`; the package then initializes the recursive maximal
+widths `floor(J / 3), floor(floor(J / 3) / 3), ...` and returns the
+CSP-active widths in `result.K_list`:
 
 ```python
 result = fit(
     Y,
-    method="DDE",
+    model="DDE",
     family="Normal",
     D=3,
     dimension_method="csp",
@@ -42,7 +69,7 @@ result = fit(
     tau=0.3,
     C=1,
     tol=0.005,
-    max_iter=50,
+    max_it=50,
     random_state=123,
 )
 ```
@@ -61,9 +88,9 @@ an exact proximal weighted-lasso step (`csp_mstep_solver="fista_lower"`,
 `csp_penalty_scaling_reference=500`); the deepest layer keeps the CopDDE
 inexact L-BFGS-B step (`optimizer_maxiter=15`) with the unscaled penalty.
 Observed-layer coefficients and variances are returned on the original
-scale; the hard threshold `tau` acts on standardized loadings.  `tol` is the
-rolling standard deviation of the relative coefficient change (window 7)
-that stops the kernel.  `csp_mstep_solver="lbfgsb"` together with
+scale; the hard threshold `tau` acts on standardized loadings.  The kernel
+stops when every layer's relative coefficient change, averaged over the last
+seven iterations, is at most `tol`.  `csp_mstep_solver="lbfgsb"` together with
 `csp_penalty_scaling_power=0` restores the CopDDE M-step in every layer;
 `csp_slab_shape` and `csp_slab_rate` set the CUSP slab hyperprior (CopDDE
 1 and 5); `standardize=False` and `csp_threshold_rule` expose the remaining
@@ -90,7 +117,7 @@ result = fit(
     tau=0.3,
     C=1,
     tol=0.005,
-    max_iter=50,
+    max_it=50,
     random_state=123,
 )
 ```
@@ -109,21 +136,27 @@ penalty in every layer (`csp_penalty_scaling_power=0.5`,
 (`csp_threshold_rule="all"`), the dense marginal-likelihood deletion test for
 the deepest layer (`csp_top_prune="bic_dense"`), and 100 iterations without
 early stop (`max_it=100`, `tol=0`); `Results/csp_redesign/bench_v2` holds the
-20-replicate N-trend study behind these defaults.  The former MCEM CSP
+20-replicate N-trend study behind these defaults.  Bernoulli CSP also holds
+the columns in the CUSP slab for the first fifth of the budget
+(`csp_shrinkage_burn`: 20 of 100 iterations, in every layer except the
+deepest layer of a model with three or more layers); without it the rarest
+latents are pruned before their states settle and the width error does not
+fall with N (`Results/dde_modification`).  The former MCEM CSP
 backends (``"mcem"``, ``"mcem_reinitialize"``, ``"mcem_cap_only"``) were
 removed; the git tag `csp-mcem-last` holds the last version with them.
 
 Bernoulli DDE uses the same fixed and CSP interfaces, requires a binary 0/1
 matrix, and has no `gamma` dispersion parameter. For fixed-width parametric
-DDEs, `tol` is the RMSE of the postprocessed parameter update and defaults to
-`0.005`.  Fixed-width Bernoulli fits start from the anchor latent-class
+DDEs, fixed-width SemiDDE (its inner SAEM fits) and fixed-width CopDDE, `tol`
+bounds the relative parameter change `||theta_new - theta_old|| /
+||theta_old||` of an update and defaults to `0.005`.  Fixed-width Bernoulli fits start from the anchor latent-class
 initialization (`fixed_init_binarize="anchor_lca"`) and run ten unit-step
 burn-in sweeps (`sa_burn_in=10`); see the fixed-width controls below:
 
 ```python
 result = fit(
     Y_binary,
-    method="DDE",
+    model="DDE",
     family="Bernoulli",
     D=2,
     dimension_method="fixed",
@@ -146,28 +179,51 @@ other latent transitions stay available as options: the CopDDE synchronous
 mean-field draws (`csp_latent_transition="synchronous_mean_field"`) and a
 persistent systematic coordinate-Gibbs chain
 (`csp_latent_transition="systematic_coordinate_gibbs"`).  Further options are
-a slab-start burn-in (`csp_shrinkage_burn`) and a stopping rule that also
-waits for stable widths (`csp_convergence_width_window`, with `tol>0`).
+the slab-start burn-in (`csp_shrinkage_burn`, an integer or one value per
+layer) and a stopping rule that also waits for stable widths
+(`csp_convergence_width_window`, with `tol>0`).
 
 ## Visualization
 
 Two interfaces summarize a fitted model (`fit` or `select_hyperparameters`
 result).  `plot_weights` draws the estimated weight matrices from the observed
-layer upward (one heatmap per layer, or a chosen `layer`); for CSP fits the
-columns are labelled by their original latent indices.  `get_anchors` returns
-the observed variables that anchor each shallow-layer latent feature, ranked
-by the relative-loading score `r_jk = max(min_{l != k}(b_jk - b_jl), 0)`:
+layer upward (one heatmap per layer, or a chosen `layer`).  For CSP fits the
+columns are labelled by their original latent indices, and each matrix ends in
+one hatched blank column labelled with the number of latent columns the CSP
+shrank away (`show_shrunk=False` drops it).  `get_anchors` returns the observed
+variables that anchor each shallow-layer latent feature, ranked by the
+relative-loading score `r_jk = max(min_{l != k}(b_jk - b_jl), 0)`.
+
+The observed variables are labelled by the column names of the data frame the
+model was fitted on (kept in `result.diagnostics["variable_names"]`), otherwise
+`y1, y2, ...`.  `variable_names` replaces them, either with one name per
+variable or with a mapping that renames only some of them:
 
 ```python
 from dde.visualization import plot_weights, get_anchors
 
-figures = plot_weights(result, variable_names=Y.columns, output_dir="plots")
-anchors = get_anchors(result, n_anchors=3, variable_names=Y.columns)
+figures = plot_weights(result, output_dir="plots")            # data-frame column names
+figures = plot_weights(result, variable_names={"BIGFIVE_1": "Name"}, output_dir="plots")
+anchors = get_anchors(result, n_anchors=3, variable_names=item_texts)
 anchors[anchors["latent_feature"] == 1]
 ```
 
-The earlier multi-panel report bundle (`visualization_report` and the
-model-summary, latent-profile and theme-table plots) remains available from
+`visualization_report` writes the standard bundle of diagnostic plots of any
+fitted `DDEResult` (DDE, SemiDDE or CopDDE; fixed or CSP widths) and returns
+their paths keyed `model_summary`, `B1_heatmap`, `B2_heatmap`, ...,
+`top_loadings`, `item_cluster_heatmap`, `latent_profiles` and
+`latent_profiles_prevalence`; SemiDDE adds `posterior_quality_table` and CopDDE
+an optional `theme_table`.  `feature_names` labels the observed variables as
+`variable_names` does above:
+
+```python
+from dde.visualization import visualization_report
+
+paths = visualization_report(result, output_dir="plots", prefix="semi",
+                             feature_names=item_names)
+```
+
+The individual report helpers remain available from
 `dde.visualization.legacy`.
 
 Poisson DDE uses a canonical log link, requires finite nonnegative integer
@@ -177,7 +233,7 @@ supports any positive number of latent layers:
 ```python
 result = fit(
     Y_counts,
-    method="DDE",
+    model="DDE",
     family="Poisson",
     D=3,
     dimension_method="fixed",
@@ -273,7 +329,7 @@ backtracking FISTA, while its latent E-step uses persistent systematic Gibbs:
 ```python
 result = fit(
     Y_counts,
-    method="DDE",
+    model="DDE",
     family="Poisson",
     D=3,
     dimension_method="csp",
@@ -289,96 +345,128 @@ Run `scripts/evaluate_poisson_csp_recovery.py` for checkpointed dimension
 recovery experiments. Its primary summary columns are the exact shrinkage
 recovery rate and the mean L1 distance between fitted and true width vectors.
 
-## Fixed (user-specified) graph
+## Prespecified sparsity (`G_list`)
 
-When the graph is known, as for a Q-matrix in a cognitive assessment, pass it
-as `G_list` and only the coefficients on the graph are estimated (the
-confirmatory analysis of the paper's TIMSS application). `G_list[0]` is the
+When part of the network structure is known, as a Q-matrix in a cognitive
+assessment, pass it as `G_list` (fixed widths only).  `G_list[0]` is the
 `J x K_1` observed-layer graph and `G_list[d]` the `K_d x K_{d+1}` graph above
 it, binary with a nonempty column for every latent variable; the widths follow
-from the graphs:
+from the graphs.  As in Section 5.1 of the package manuscript, `G = 1` marks an
+allowable connection and `G = 0` a coefficient held at exactly zero.  The
+allowable coefficients are estimated by the same penalized SAEM as without a
+graph, so `pen_list` and `tau` are required and can still shrink an allowable
+coefficient to zero:
 
 ```python
 result = fit(
     Y_log_times,
-    method="DDE",
+    model="DDE",
     family="Normal",
+    dimension_method="fixed",
     G_list=[Q, np.ones((7, 1))],
+    pen_list=[N ** 0.25] * 2,
+    tau=0.3,
 )
 ```
 
-The fixed layers are neither penalized nor thresholded (`tau` and `pen_list`
-may be omitted when every layer is fixed), and their coefficients outside the
-graph are exactly zero. The start is graph-anchored: each latent column is
-read off its children with the fewest parents, oriented so that the value one
-raises their means. With every layer fixed and no layer wider than 10, the
-default `graph_algorithm="auto"` runs an exact EM over each layer's `2**K_d`
-states, which reaches the maximum-likelihood estimate on the graph; it keeps
-the best of `n_init=10` starts (the graph-anchored one and random starts on
-the graph, drawn from `random_state`), because the likelihood can be
-multimodal on real data. Wider layers, or a `G_list` that fixes only the
-shallowest layers (`K_list` then gives the free widths, which keep the
-penalized estimation), use the fixed-width SAEM kernel with the graph held
-(`graph_algorithm="saem"`, which needs `C`). SemiDDE (`model="SemiDDE"`,
-fixed mode) accepts `G_list` with the SAEM path. The paper-format study is
-`scripts/evaluate_fixed_graph_paper.py` and the TIMSS replication
-`scripts/realdata_timss_fixed_graph.py`.
+A layer whose graph allows every connection restricts nothing and is fitted as
+without a graph (all-ones `G_list` give exactly the fit without a graph; a
+restricted layer cannot sit above such a layer, whose latent variables would
+then be unlabelled).  A `G_list` shorter than `D` restricts the shallowest
+layers only; `K_list` then gives the widths of the deeper layers.  The start
+is graph-anchored: each latent column is read off its children with the
+fewest parents, oriented so that the value one raises their means.  When the
+graphs restrict every deeper layer and none is wider than 10, the layer-wise
+warm start fits the deeper layers by exact EM on the first-stage latent
+states; this only builds the start, and the full SAEM that follows
+penalizes and thresholds the allowable connections.  SemiDDE
+(`model="SemiDDE"`, fixed mode) accepts `G_list` the same way.
 
-CopDDE takes `G_list` the same way (`dimension_method` then defaults to
-`"fixed"`):
+Fits on a graph always use the penalized SAEM kernel.  An unpenalized exact
+EM over each layer's `2**K_d` states (every layer restricted, widths up to 16)
+is kept outside `fit()` as a reference implementation for checking the kernel
+against the maximum-likelihood estimate on the graph:
+`dde.algorithms.dde.fit_fixed_graph_reference(Y, family=..., G_list=...)`.
+It does not use `pen_list` or `tau` and keeps the best of `n_init=10` starts
+(the graph-anchored one and random starts on the graph, drawn from
+`random_state`), because the likelihood can be multimodal on real data.  It
+stops when an M-step changes the parameters by at most `tol` relative to their
+norm (default `1e-4`, at most 500 M-steps).  The paper-format study
+`scripts/evaluate_fixed_graph_paper.py` and the TIMSS confirmatory replication
+`scripts/realdata_timss_fixed_graph.py` call it.
+
+CopDDE takes `G_list` the same way:
 
 ```python
-result = fit(X_counts, method="CopDDE", G_list=[G1, G2], random_state=0)
+result = fit(X_counts, model="CopDDE", dimension_method="fixed",
+             G_list=[G1, G2], pen_list=[N ** 0.25] * 2, tau=0.3,
+             random_state=0)
 ```
 
-The fixed layers are fitted by the rank-likelihood kernel (`get_SAEM_RL_D`)
-on their graph, unpenalized and unthresholded, with coordinate-Gibbs latent
-draws, as in the CopDDE code's fixed-graph refit (`get_SAEM_RL_G.m`); the
-defaults are `C=1`, `it=50`, `tol=0` and `temp=1`. The start matches the
-spectral estimate's columns to the graph, which needs no child with a single
-parent. With every layer fixed and deep layers no wider than 10, the layers
-above the first are then refitted by exact EM on the first layer's states
-after `graph_warmup_it=10` kernel iterations, keeping the best of `n_init=20`
-starts. A binary graph fixes the labels of the latent variables but not their
-0/1 coding, and variables with identical graph columns (and rows above) are
-interchangeable. The paper-format study is
+The rank-likelihood kernel (`get_SAEM_RL_D`) holds the coefficients outside
+the graph at zero and penalizes and thresholds the allowable ones; with a
+restricting graph its latent draws are coordinate-Gibbs sweeps, as in the
+CopDDE code's fixed-graph refit (`get_SAEM_RL_G.m`), and the defaults are
+`C=1`, `max_it=50`, `tol=0` and `temp=1`.  The start matches the spectral
+estimate's columns to the graph, which needs no child with a single parent.
+With every layer restricted and deep layers no wider than 10, the layers above
+the first are then refitted by exact EM on the first layer's states after
+`graph_warmup_it=10` kernel iterations, keeping the best of `n_init=20`
+starts.  A binary graph fixes the labels of the latent variables but not
+their 0/1 coding, and variables with identical graph columns (and rows above)
+are interchangeable.  The paper-format study is
 `scripts/evaluate_copdde_fixed_graph.py`.
 
 ## Hyperparameter selection
 
-`select_hyperparameters` accepts the same `method`, `family`, `D`, and
-`dimension_method` path choices as `fit`. Use `criterion="ebic"` for a
-full-data information criterion or `"bic"`/`"loglik"` for K-fold scores.
-CopDDE also supports `"pmse"`, which compares simulated and observed data
-with a cross-validated random forest. Fixed DDE and SemiDDE use `pen_list`;
-CSP paths use `t_spike` and `temp`. DDE and SemiDDE CSP derive maximal widths
-from `D`, while CopDDE can derive them or accept `K_list`.
-
-Supply explicit candidate rows or a mapping of axes. `per_layer` crosses each
-layer's values independently, including all interactions with `tau` and
-`temp`:
+`select_hyperparameters` takes the same `model`, `family`, `D` and
+`dimension_method` as `fit`, a `candidates` grid, and passes every other
+keyword (`K_list`, `G_list`, `C`, `tol`, `max_it`, ...) to `fit` for every
+candidate.  For fixed widths the grid holds `pen_list` and `tau`; for CSP,
+`t_spike`, `tau` and `temp`.  A flat list of `pen_list` or `t_spike` values
+holds one candidate per value, used in every layer; nested lists or
+`{"per_layer": [[...], ...]}` give layer-specific vectors.  Every Cartesian
+combination is fitted:
 
 ```python
 selected = select_hyperparameters(
-    Y_binary, method="DDE", family="Bernoulli", D=2,
-    dimension_method="fixed", criterion="ebic",
-    fixed_hp={"K_list": [6, 2]},
+    Y,
+    D=2,
+    model="DDE",
+    family="Normal",
+    dimension_method="fixed",
+    K_list=[10, 3],
     candidates={
-        "pen_list": {"per_layer": [[0.1, 0.2], [0.2, 0.4]]},
-        "tau": [0.2, 0.3],
+        "pen_list": [.1, .05, .02, .01],
+        "tau": [.1, .2, .3],
     },
-    base_fit_kwargs={"max_iter": 50, "C": 1},
-    random_state=123,
+    C=1,
+    tol=.01,
+    max_it=25,
 )
-table = selected.diagnostics["cv_table"]  # eight fitted candidates
-best = selected.diagnostics["hyperparameter_selection"].best_candidate
+selected.K_list                                   # [10, 3]
+selected.raw["selection_method"]                  # 'fixed'
+selected.raw["selected_hyperparameters"]          # e.g. {'pen_list': [0.05, 0.05], 'tau': 0.3}
+table = selected.diagnostics["cv_table"]          # one row per candidate
 ```
+
+The criterion follows the model.  DDE and SemiDDE candidates are compared by
+the extended BIC of the full-data fit (`criterion="ebic"`, the default; the
+`ebic` column of the table is on the usual smaller-is-better scale, while
+`mean_score` is its negative per-observation value).  CopDDE candidates are
+compared by predictive synthetic-data utility (`criterion="pmse"`, the
+default): `n_repeats=25` synthetic data sets are drawn from each fit, pooled
+with the observed data, and a random forest scored by `n_splits=5`-fold
+cross-validation measures the propensity-score MSE; the smallest mean pMSE
+wins.  `criterion="bic"` or `"loglik"` selects by `n_splits`-fold
+cross-validated likelihood instead.
 
 When `candidates` is omitted, `auto_grid` crosses layer-specific penalty
 exponents and thresholds; CSP defaults cross all layer-specific spike choices.
 `auto_grid_copula_csp` also accepts `temp_values` and `tau_values` to build
 the complete grid used in a specific analysis. Every evaluated row records its
 score and elapsed fit/score times. The selected model is fitted on all data
-when `refit=True` (the default). For larger CopDDE grids, set `n_jobs` to
-parallelize the independent pMSE repeats; `n_repeats` and
-`pmse_n_estimators` control the accuracy and cost of that score.
+when `refit=True` (the default). Set `n_jobs` to evaluate candidates in
+parallel worker processes; `n_repeats` and `pmse_n_estimators` control the
+accuracy and cost of the pMSE score.  `fixed_hp` and `base_fit_kwargs` remain
+accepted as older ways to pass the fixed `fit` arguments.

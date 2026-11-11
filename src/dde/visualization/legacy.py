@@ -1,8 +1,10 @@
 """Legacy multi-panel reporting interface (kept for existing scripts).
 
-The primary interfaces are :func:`dde.visualization.plot_weights` and
-:func:`dde.visualization.get_anchors`.  The functions below produce the
-earlier model-summary, latent-profile, theme-table and report bundles.
+The primary interfaces are :func:`dde.visualization.plot_weights`,
+:func:`dde.visualization.get_anchors` and
+:func:`dde.visualization.visualization_report`.  The functions below produce
+the earlier model-summary, latent-profile, theme-table and report bundles;
+``visualization_report`` is re-exported here for existing scripts.
 """
 
 from .copula import (

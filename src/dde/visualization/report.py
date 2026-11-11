@@ -9,8 +9,25 @@ import numpy as np
 
 from dde.results import DDEResult
 
+from .weights import (
+    _active_index,
+    draw_shrunk_column,
+    observed_variable_labels,
+    shrunk_column_count,
+)
+
 
 MODEL_CONFIG = {
+    "dde": {
+        "label": "DDE",
+        "prefix": "dde",
+        "header_color": "#ece7f2",
+        "latent_binary_colors": ("#fcfbfd", "#6a51a3"),
+        "latent_cmap": "Purples",
+        "cluster_default": "always",
+        "cluster_title": "DDE item clusters by B1 loading pattern",
+        "top_loading_title": "Largest loadings",
+    },
     "semi": {
         "label": "SemiDDE",
         "prefix": "semi",
@@ -48,7 +65,7 @@ def _deps():
         import pandas as pd
     except ImportError as exc:  # pragma: no cover - depends on optional install
         raise ImportError(
-            "SemiDDE visualization requires the optional dependencies "
+            "dde.visualization requires the optional dependencies "
             "`matplotlib` and `pandas`. Install with `pip install dde[viz]` "
             "or install those packages directly."
         ) from exc
@@ -62,8 +79,17 @@ def _model_key(model: Optional[str], result: Optional[DDEResult] = None) -> str:
     if chosen in {"copdde"}:
         chosen = "copula"
     if chosen not in MODEL_CONFIG:
-        raise ValueError("model must be 'semi' or 'copula'.")
+        raise ValueError("model must be 'DDE', 'SemiDDE' or 'CopDDE' ('dde', 'semi' or 'copula').")
     return chosen
+
+
+def _model_label(model_key: str, result: DDEResult) -> str:
+    """Title label; a parametric DDE also names its family (``Normal DDE``)."""
+    label = MODEL_CONFIG[model_key]["label"]
+    family = (result.diagnostics or {}).get("family")
+    if model_key == "dde" and family:
+        return f"{str(family).capitalize()} {label}"
+    return label
 
 
 def _ensure_dir(output_dir: str | Path) -> Path:
@@ -119,16 +145,26 @@ def _latent_names(prefix: str, n: int) -> list[str]:
     return [f"{prefix}_{j + 1}" for j in range(n)]
 
 
-def _item_labels(n: int, feature_names: Optional[Sequence[str]]) -> list[str]:
-    if feature_names is None:
-        return [f"item_{i + 1}" for i in range(n)]
+def _layer_names(result: DDEResult, layer: int, n: int) -> list[str]:
+    """``A{layer}_k`` with the original column numbers of a CSP fit."""
+    return [f"A{layer}_{k}" for k in _active_index(result, layer, n)]
+
+
+def _item_labels(result: DDEResult, n: int, feature_names) -> list[str]:
+    """Observed-variable labels as in :func:`dde.visualization.plot_weights`:
+    recorded column names or ``y1, y2, ...``, replaced by ``feature_names``
+    (one name per item, padded with ``y{i}`` when short, or a mapping that
+    renames some default labels)."""
+    if feature_names is None or isinstance(feature_names, Mapping):
+        return observed_variable_labels(result, n, feature_names, argument="feature_names")
     labels = list(map(str, feature_names))
     if len(labels) < n:
-        labels.extend(f"item_{i + 1}" for i in range(len(labels), n))
+        labels.extend(f"y{i + 1}" for i in range(len(labels), n))
     return labels[:n]
 
 
-def _top_loading_frame(B, row_names, col_prefix, top_n=10):
+def _top_loading_frame(B, row_names, col_labels, top_n=10):
+    """Largest loadings of every active column of ``B`` (intercept in column 0)."""
     _, pd = _deps()
     B = np.asarray(B, dtype=float)
     rows = []
@@ -138,7 +174,7 @@ def _top_loading_frame(B, row_names, col_prefix, top_n=10):
         for rank, idx in enumerate(order, start=1):
             rows.append(
                 {
-                    "latent": f"{col_prefix}_{col + 1}",
+                    "latent": col_labels[col],
                     "rank": rank,
                     "row": row_names[idx],
                     "loading": float(slopes[idx]),
@@ -212,11 +248,21 @@ def _table_figure(rows, title, header_color, figsize=(8.6, 3.2)):
     return fig
 
 
-def _plot_heatmap(matrix, title, xlabels, ylabels, output_dir, filename, center_zero=True):
+def _row_layout(n_rows: int, *, base: float, pad: float):
+    """Figure height, label step and label size: every row keeps its label up
+    to 150 rows, as in :func:`dde.visualization.plot_weights`."""
+    height = max(base, min(24.0, (0.22 if n_rows <= 60 else 0.16) * n_rows + pad))
+    step = max(1, int(np.ceil(n_rows / 150)))
+    size = 8 if n_rows <= 60 else (7 if n_rows <= 110 else 6)
+    return height, step, size
+
+
+def _plot_heatmap(matrix, title, xlabels, ylabels, output_dir, filename, center_zero=True, n_shrunk=0):
     plt, _ = _deps()
     M = np.asarray(matrix, dtype=float)
-    fig_w = max(7.5, min(16.0, 0.28 * M.shape[1] + 4.0))
-    fig_h = max(4.5, min(14.0, 0.22 * M.shape[0] + 2.5))
+    shown_cols = M.shape[1] + (1 if n_shrunk else 0)
+    fig_w = max(7.5, min(16.0, 0.28 * shown_cols + 4.0))
+    fig_h, step, label_size = _row_layout(M.shape[0], base=4.5, pad=2.5)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     if center_zero:
         vmax = float(np.nanmax(np.abs(M))) if M.size else 1.0
@@ -225,11 +271,14 @@ def _plot_heatmap(matrix, title, xlabels, ylabels, output_dir, filename, center_
     else:
         im = ax.imshow(M, aspect="auto", cmap="viridis")
     ax.set_title(title, fontsize=13)
+    xlabels = list(xlabels)
+    if n_shrunk:
+        draw_shrunk_column(ax, M.shape[0], M.shape[1], n_shrunk)
+        xlabels.append(f"+{n_shrunk} shrunk")
     ax.set_xticks(range(len(xlabels)))
     ax.set_xticklabels(xlabels, rotation=90, fontsize=8)
-    step = max(1, int(np.ceil(len(ylabels) / 35)))
     ax.set_yticks(range(0, len(ylabels), step))
-    ax.set_yticklabels([ylabels[i] for i in range(0, len(ylabels), step)], fontsize=8)
+    ax.set_yticklabels([ylabels[i] for i in range(0, len(ylabels), step)], fontsize=label_size)
     ax.set_xlabel("latent column")
     ax.set_ylabel("rows")
     fig.colorbar(im, ax=ax, shrink=0.75, label="loading")
@@ -275,7 +324,7 @@ def _cluster_item_order(slopes, max_clusters=8):
     return order, np.asarray(cluster_labels, dtype=int)
 
 
-def _plot_item_cluster_heatmap(B1, row_names, output_dir, filename, title):
+def _plot_item_cluster_heatmap(B1, row_names, output_dir, filename, title, col_labels=None):
     plt, _ = _deps()
     B1 = np.asarray(B1, dtype=float)
     if B1.ndim != 2 or B1.shape[1] <= 1:
@@ -284,9 +333,10 @@ def _plot_item_cluster_heatmap(B1, row_names, output_dir, filename, title):
     order, cluster_labels = _cluster_item_order(slopes)
     heat = slopes[order]
     labels = [row_names[i] for i in order]
-    col_labels = _latent_names("A1", slopes.shape[1])
+    if col_labels is None:
+        col_labels = _latent_names("A1", slopes.shape[1])
     fig_w = max(7.8, min(16.0, 0.34 * heat.shape[1] + 5.2))
-    fig_h = max(5.0, min(16.0, 0.18 * heat.shape[0] + 2.8))
+    fig_h, step, label_size = _row_layout(heat.shape[0], base=5.0, pad=2.8)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     vmax = float(np.nanmax(np.abs(heat))) if heat.size else 1.0
     vmax = max(vmax, 1e-8)
@@ -294,9 +344,11 @@ def _plot_item_cluster_heatmap(B1, row_names, output_dir, filename, title):
     ax.set_title(title, fontsize=13)
     ax.set_xticks(range(len(col_labels)))
     ax.set_xticklabels(col_labels, rotation=90, fontsize=8)
-    step = max(1, int(np.ceil(len(labels) / 35)))
     ax.set_yticks(range(0, len(labels), step))
-    ax.set_yticklabels([f"C{cluster_labels[i]} | {labels[i]}" for i in range(0, len(labels), step)], fontsize=7)
+    ax.set_yticklabels(
+        [f"C{cluster_labels[i]} | {labels[i]}" for i in range(0, len(labels), step)],
+        fontsize=min(label_size, 7),
+    )
     ax.set_xlabel("A1 latent")
     ax.set_ylabel("cluster | item")
     for i in range(1, len(cluster_labels)):
@@ -329,6 +381,16 @@ def _plot_bar_frame(df, output_dir, filename, title, value_col="loading", label_
 
 
 def _summary_rows(result: DDEResult, model_key: str, best: Mapping[str, Any], B_list, A_list):
+    diagnostics = result.diagnostics or {}
+
+    def setting(name):
+        # the selected candidate first, then the fit's own record, then the
+        # hyperparameters given to fit()
+        arguments = diagnostics.get("fit_arguments") or {}
+        return _format_value(
+            best.get(name, diagnostics.get(name, arguments.get(name, "not available")))
+        )
+
     K_list = result.diagnostics.get("K_list") if result.diagnostics else None
     if K_list is None and B_list:
         K_list = [B.shape[1] - 1 for B in B_list]
@@ -344,6 +406,16 @@ def _summary_rows(result: DDEResult, model_key: str, best: Mapping[str, Any], B_
         ("best score", _format_value(best.get("mean_score", "not available"))),
         ("tau", _format_value(best.get("tau", "not available"))),
     ]
+    if model_key == "dde":
+        method = str(best.get("dimension_method", diagnostics.get("dimension_method", ""))).lower()
+        rows[1:1] = [("family", _format_value(diagnostics.get("family", "not available")))]
+        rows[7:7] = [("dimension method", method or "not available")]
+        rows[-1] = ("tau", setting("tau"))
+        if method == "csp":
+            rows.extend([("t_spike", setting("t_spike")), ("temperature", setting("temp"))])
+        else:
+            rows.append(("pen_list", setting("pen_list")))
+        return rows
     if model_key == "semi":
         rows.extend(
             [
@@ -380,10 +452,16 @@ def plot_model_summary(
     top_loadings: int = 8,
     include_item_cluster: Optional[bool] = None,
 ) -> Dict[str, str]:
-    """Create model-summary visualizations for a fitted DDE result."""
+    """Create model-summary visualizations for a fitted DDE result.
+
+    ``feature_names`` labels the observed variables: one name per item, or a
+    mapping that renames some of the default labels (the column names of the
+    fitted data frame, else ``y1, y2, ...``).  The loading heatmaps
+    of a CSP fit end in one blank column that counts the shrunk columns.
+    """
     plt, pd = _deps()
     model_key = _model_key(model, result)
-    config = MODEL_CONFIG[model_key]
+    config = dict(MODEL_CONFIG[model_key], label=_model_label(model_key, result))
     prefix = prefix or config["prefix"]
     cv = _as_cv_table(result, cv_table)
     best = _best_row_from_cv(cv)
@@ -395,10 +473,10 @@ def plot_model_summary(
         f"{config['label']} model and selected hyperparameters",
         config["header_color"],
     )
-    paths = {"summary": _save(fig, output_dir, f"{prefix}_model_summary.png")}
+    paths = {"model_summary": _save(fig, output_dir, f"{prefix}_model_summary.png")}
     plt.close(fig)
 
-    row_names = _item_labels(B_list[0].shape[0], feature_names) if B_list else []
+    row_names = _item_labels(result, B_list[0].shape[0], feature_names) if B_list else []
     if include_item_cluster is None:
         include_item_cluster = config["cluster_default"] == "always"
     if include_item_cluster and B_list:
@@ -407,15 +485,16 @@ def plot_model_summary(
             row_names,
             output_dir,
             f"{prefix}_item_cluster_heatmap.png",
-            config["cluster_title"],
+            config["cluster_title"].replace(MODEL_CONFIG[model_key]["label"], config["label"], 1),
+            col_labels=_layer_names(result, 1, B_list[0].shape[1] - 1),
         )
         if path is not None:
             paths["item_cluster_heatmap"] = path
     top_frames = []
     for layer, B in enumerate(B_list, start=1):
         slopes = B[:, 1:]
-        layer_rows = row_names if layer == 1 else _latent_names(f"A{layer - 1}", B.shape[0])
-        col_labels = _latent_names(f"A{layer}", slopes.shape[1])
+        layer_rows = row_names if layer == 1 else _layer_names(result, layer - 1, B.shape[0])
+        col_labels = _layer_names(result, layer, slopes.shape[1])
         if slopes.shape[0] > max_heatmap_rows:
             row_order = np.argsort(np.linalg.norm(slopes, axis=1))[::-1][:max_heatmap_rows]
             heat = slopes[row_order]
@@ -430,8 +509,10 @@ def plot_model_summary(
             ylabels,
             output_dir,
             f"{prefix}_B{layer}_heatmap.png",
+            n_shrunk=shrunk_column_count(result, layer, slopes.shape[1]),
         )
-        top_frames.append(_top_loading_frame(slopes, layer_rows, f"A{layer}", top_n=top_loadings))
+        # B with its intercept column: the helper reads the slopes from column 1
+        top_frames.append(_top_loading_frame(B, layer_rows, col_labels, top_n=top_loadings))
     if top_frames:
         top_df = pd.concat(top_frames, ignore_index=True)
         path = _plot_bar_frame(
@@ -691,7 +772,7 @@ def plot_latent_profiles(
 ) -> Dict[str, str]:
     """Visualize latent profiles with model-specific auxiliary plots."""
     model_key = _model_key(model, result)
-    config = MODEL_CONFIG[model_key]
+    config = dict(MODEL_CONFIG[model_key], label=_model_label(model_key, result))
     prefix = prefix or config["prefix"]
     latent_df = _coerce_latent_frame(result, latent_frame)
     if latent_df is None:
@@ -824,7 +905,21 @@ def visualization_report(
     average_by_label: bool = False,
     continuous_label_bins: int = 10,
 ) -> Dict[str, str]:
-    """Generate the standard visualization bundle for SemiDDE or CopDDE."""
+    """Generate the standard visualization bundle of a fitted ``DDEResult``.
+
+    Works for every model (``"DDE"``, ``"SemiDDE"``, ``"CopDDE"``; taken from
+    ``result.model`` unless ``model`` is given) and for fixed-width and CSP
+    fits.  Every model writes the model summary, the loading heatmaps
+    ``B{d}_heatmap`` (a CSP fit's heatmaps end in one blank column that
+    counts the shrunk columns), the top loadings, the latent profiles and,
+    when latent states are available, their prevalence by label.  DDE and
+    CopDDE add the item-cluster heatmap; SemiDDE adds it when no
+    ``alignment_weights`` are given, plus the posterior-quality table and
+    the alignment heatmap; CopDDE adds the theme table when
+    ``theme_table`` is given.  ``feature_names`` labels the observed
+    variables (one name per item, or a mapping that renames some of the
+    default labels, which are the column names of the fitted data frame).
+    """
     model_key = _model_key(model, result)
     config = MODEL_CONFIG[model_key]
     prefix = prefix or config["prefix"]

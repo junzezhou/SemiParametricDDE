@@ -88,7 +88,7 @@ def get_SAEM_semiparametric_csp_copula(
     raw = fit_parametric_csp_copula(
         X, prop_in, gamma_in, B_list_in, A_list_in, family="normal", C=C, it=max_iter,
         t_spike=t_spike, temp=temp, tau=tau, optimizer_maxiter=optimizer_maxiter,
-        convergence_std=tol, random_state=random_state, keep_trace=keep_trace,
+        convergence_tol=tol, random_state=random_state, keep_trace=keep_trace,
         verbose=verbose, observed_update=g_update, observed_update_every=g_update_every,
         **settings,
     )

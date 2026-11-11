@@ -352,7 +352,7 @@ def test_normal_csp_d5_maximal_width_one_iteration_smoke():
 
     result = fit(
         X,
-        method="DDE",
+        model="DDE",
         D=5,
         family="Normal",
         dimension_method="csp",

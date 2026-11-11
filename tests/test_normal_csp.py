@@ -176,7 +176,7 @@ def test_mean_field_mstep_and_observed_noise_options():
 def test_fit_forwards_hybrid_solver_controls():
     X = _simulate_two_layer(13, N=120)
     result = fit(
-        X, method="DDE", family="Normal", D=2, dimension_method="csp",
+        X, model="DDE", family="Normal", D=2, dimension_method="csp",
         t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=2,
         random_state=5, verbose=False, csp_mstep_solver="hybrid",
         csp_fista_maxiter=50, csp_initializer="family",
@@ -258,7 +258,7 @@ def _simulate_two_layer(seed, N=600, J=36, K_true=(6, 2)):
 def test_copula_backend_is_default_for_normal_and_shrinks_overspecified_widths():
     X = _simulate_two_layer(11)
     result = fit(
-        X, method="DDE", family="Normal", D=2, dimension_method="csp",
+        X, model="DDE", family="Normal", D=2, dimension_method="csp",
         t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=40,
         random_state=5, verbose=False,
     )
@@ -280,12 +280,12 @@ def test_mcem_backend_is_rejected_and_copula_initializer_still_available():
     X = _simulate_two_layer(12, N=120)
     with pytest.raises(ValueError, match="were removed"):
         fit(
-            X, method="DDE", family="Normal", D=2, dimension_method="csp",
+            X, model="DDE", family="Normal", D=2, dimension_method="csp",
             t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=2,
             random_state=5, verbose=False, csp_backend="mcem",
         )
     result = fit(
-        X, method="DDE", family="Normal", D=2, dimension_method="csp",
+        X, model="DDE", family="Normal", D=2, dimension_method="csp",
         t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=2,
         random_state=5, verbose=False, csp_initializer="copula",
     )
@@ -298,7 +298,7 @@ def test_copula_backend_accepts_poisson_family():
     rng = np.random.default_rng(0)
     Y = rng.poisson(2.0, size=(60, 18)).astype(float)
     res = fit(
-        Y, method="DDE", family="Poisson", D=2, dimension_method="csp",
+        Y, model="DDE", family="Poisson", D=2, dimension_method="csp",
         t_spike=0.02, temp=0.9, tau=0.3, C=1, max_iter=1,
         csp_backend="copula", verbose=False,
     )
@@ -311,7 +311,7 @@ def test_standardized_copula_backend_is_affine_equivariant():
     scale = np.linspace(0.5, 4.0, X.shape[1])
     shift = np.linspace(-3.0, 3.0, X.shape[1])
     kwargs = dict(
-        method="DDE", family="Normal", D=2, dimension_method="csp",
+        model="DDE", family="Normal", D=2, dimension_method="csp",
         t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=6,
         random_state=9, verbose=False,
     )
@@ -334,7 +334,7 @@ def test_standardize_applies_to_supplied_initialization():
     X = _simulate_two_layer(22, N=200)
     prop0, B0, gamma0, A0 = Normal_init_cop(X, (12, 4))
     kwargs = dict(
-        method="DDE", family="Normal", D=2, dimension_method="csp",
+        model="DDE", family="Normal", D=2, dimension_method="csp",
         t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=3,
         random_state=9, verbose=False,
     )
@@ -425,7 +425,7 @@ def test_penalty_scaling_multiplies_mstep_weights_and_is_recorded():
 def test_fit_passes_slab_and_penalty_scaling_controls():
     X = _simulate_two_layer(31, N=150)
     result = fit(
-        X, method="DDE", family="Normal", D=2, dimension_method="csp",
+        X, model="DDE", family="Normal", D=2, dimension_method="csp",
         t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=1, max_iter=2,
         random_state=5, verbose=False,
         csp_slab_shape=5.0, csp_slab_rate=1.0,
@@ -548,7 +548,7 @@ def test_top_layer_reinitialization_replaces_deepest_layer():
 def test_fit_passes_latent_transition_and_reinit_controls():
     X = _simulate_two_layer(17, N=150)
     common = dict(
-        method="DDE", family="Normal", D=2, dimension_method="csp",
+        model="DDE", family="Normal", D=2, dimension_method="csp",
         t_spike=[0.02, 0.04], temp=0.7, tau=0.3, C=2, max_iter=3,
         random_state=5, verbose=False,
     )

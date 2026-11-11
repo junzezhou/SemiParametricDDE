@@ -27,7 +27,7 @@ def _simulate(seed, N=300, J=18, K_true=(6, 2)):
 def test_fit_routes_poisson_to_copula_backend():
     Y = _simulate(3)
     res = fit(
-        Y, method="DDE", family="Poisson", D=2, dimension_method="csp",
+        Y, model="DDE", family="Poisson", D=2, dimension_method="csp",
         t_spike=(0.02, 0.04), temp=0.7, tau=0.4, C=1, max_iter=4, verbose=False,
         csp_backend="copula", random_state=2,
     )

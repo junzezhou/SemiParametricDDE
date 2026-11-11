@@ -136,6 +136,7 @@ def _fit_one(scenario, *, N, replicate, seed, args):
                 )
                 if value is not None
             },
+            **args.fit_kwargs,
         )
         widths = tuple(int(value) for value in result.K_list)
         metrics = dimension_recovery_metrics(widths, scenario["K_true"])
@@ -241,7 +242,12 @@ def main():
         default=Path("results/semidde_csp_recovery"),
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--fit-kwargs", default="",
+        help="JSON object of extra keyword arguments for fit (kernel options)",
+    )
     args = parser.parse_args()
+    args.fit_kwargs = json.loads(args.fit_kwargs) if args.fit_kwargs else {}
     if args.replicates < 1 or args.sample_size < 1:
         parser.error("--replicates and --sample-size must be positive")
 
@@ -276,6 +282,7 @@ def main():
         "max_enum_bits": args.max_enum_bits,
         "tau": args.tau,
         "tol": args.tol,
+        "fit_kwargs": args.fit_kwargs,
         "primary_metrics": [
             "dimension_shrinkage_accuracy",
             "mean_dimension_l1_error",
