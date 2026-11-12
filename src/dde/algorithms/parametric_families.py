@@ -1004,11 +1004,19 @@ class NormalFamilyAdapter:
                 x_sq_sum=response_cache,
                 support=support,
             )
-        if depth >= 3:
+        if depth >= 3 and observed_solver in (None, "least_squares"):
             return _update_deep_normal_observed(
                 X,
                 Q_current,
                 q_current,
+                tau,
+                x_sq_sum=response_cache,
+            )
+        if depth >= 3 and observed_solver == "least_squares_averaged":
+            return _update_deep_normal_observed(
+                X,
+                accumulator.Q,
+                accumulator.q_all,
                 tau,
                 x_sq_sum=response_cache,
             )

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 from joblib import Parallel, delayed
-from scipy.special import gammaln, logsumexp
+from scipy.special import gammaln, log_ndtr, logsumexp, ndtri
 from scipy.stats import rankdata
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
@@ -518,6 +518,115 @@ def parametric_mixture_loglik_score(
     return float(np.mean(obs_loglik))
 
 
+def _first_layer_mixture(result: DDEResult, *, max_enum_bits: int, mc_samples: int, random_state):
+    """Patterns of ``A^(1)`` and their probabilities under the fitted hierarchy."""
+    B_list = [np.asarray(B, dtype=float) for B in result.B_list]
+    K1 = B_list[0].shape[1] - 1
+    if K1 <= max_enum_bits:
+        patterns = binary(np.arange(1 << K1, dtype=np.int64), K1)
+        pmf = np.asarray(compute_marginal_pmf_A1(
+            result.prop, B_list, max_enum_bits=max_enum_bits, mc_samples=mc_samples,
+        ), dtype=float)
+        pmf = np.clip(pmf, 1e-300, None)
+        return np.asarray(patterns, dtype=float), pmf / pmf.sum()
+    patterns = np.asarray(simulate_latent_layers_D(
+        int(mc_samples), result.prop, B_list, _as_rng(random_state)
+    )[0][0], dtype=float)
+    return patterns, np.full(patterns.shape[0], 1.0 / patterns.shape[0])
+
+
+def semidde_loglik_score(
+    Y: np.ndarray,
+    result: DDEResult,
+    *,
+    max_enum_bits: int = 12,
+    mc_samples: int = 4096,
+    newton_steps: int = 30,
+    random_state: Optional[int] = 0,
+) -> float:
+    """Average SemiDDE log-likelihood of ``Y``, up to a term free of the fit.
+
+    Under the SemiDDE, ``Z = g(Y)`` follows a Normal DDE and every ``g_j`` is
+    increasing, so ``g_j = F_{Z_j}^{-1} o F_{Y_j}`` with ``F_{Z_j}`` the
+    Gaussian-mixture margin that the DDE parameters imply.  Hence
+
+        log p(Y) = sum_i [log p_DDE(z_i) - sum_j log f_{Z_j}(z_ij)]
+                   + sum_ij log f_{Y_j}(Y_ij),
+
+    and the last sum does not depend on the fitted model.  With ``F_{Y_j}``
+    at its empirical value, ``z_ij = F_{Z_j}^{-1}(r_ij / (N + 1))`` (``r_ij``
+    the rank of ``Y_ij``), i.e. the transformation and the DDE parameters are
+    estimated jointly, and the score is the mean over observations of the
+    bracket.  It is invariant to an affine change of ``Z_j`` (the canonical
+    location-scale constraints do not matter).  Missing entries are skipped
+    (ranks among the observed values of the column).
+    """
+    if result.prop is None or result.B_list is None or result.gamma is None:
+        raise ValueError("result must contain prop, B_list and gamma to be scored.")
+    Y = np.asarray(Y, dtype=float)
+    if Y.ndim != 2:
+        raise ValueError("Y must be a two-dimensional matrix.")
+    N, J = Y.shape
+    B1 = np.asarray(result.B_list[0], dtype=float)
+    if B1.shape[0] != J:
+        raise ValueError("Y and fitted observed-layer widths differ.")
+    sd = np.sqrt(np.maximum(np.asarray(result.gamma, dtype=float).reshape(-1), 1e-8))
+    patterns, pmf = _first_layer_mixture(
+        result, max_enum_bits=max_enum_bits, mc_samples=mc_samples, random_state=random_state,
+    )
+    means = np.column_stack([np.ones(patterns.shape[0]), patterns]) @ B1.T  # P x J
+    log_pmf = np.log(pmf)
+    mask = np.isfinite(Y)
+    Z = np.zeros_like(Y)
+    log_margin = np.zeros_like(Y)
+    for j in range(J):
+        obs = np.flatnonzero(mask[:, j])
+        if obs.size == 0:
+            continue
+        u = rankdata(Y[obs, j], method="average") / (obs.size + 1.0)
+        # patterns with the same mean for this item (it depends only on the
+        # item's parents) are one mixture component: merge them (exact)
+        unique_means, inverse = np.unique(means[:, j], return_inverse=True)
+        m, s = unique_means, sd[j]
+        log_w = np.log(np.maximum(np.bincount(inverse, weights=pmf), 1e-300))
+        # start from the quantile of a moment-matched normal, then Newton steps
+        # on the exact mixture cdf, kept inside a bracket of the mixture
+        w = np.exp(log_w)
+        centre = float(w @ m)
+        spread = float(np.sqrt(w @ (m - centre) ** 2 + s * s))
+        lo = np.full(obs.size, m.min() - 40.0 * s)
+        hi = np.full(obs.size, m.max() + 40.0 * s)
+        z = np.clip(centre + spread * ndtri(u), lo, hi)
+        for _ in range(int(newton_steps)):
+            # a vanishing density (far tails) gives an infinite step, which
+            # falls outside the bracket and is replaced by bisection
+            standardized = (z[:, None] - m[None, :]) / s
+            cdf = np.exp(logsumexp(log_w[None, :] + log_ndtr(standardized), axis=1))
+            log_pdf = logsumexp(log_w[None, :] - 0.5 * standardized**2, axis=1) - np.log(s * np.sqrt(2.0 * np.pi))
+            above = cdf > u
+            hi = np.where(above, z, hi)
+            lo = np.where(above, lo, z)
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                step = (cdf - u) / np.exp(log_pdf)
+            proposal = z - step
+            outside = ~((proposal > lo) & (proposal < hi)) | ~np.isfinite(proposal)
+            z_next = np.where(outside, 0.5 * (lo + hi), proposal)
+            converged = np.max(np.abs(z_next - z)) < 1e-10 * (1.0 + np.max(np.abs(z)))
+            z = z_next
+            if converged:
+                break
+        standardized = (z[:, None] - m[None, :]) / s
+        log_margin[obs, j] = (
+            logsumexp(log_w[None, :] - 0.5 * standardized**2, axis=1) - np.log(s * np.sqrt(2.0 * np.pi))
+        )
+        Z[obs, j] = z
+    joint = parametric_mixture_loglik_score(
+        Z, result, family="normal", max_enum_bits=max_enum_bits, mc_samples=mc_samples,
+        random_state=random_state, observed_mask=mask,
+    )
+    return float(joint - np.mean(np.sum(np.where(mask, log_margin, 0.0), axis=1)))
+
+
 def _as_rng(random_state=None) -> np.random.Generator:
     if isinstance(random_state, np.random.Generator):
         return random_state
@@ -637,5 +746,6 @@ __all__ = [
     "estimate_K_list_semidde",
     "normal_mixture_loglik_score",
     "parametric_mixture_loglik_score",
+    "semidde_loglik_score",
     "simulate_copula_predictive",
 ]

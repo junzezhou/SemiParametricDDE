@@ -383,7 +383,12 @@ def fit_parametric_dde(
     active set afterwards) and ``"active_set_wide"``; on the D=4 design the
     exact variants lose observed-layer accuracy (layer-1 RMSE 0.12 versus
     0.07 at N=16000), so they are kept for wide layers where the dense
-    solve is too slow.
+    solve is too slow.  For Normal fits with ``D >= 3`` it selects the
+    observed-layer update: ``"least_squares"`` (default, the MATLAB ``D >= 3``
+    rule: unpenalized least squares on the current draw, then the ``tau``
+    threshold), ``"least_squares_averaged"`` (the same on the
+    stochastically averaged statistics) or ``"rowwise"`` (the TLP-penalized
+    update on the averaged statistics, as for ``D <= 2``).
 
     ``G_list`` gives prespecified sparsity patterns (fixed-width fits only,
     manuscript Section 5.1): ``G_list[0]`` is the ``J x K_1`` observed-layer
@@ -612,10 +617,14 @@ def fit_parametric_dde(
         )
     if fixed_observed_solver is not None:
         fixed_observed_solver = str(fixed_observed_solver).strip().lower()
-        if not is_poisson or method != "fixed":
-            raise ValueError("fixed_observed_solver is a fixed-width Poisson option.")
-        if fixed_observed_solver not in {"active_set", "rowwise", "hybrid", "active_set_wide"}:
+        if not (is_poisson or is_normal) or method != "fixed":
+            raise ValueError("fixed_observed_solver is a fixed-width Poisson or Normal option.")
+        if is_poisson and fixed_observed_solver not in {"active_set", "rowwise", "hybrid", "active_set_wide"}:
             raise ValueError("fixed_observed_solver must be 'active_set', 'rowwise', 'hybrid' or 'active_set_wide'.")
+        if is_normal and fixed_observed_solver not in {"least_squares", "least_squares_averaged", "rowwise"}:
+            raise ValueError(
+                "Normal fixed_observed_solver must be 'least_squares', 'least_squares_averaged' or 'rowwise'."
+            )
     if fixed_warm_start is None:
         fixed_warm_start = (
             "layerwise"

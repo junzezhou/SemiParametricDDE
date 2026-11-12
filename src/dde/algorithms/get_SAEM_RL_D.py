@@ -12,6 +12,9 @@ try:
         _prepare_rank_groups,
         _sample_latent_layers,
         _sample_rank_likelihood_Z,
+        _StochasticApproximation,
+        _optimize_gaussian_layer_sa,
+        _optimize_logistic_layer_sa,
         _threshold,
         _update_bernoulli_probabilities_D,
         _as_arrays,
@@ -26,6 +29,9 @@ except Exception:  # pragma: no cover - direct script/notebook import
         _prepare_rank_groups,
         _sample_latent_layers,
         _sample_rank_likelihood_Z,
+        _StochasticApproximation,
+        _optimize_gaussian_layer_sa,
+        _optimize_logistic_layer_sa,
         _threshold,
         _update_bernoulli_probabilities_D,
         _as_arrays,
@@ -80,6 +86,7 @@ def get_SAEM_RL_D(
     verbose: bool = True,
     support_list=None,
     latent_transition: str = "synchronous_mean_field",
+    sa_burn_in=None,
 ):
     """D-layer rank-likelihood SAEM using fixed TLP penalties.
 
@@ -104,6 +111,13 @@ def get_SAEM_RL_D(
     CopDDE kernels' rule) or ``"systematic_coordinate_gibbs"`` (one sequential
     sweep of the exact full conditionals per draw, deepest layer first as in
     ``get_SAEM_RL_G.m``).
+
+    ``sa_burn_in=None`` fits every M-step to the current draw alone (the
+    CopDDE code, whose averaging line is commented out).  An integer turns
+    on the stochastic-approximation averaging of the manuscript (eq. 18,
+    21): ``sa_burn_in`` unit steps, then the M-step objective and the
+    top-layer probabilities are averaged with step size
+    ``1 / (t - sa_burn_in)``; the stopping test starts after the burn-in.
     """
     X = np.asarray(X)
     Z = np.asarray(Z, dtype=float).copy()
@@ -131,13 +145,14 @@ def get_SAEM_RL_D(
 
     rank_groups = _prepare_rank_groups(R, Rlevels)
     lb, ub = _make_bounds(K, D)
+    sa = None if sa_burn_in is None else _StochasticApproximation(J, K, sa_burn_in)
     A_sample_long = None
     ber = None
     ber_top = None
     it_num = 0
     err = np.inf
 
-    while it_num < it and abs(err) > tol:
+    while it_num < it and (abs(err) > tol or (sa is not None and it_num <= sa.burn_in)):
         if gibbs:
             samples, ber_top = _sample_latent_layers_parametric(
                 Z, prop, B_list, gamma, [A.astype(np.uint8) for A in A_list], C,
@@ -153,38 +168,51 @@ def get_SAEM_RL_D(
         mu = np.mean(A_sample_long[0], axis=2) @ B_list[0].T
         _sample_rank_likelihood_Z(Z, mu, gamma, temp, rank_groups)
 
-        prop_update = np.mean(ber_top, axis=0)
         B_update = [None] * D
-        B_update[0], gamma_update = _optimize_gaussian_layer(
-            Z,
-            A_sample_long[0],
-            B_list[0],
-            gamma,
-            pen_list[0],
-            temp,
-            lb[0],
-            ub[0],
-            optimizer_maxiter,
-            n_jobs,
-            "tlp",
-            tau,
-            support=support_list[0],
-        )
-        for d in range(1, D):
-            B_update[d] = _optimize_logistic_layer(
-                A_sample_long[d - 1],
-                A_sample_long[d],
-                B_list[d],
-                pen_list[d],
+        if sa is not None:
+            prop_update = sa.update(it_num + 1, Z, A_sample_long, ber_top)
+            B_update[0], gamma_update = _optimize_gaussian_layer_sa(
+                sa.gaussian, Z.shape[0], A_sample_long[0].shape[2], B_list[0], gamma,
+                pen_list[0], temp, lb[0], ub[0], optimizer_maxiter, n_jobs, "tlp", tau,
+                support=support_list[0],
+            )
+            for d in range(1, D):
+                B_update[d] = _optimize_logistic_layer_sa(
+                    sa.logistic[d - 1], B_list[d], pen_list[d], temp, lb[d], ub[d],
+                    optimizer_maxiter, n_jobs, "tlp", tau, support=support_list[d],
+                )
+        else:
+            prop_update = np.mean(ber_top, axis=0)
+            B_update[0], gamma_update = _optimize_gaussian_layer(
+                Z,
+                A_sample_long[0],
+                B_list[0],
+                gamma,
+                pen_list[0],
                 temp,
-                lb[d],
-                ub[d],
+                lb[0],
+                ub[0],
                 optimizer_maxiter,
                 n_jobs,
                 "tlp",
                 tau,
-                support=support_list[d],
+                support=support_list[0],
             )
+            for d in range(1, D):
+                B_update[d] = _optimize_logistic_layer(
+                    A_sample_long[d - 1],
+                    A_sample_long[d],
+                    B_list[d],
+                    pen_list[d],
+                    temp,
+                    lb[d],
+                    ub[d],
+                    optimizer_maxiter,
+                    n_jobs,
+                    "tlp",
+                    tau,
+                    support=support_list[d],
+                )
 
         for d in range(D):
             B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)

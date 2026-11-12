@@ -69,9 +69,9 @@ in about the ninth digit between runs.
 
 `method=` (the former name of `model`) still works with a
 `DeprecationWarning`, and the kernel spellings `max_iter`, `it` and
-`max_inner_iter` are accepted for `max_it`.  Omitting `dimension_method`
-warns (`FutureWarning`) and falls back to `"fixed"` (CopDDE: `"csp"`, or
-`"fixed"` with `G_list`).  Every fit returns a `DDEResult` with the fields
+`max_inner_iter` are accepted for `max_it`.  `dimension_method` (`"fixed"`
+or `"csp"`) is required, as in the manuscript's Table 1; omitting it raises
+a `ValueError`.  Every fit returns a `DDEResult` with the fields
 `model` (`"DDE"`, `"SemiDDE"` or `"CopDDE"`), `prop`, `B_list`, `gamma`,
 `A_list`, `K_list`, `transformed`, `diagnostics` (including `iterations`,
 `active_by_layer` and `n_active_edges`) and `raw` (a dict of the kernel's
@@ -503,7 +503,13 @@ table = selected.diagnostics["cv_table"]          # one row per candidate
 The criterion follows the model.  DDE and SemiDDE candidates are compared by
 the extended BIC of the full-data fit (`criterion="ebic"`, the default; the
 `ebic` column of the table is on the usual smaller-is-better scale, while
-`mean_score` is its negative per-observation value).  CopDDE candidates are
+`mean_score` is its negative per-observation value).  The SemiDDE likelihood
+is evaluated with the transformation the fit implies: under the model
+`g_j = F_Zj^-1 o F_Yj`, with `F_Zj` the Gaussian-mixture margin of the
+fitted DDE, so `log p(Y)` is the DDE log-likelihood of `z_ij =
+F_Zj^-1(rank_ij / (N + 1))` minus the log margin densities, up to a term
+common to all candidates (`dde.utils.hyperparameter_selection.semidde_loglik_score`).
+CopDDE candidates are
 compared by predictive synthetic-data utility (`criterion="pmse"`, the
 default): `n_repeats=25` synthetic data sets are drawn from each fit, pooled
 with the observed data, and a random forest scored by `n_splits=5`-fold

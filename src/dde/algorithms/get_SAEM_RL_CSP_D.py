@@ -459,6 +459,179 @@ def _optimize_logistic_layer(
     return np.vstack(_maybe_parallel_map(solve_row, range(K_child), n_jobs))
 
 
+class _GaussianSAStats:
+    """Stochastically averaged sufficient statistics of the Gaussian layer.
+
+    ``Q`` (Gram of ``[1, A]``), ``q`` (cross products with each ``Z_j``) and
+    ``s`` (``sum_i Z_ij^2``), each averaged over the ``C`` draws of an
+    iteration and then over iterations with step size ``alpha``.
+    """
+
+    def __init__(self, J, K_plus_1):
+        self.Q = np.zeros((K_plus_1, K_plus_1))
+        self.q = np.zeros((J, K_plus_1))
+        self.s = np.zeros(J)
+
+    def update(self, Z, A_sample, alpha):
+        N, K_plus_1, C = A_sample.shape
+        flat = np.transpose(A_sample, (0, 2, 1)).reshape(N * C, K_plus_1)
+        Q_new = flat.T @ flat / C
+        q_new = (np.mean(A_sample, axis=2).T @ Z).T
+        s_new = np.sum(Z**2, axis=0)
+        if alpha >= 1.0:
+            self.Q, self.q, self.s = Q_new, q_new, s_new
+        else:
+            self.Q = (1.0 - alpha) * self.Q + alpha * Q_new
+            self.q = (1.0 - alpha) * self.q + alpha * q_new
+            self.s = (1.0 - alpha) * self.s + alpha * s_new
+
+    def sse(self, B):
+        """Averaged residual sums of squares of every row of ``B``."""
+        return np.maximum(
+            self.s - 2.0 * np.sum(B * self.q, axis=1) + np.einsum("jk,kl,jl->j", B, self.Q, B),
+            0.0,
+        )
+
+
+class _StochasticApproximation:
+    """Stochastic-approximation averaging of the M-step objective (manuscript eq. 18, 21).
+
+    ``burn_in`` initial iterations use step size one (the current draw alone,
+    as without averaging); afterwards the Monte Carlo objective, i.e. the
+    sufficient statistics of every layer and the top-layer probabilities,
+    is averaged with step size ``1 / (t - burn_in)``.  The logistic layers
+    reuse the parametric SAEM kernel's parent-pattern accumulators.
+    """
+
+    def __init__(self, J, K, burn_in):
+        from .semi_saem import _make_bernoulli_layer_accumulator
+
+        self.burn_in = int(burn_in)
+        if self.burn_in < 0:
+            raise ValueError("sa_burn_in must be a nonnegative integer.")
+        self.gaussian = _GaussianSAStats(J, K[0] + 1)
+        self.logistic = [
+            _make_bernoulli_layer_accumulator(K[d], K[d - 1]) for d in range(1, len(K))
+        ]
+        self.p_top = None
+
+    def update(self, iteration, Z, A_sample_long, top_probabilities):
+        """Fold in the draws of ``iteration`` (1-based); returns the averaged ``prop``."""
+        t = max(1, int(iteration) - self.burn_in)
+        alpha = 1.0 / t
+        self.gaussian.update(Z, A_sample_long[0], alpha)
+        for d, accumulator in enumerate(self.logistic, start=1):
+            accumulator.update(A_sample_long[d - 1], A_sample_long[d], t)
+        top = np.asarray(top_probabilities, dtype=float)
+        self.p_top = top.copy() if (self.p_top is None or alpha >= 1.0) else (
+            (1.0 - alpha) * self.p_top + alpha * top
+        )
+        return np.mean(self.p_top, axis=0)
+
+
+def _optimize_gaussian_layer_sa(
+    stats,
+    N,
+    C,
+    B1,
+    gamma,
+    theta_or_penalty,
+    temp,
+    lb,
+    ub,
+    maxiter,
+    n_jobs,
+    penalty_kind,
+    tau,
+    observed_scale="declared",
+    support=None,
+):
+    """``_optimize_gaussian_layer`` on averaged statistics (``_GaussianSAStats``).
+
+    With a single iteration's statistics the objective equals the sample
+    version's: ``0.5 * scale * sum_{i,c} r_ic^2 / C`` with the same scale.
+    """
+    J = B1.shape[0]
+    row_lb, row_ub = _support_row_limits(lb, ub, support, J)
+    Q = stats.Q
+
+    def solve_row(j):
+        q, s = stats.q[j], stats.s[j]
+        scale = gamma[j] / temp if observed_scale == "matlab" else temp / gamma[j]
+
+        def data_value_grad(x):
+            Qx = Q @ x
+            return 0.5 * scale * float(s - 2.0 * q @ x + x @ Qx), scale * (Qx - q)
+
+        if penalty_kind == "weighted_l1":
+            weights = np.concatenate(([0.0], 1.0 / np.asarray(theta_or_penalty[j], dtype=float)))
+
+            def obj_grad(x):
+                value, grad = data_value_grad(x)
+                value += float(np.sum(weights[1:] * np.abs(x[1:])))
+                grad = grad.copy()
+                grad[1:] += weights[1:] * np.sign(x[1:])
+                return value, grad
+
+            return _bounded_minimize_value_grad(obj_grad, B1[j, :], row_lb[j], row_ub[j], maxiter=maxiter)
+
+        pen = float(theta_or_penalty)
+
+        def obj(x):
+            return data_value_grad(x)[0] + pen * _tlp(x[1:], tau)
+
+        return _bounded_minimize(obj, B1[j, :], row_lb[j], row_ub[j], maxiter=maxiter)
+
+    B_update = np.vstack(_maybe_parallel_map(solve_row, range(J), n_jobs))
+    # same Gamma(1, 1)-prior mode as the sample version, with the averaged SSE
+    gamma_update = (1.0 + 0.5 * C * stats.sse(B_update)) / (1.0 + 0.5 * N * C + 1.0)
+    return B_update, gamma_update
+
+
+def _optimize_logistic_layer_sa(
+    accumulator,
+    B_d,
+    theta_or_penalty,
+    temp,
+    lb,
+    ub,
+    maxiter,
+    n_jobs,
+    penalty_kind,
+    tau,
+    support=None,
+):
+    """``_optimize_logistic_layer`` on an averaged parent-pattern accumulator."""
+    K_child = B_d.shape[0]
+    row_lb, row_ub = _support_row_limits(lb, ub, support, K_child)
+
+    def solve_row(k):
+        def data_value_grad(x):
+            value, grad = accumulator.value_and_grad(k, x)
+            return temp * value, temp * np.asarray(grad, dtype=float)
+
+        if penalty_kind == "weighted_l1":
+            weights = np.concatenate(([0.0], 1.0 / np.asarray(theta_or_penalty[k], dtype=float)))
+
+            def obj_grad(x):
+                value, grad = data_value_grad(x)
+                value += float(np.sum(weights[1:] * np.abs(x[1:])))
+                grad = grad.copy()
+                grad[1:] += weights[1:] * np.sign(x[1:])
+                return value, grad
+
+            return _bounded_minimize_value_grad(obj_grad, B_d[k, :], row_lb[k], row_ub[k], maxiter=maxiter)
+
+        pen = float(theta_or_penalty)
+
+        def obj(x):
+            return data_value_grad(x)[0] + pen * _tlp(x[1:], tau)
+
+        return _bounded_minimize(obj, B_d[k, :], row_lb[k], row_ub[k], maxiter=maxiter)
+
+    return np.vstack(_maybe_parallel_map(solve_row, range(K_child), n_jobs))
+
+
 _update_csp_layer = update_csp_layer
 
 
@@ -485,6 +658,9 @@ def get_SAEM_RL_CSP_D(
     burn: int = 5,
     trace_callback=None,
     observed_scale: str = "declared",
+    sa_burn_in: Optional[int] = None,
+    threshold_layers: str = "first_two",
+    temper_z: bool = True,
 ):
     """MATLAB-architecture D-layer rank-likelihood SAEM with CSP shrinkage.
 
@@ -502,9 +678,27 @@ def get_SAEM_RL_CSP_D(
     ``convergence_window`` iterations, is at most ``convergence_tol``.  (The
     MATLAB routine thresholds the standard deviation of that window
     instead, which measures how steady the change is, not how small.)
+
+    ``sa_burn_in=None`` fits every M-step to the current draw alone (step
+    size one throughout, the MATLAB routine).  An integer turns on the
+    stochastic-approximation averaging of the manuscript (eq. 18, 21): after
+    ``sa_burn_in`` unit steps the likelihood part of the M-step objective and
+    the top-layer probabilities are averaged with step size
+    ``1 / (t - sa_burn_in)`` (``_StochasticApproximation``); the CSP penalty
+    uses the current shrinkage state.  ``sa_burn_in="anneal"`` starts the
+    averaging at the first iteration run at ``temp = 1``: before that every
+    iteration targets a different tempered posterior.
+
+    ``threshold_layers="all"`` applies the ``tau`` threshold to every layer
+    (manuscript Section 5.1) instead of the first two (the CopDDE code and
+    the default; Results/todo_2026-11-12/ablation, A4).  ``temper_z=False``
+    draws ``Z`` from the untempered rank likelihood (manuscript Algorithm 4)
+    while the latent draws stay tempered.
     """
     if observed_scale not in {"declared", "matlab"}:
         raise ValueError("observed_scale must be 'declared' or 'matlab'.")
+    if threshold_layers not in {"first_two", "all"}:
+        raise ValueError("threshold_layers must be 'first_two' or 'all'.")
     X = np.asarray(X)
     Z = np.asarray(Z, dtype=float).copy()
     R = np.asarray(R, dtype=float)
@@ -532,17 +726,27 @@ def get_SAEM_RL_CSP_D(
     ]
     num_act = np.array(K, dtype=int)
     rel_hist = [[] for _ in range(D)]
+    anneal_start = isinstance(sa_burn_in, str)
+    if anneal_start and sa_burn_in != "anneal":
+        raise ValueError("sa_burn_in must be None, a nonnegative integer or 'anneal'.")
+    _NOT_STARTED = 10**9
+    sa = None if sa_burn_in is None else _StochasticApproximation(
+        J, K, _NOT_STARTED if anneal_start else sa_burn_in
+    )
 
     A_sample_long = None
     ber = None
     it_num = 0
 
     while it_num < it:
+        if anneal_start and sa.burn_in == _NOT_STARTED and temp >= 1.0:
+            # the annealing has reached the untempered target: average from here
+            sa.burn_in = it_num
         ber = _update_bernoulli_probabilities_D(Z, A_list, B_list, gamma, prop, temp)
         A_sample_long = _sample_latent_layers(ber, C)
 
         mu = np.mean(A_sample_long[0], axis=2) @ B_list[0].T
-        _sample_rank_likelihood_Z(Z, mu, gamma, temp, rank_groups)
+        _sample_rank_likelihood_Z(Z, mu, gamma, temp if temper_z else 1.0, rank_groups)
 
         for d in range(D - 1, -1, -1):
             num_rows = J if d == 0 else int(num_act[d - 1])
@@ -550,37 +754,49 @@ def get_SAEM_RL_CSP_D(
                 B_list[d], omega[d], t_spike[d], theta_slab[d], num_rows
             )
 
-        prop_update = np.mean(ber[-1], axis=0)
         B_update = [None] * D
-        B_update[0], gamma_update = _optimize_gaussian_layer(
-            Z,
-            A_sample_long[0],
-            B_list[0],
-            gamma,
-            theta[0],
-            temp,
-            lb[0],
-            ub[0],
-            optimizer_maxiter,
-            n_jobs,
-            "weighted_l1",
-            tau,
-            observed_scale=observed_scale,
-        )
-        for d in range(1, D):
-            B_update[d] = _optimize_logistic_layer(
-                A_sample_long[d - 1],
-                A_sample_long[d],
-                B_list[d],
-                theta[d],
+        if sa is not None:
+            prop_update = sa.update(it_num + 1, Z, A_sample_long, ber[-1])
+            B_update[0], gamma_update = _optimize_gaussian_layer_sa(
+                sa.gaussian, N, C, B_list[0], gamma, theta[0], temp, lb[0], ub[0],
+                optimizer_maxiter, n_jobs, "weighted_l1", tau, observed_scale=observed_scale,
+            )
+            for d in range(1, D):
+                B_update[d] = _optimize_logistic_layer_sa(
+                    sa.logistic[d - 1], B_list[d], theta[d], temp, lb[d], ub[d],
+                    optimizer_maxiter, n_jobs, "weighted_l1", tau,
+                )
+        else:
+            prop_update = np.mean(ber[-1], axis=0)
+            B_update[0], gamma_update = _optimize_gaussian_layer(
+                Z,
+                A_sample_long[0],
+                B_list[0],
+                gamma,
+                theta[0],
                 temp,
-                lb[d],
-                ub[d],
+                lb[0],
+                ub[0],
                 optimizer_maxiter,
                 n_jobs,
                 "weighted_l1",
                 tau,
+                observed_scale=observed_scale,
             )
+            for d in range(1, D):
+                B_update[d] = _optimize_logistic_layer(
+                    A_sample_long[d - 1],
+                    A_sample_long[d],
+                    B_list[d],
+                    theta[d],
+                    temp,
+                    lb[d],
+                    ub[d],
+                    optimizer_maxiter,
+                    n_jobs,
+                    "weighted_l1",
+                    tau,
+                )
 
         it_num += 1
         ind_inact = []
@@ -589,7 +805,7 @@ def get_SAEM_RL_CSP_D(
             ind_inact.append(inactive)
             num_act[d] = K[d] - inactive.size
 
-        for d in range(min(2, D)):
+        for d in range(D if threshold_layers == "all" else min(2, D)):
             B_update[d][:, 1:] = _threshold(B_update[d][:, 1:], tau)
 
         for d in range(D - 1):

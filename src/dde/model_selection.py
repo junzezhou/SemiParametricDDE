@@ -30,6 +30,7 @@ from .utils.hyperparameter_selection import (
     estimate_K_list_semidde,
     normal_mixture_loglik_score,
     parametric_mixture_loglik_score,
+    semidde_loglik_score,
     simulate_copula_predictive,
 )
 
@@ -674,6 +675,13 @@ def _parametric_score(holdout, fitted, *, family):
 
 
 def _normal_score(holdout, fitted, *, model):
+    if str(model).lower() in {"semi", "semidde"}:
+        # MARK: SemiDDE candidates used to be scored by the Normal DDE
+        # mixture log-likelihood of the rank-normal scores of Y, which is not
+        # the SemiDDE likelihood.  The score is now the SemiDDE log-likelihood
+        # with the transformation implied by the fit (g_j = F_Zj^-1 o F_Yj),
+        # up to a term common to all candidates (semidde_loglik_score).
+        return semidde_loglik_score(holdout, fitted)
     return normal_mixture_loglik_score(holdout, fitted, model=model)
 
 
@@ -880,7 +888,10 @@ def select_hyperparameters(
 
     ``criterion`` defaults to ``"ebic"`` for the DDE and SemiDDE (the
     candidate with the smallest EBIC, reported in the ``"ebic"`` column of
-    ``diagnostics["cv_table"]``, is returned) and to ``"pmse"`` for the
+    ``diagnostics["cv_table"]``, is returned; the SemiDDE likelihood uses
+    the transformation the fit implies, see
+    :func:`dde.utils.hyperparameter_selection.semidde_loglik_score`) and to
+    ``"pmse"`` for the
     CopDDE (the smallest mean propensity-score MSE over ``n_repeats``
     synthetic data sets, each scored by ``n_splits``-fold cross-validated
     random forests).  ``"bic"`` and ``"loglik"`` select by ``n_splits``-fold
