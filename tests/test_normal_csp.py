@@ -276,6 +276,26 @@ def test_copula_backend_is_default_for_normal_and_shrinks_overspecified_widths()
     assert result.B_list[1].shape == (K1, K2 + 1)
 
 
+@pytest.mark.parametrize("model", ["DDE", "SemiDDE"])
+def test_csp_threshold_rule_default_and_override(model):
+    """Normal/SemiDDE CSP keep the first-two rule; "all" (manuscript) is honoured.
+
+    The A4 ablation (Results/todo_2026-11-12/ablation) found "all" better at
+    N <= 4000 but under-selecting the top layer at N = 8000, while the
+    first-two rule's width error falls with N.
+    """
+    X = _simulate_two_layer(13, N=120)
+    kwargs = dict(
+        model=model, D=2, dimension_method="csp", t_spike=[0.02, 0.04],
+        temp=0.7, tau=0.3, C=1, max_iter=2, random_state=5, verbose=False,
+    )
+    if model == "DDE":
+        kwargs["family"] = "Normal"
+    assert fit(X, **kwargs).diagnostics["threshold_rule"] == "first_two"
+    paper = fit(X, csp_threshold_rule="all", **kwargs)
+    assert paper.diagnostics["threshold_rule"] == "all"
+
+
 def test_mcem_backend_is_rejected_and_copula_initializer_still_available():
     X = _simulate_two_layer(12, N=120)
     with pytest.raises(ValueError, match="were removed"):

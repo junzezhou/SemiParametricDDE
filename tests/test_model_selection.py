@@ -693,3 +693,44 @@ def test_semidde_candidates_start_from_the_fit_initialization():
     shared = default_fit_hyperparameters("copula", "fixed", 300, 2)
     assert defaults["temp"] == COPDDE_FIXED_TEMP == shared["temp"]
     assert defaults["tol"] == shared["tol"]
+
+
+def test_semidde_loglik_score_is_the_semidde_likelihood_with_the_implied_transform():
+    """With the true parameters and a known transform, the score (which sees only
+    the ranks of Y) approaches mean_i [log p_DDE(z_i) - sum_j log f_Zj(z_ij)] from
+    the true Z, and perturbed parameters score lower."""
+    from scipy.special import expit, logsumexp
+
+    from dde.utils.hyperparameter_selection import _first_layer_mixture, semidde_loglik_score
+
+    rng = np.random.default_rng(3)
+    J, K1 = 12, 4
+    B1 = np.zeros((J, K1 + 1))
+    B1[:, 0] = -1.0
+    for j in range(J):
+        B1[j, 1 + j % K1] = 2.0
+        B1[j, 1 + (j + 1) % K1] = -0.8
+    B2 = np.column_stack([np.full(K1, -1.5), np.full(K1, 3.0)])
+    prop, gamma = np.array([0.4]), np.full(J, 0.5)
+    truth = DDEResult(model="SemiDDE", K_list=[K1, 1], prop=prop, B_list=[B1, B2], gamma=gamma)
+    N = 3000
+    A2 = (rng.random((N, 1)) < prop).astype(float)
+    A1 = (rng.random((N, K1)) < expit(np.column_stack([np.ones(N), A2]) @ B2.T)).astype(float)
+    Z = np.column_stack([np.ones(N), A1]) @ B1.T + rng.normal(size=(N, J)) * np.sqrt(gamma)
+    Y = Z.copy()
+    Y[:, :6] = np.exp(Z[:, :6])
+    Y[:, 6:] = Z[:, 6:] ** 3
+
+    patterns, pmf = _first_layer_mixture(truth, max_enum_bits=12, mc_samples=4096, random_state=0)
+    means = np.column_stack([np.ones(len(pmf)), patterns]) @ B1.T
+    log_margin = np.column_stack([
+        logsumexp(np.log(pmf)[None, :] - 0.5 * ((Z[:, j, None] - means[None, :, j]) / np.sqrt(gamma[j])) ** 2, axis=1)
+        - np.log(np.sqrt(2.0 * np.pi * gamma[j]))
+        for j in range(J)
+    ])
+    exact = parametric_mixture_loglik_score(Z, truth, family="normal") - np.mean(log_margin.sum(axis=1))
+    score = semidde_loglik_score(Y, truth)
+    assert abs(score - exact) < 0.05
+    shrunk = DDEResult(model="SemiDDE", K_list=[K1, 1], prop=prop,
+                       B_list=[np.column_stack([B1[:, 0], 0.5 * B1[:, 1:]]), B2], gamma=gamma)
+    assert semidde_loglik_score(Y, shrunk) < score - 0.5

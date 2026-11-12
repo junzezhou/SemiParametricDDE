@@ -170,14 +170,17 @@ def test_fit_method_is_a_deprecated_spelling_of_model():
         np.testing.assert_allclose(actual, expected)
 
 
-def test_fit_warns_when_dimension_method_is_omitted():
+def test_fit_requires_dimension_method():
+    """Manuscript Table 1: dimension_method is required for every fit."""
+    from dde import select_hyperparameters
+
     X, K_list, _, _ = _normal_parameters()
-    with pytest.warns(FutureWarning, match="dimension_method was not given"):
-        result = fit(
-            X, model="DDE", D=2, family="Normal", K_list=K_list,
-            pen_list=[0.0, 0.0], tau=0.3, max_it=1, verbose=False,
-        )
-    assert result.diagnostics["dimension_method"] == "fixed"
+    for model, extra in (("DDE", {"family": "Normal"}), ("SemiDDE", {}), ("CopDDE", {})):
+        with pytest.raises(ValueError, match="dimension_method is required"):
+            fit(X, model=model, D=2, K_list=K_list, max_it=1, verbose=False, **extra)
+    with pytest.raises(ValueError, match="dimension_method is required"):
+        select_hyperparameters(X, model="DDE", family="Normal", D=2, K_list=K_list,
+                               candidates={"pen_list": [1.0]}, max_it=1)
 
 
 def test_fit_common_max_iter_alias_and_conflict():

@@ -406,7 +406,7 @@ def fit_copula_dde(
             "K_list": shape.K_list,
             "original_K_list": shape.K_list,
             "backend": "csp",
-            "threshold_rule": "first_two_layers",
+            "threshold_rule": "all_layers" if kwargs.get("threshold_layers") == "all" else "first_two_layers",
         }
         compressed = compress_csp_result_components(
             prop=raw["prop"],

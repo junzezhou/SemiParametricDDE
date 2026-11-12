@@ -199,3 +199,35 @@ def test_fixed_fits_draw_latent_states_by_gibbs_sweeps_by_default():
     synchronous = fit_copula_dde(sim["X"], latent_transition="synchronous_mean_field", **args)
     assert synchronous.diagnostics["latent_transition"] == "synchronous_mean_field"
     assert synchronous.raw["p"][0].shape == (200, 6)
+
+
+def test_stochastic_approximation_option_of_the_copdde_kernels():
+    """sa_burn_in=None is the plain kernel; with a burn-in longer than the run the
+    averaged objective is the current draw's, so one iteration matches it; the
+    CSP kernel also takes 'anneal' and the manuscript's threshold / Z options."""
+    from dde.algorithms.get_SAEM_RL_CSP_D import get_SAEM_RL_CSP_D
+
+    sim, _ = _simulate(300, seed=11)
+    X = sim["X"]
+    Z, R, Rlevels = prepare_rank_likelihood_inputs(X)
+    from dde.algorithms.copula import normal_initialize_copula_dde
+
+    init = normal_initialize_copula_dde(X, [6, 2], Z=Z)
+    args = (X, Z, R, Rlevels, init["prop"], init["gamma"], init["B_list"], init["A_list"])
+    outs = []
+    for burn in (None, 1000):
+        np.random.seed(3)
+        outs.append(get_SAEM_RL_CSP_D(*args, 1, 1, [0.05, 0.1], 0.8, 0.3, verbose=False, sa_burn_in=burn))
+    for a, b in zip(outs[0]["B_list"], outs[1]["B_list"]):
+        np.testing.assert_allclose(a, b, atol=1e-8)
+    np.random.seed(3)
+    averaged = get_SAEM_RL_D(*args, 1, 0.0, 6, 1.0, [1.0, 1.0], 0.3, verbose=False, sa_burn_in=2,
+                             latent_transition="systematic_coordinate_gibbs")
+    assert averaged["it_num"] == 6
+    np.random.seed(3)
+    out = get_SAEM_RL_CSP_D(*args, 1, 4, [0.05, 0.1], 0.9, 0.3, verbose=False, sa_burn_in="anneal",
+                            threshold_layers="all", temper_z=False)
+    slopes = out["B_list"][1][:, 1:]
+    assert np.all((slopes == 0.0) | (np.abs(slopes) >= 0.3))
+    with pytest.raises(ValueError, match="threshold_layers"):
+        get_SAEM_RL_CSP_D(*args, 1, 1, [0.05, 0.1], 0.9, 0.3, verbose=False, threshold_layers="top")

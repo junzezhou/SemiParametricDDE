@@ -131,3 +131,35 @@ def test_normal_two_layer_recovery_with_oracle_labels_under_defaults():
     assert np.sqrt(np.mean((np.asarray(result.B_list[0]) - B_true[0]) ** 2)) < 0.02
     assert np.sqrt(np.mean((np.asarray(result.B_list[1]) - B_true[1]) ** 2)) < 0.5
     assert np.mean(np.asarray(result.A_list[0]) == A_true[0]) > 0.99
+
+
+def test_deep_normal_observed_layer_solver_options():
+    """D >= 3 Normal fits: 'least_squares' (default, current draw), the same on the
+    averaged statistics, and the TLP-penalized update ('rowwise')."""
+    from dde import fit
+    from dde.simulation import generate_X_normal
+
+    rng = np.random.default_rng(0)
+    K = (9, 3, 1)
+    B1 = np.zeros((27, 10)); B1[:, 0] = -1.0
+    for j in range(27):
+        B1[j, 1 + j % 9] = 2.0
+    B2 = np.zeros((9, 4)); B2[:, 0] = -1.0
+    for k in range(9):
+        B2[k, 1 + k % 3] = 2.5
+    B3 = np.column_stack([np.full(3, -1.0), np.full(3, 2.5)])
+    np.random.seed(1)
+    X, _ = generate_X_normal(300, np.array([0.5]), [B1, B2, B3], np.ones(27))
+    fits = {}
+    for solver in ("least_squares", "least_squares_averaged", "rowwise"):
+        np.random.seed(2)
+        fits[solver] = fit(X, model="DDE", family="Normal", D=3, dimension_method="fixed", K_list=list(K),
+                           max_it=4, verbose=False, fixed_observed_solver=solver)
+    np.random.seed(2)
+    default = fit(X, model="DDE", family="Normal", D=3, dimension_method="fixed", K_list=list(K),
+                  max_it=4, verbose=False)
+    for a, b in zip(default.B_list, fits["least_squares"].B_list):
+        np.testing.assert_array_equal(a, b)
+    with pytest.raises(ValueError, match="Normal fixed_observed_solver"):
+        fit(X, model="DDE", family="Normal", D=3, dimension_method="fixed", K_list=list(K),
+            max_it=1, verbose=False, fixed_observed_solver="active_set")

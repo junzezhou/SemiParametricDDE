@@ -64,17 +64,14 @@ def _resolve_model(model: Optional[str], method: Optional[str], *, stacklevel: i
 
 
 def _default_dimension_method(chosen: str, has_graph: bool, *, stacklevel: int = 3) -> str:
-    """Path taken when ``dimension_method`` is omitted (the manuscript requires it)."""
-    default = "csp" if chosen == "copula" and not has_graph else "fixed"
-    warnings.warn(
-        "dimension_method was not given; using "
-        f"dimension_method={default!r} for model={MODEL_NAMES[chosen]!r}. "
-        "Pass dimension_method='fixed' or 'csp' explicitly; omitting it "
-        "will become an error.",
-        FutureWarning,
-        stacklevel=stacklevel,
+    """``dimension_method`` is required for every fit (manuscript Table 1)."""
+    # MARK: omitting dimension_method used to select "fixed" (CopDDE: "csp",
+    # or "fixed" with G_list) with a FutureWarning; the manuscript requires it.
+    raise ValueError(
+        f"dimension_method is required for model={MODEL_NAMES[chosen]!r}: pass "
+        "dimension_method='fixed' (widths given by K_list, penalized SAEM) or "
+        "dimension_method='csp' (widths inferred by cumulative shrinkage)."
     )
-    return default
 
 
 def _pop_iteration_limit(kwargs: dict, max_it: Optional[int]) -> Optional[int]:
@@ -169,8 +166,7 @@ def fit(
     dimension_method:
         ``"fixed"`` (widths given by ``K_list``, penalized SAEM) or
         ``"csp"`` (widths inferred by cumulative shrinkage, Bayesian SAEM).
-        Omitting it is deprecated; the fit then uses ``"fixed"`` (CopDDE:
-        ``"csp"``, or ``"fixed"`` with ``G_list``) and warns.
+        Required.
     K_list:
         Layer widths ``[K_1, ..., K_D]`` from the shallowest layer to the
         deepest.  Required for ``"fixed"``.  For ``"csp"`` it is optional and
