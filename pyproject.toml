@@ -5,11 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dde"
 version = "0.1.0"
-description = "Deep Discrete Encoder models"
+description = "Deep Discrete Encoders: identifiable deep generative models with binary latent layers (parametric, semiparametric and copula formulations)"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.9"
+# Author list to be completed together with the package manuscript.
 authors = [
-  { name = "DDE contributors" }
+  { name = "The dde authors" }
+]
+keywords = ["deep discrete encoder", "latent variable model", "binary latent variables", "semiparametric", "copula", "stochastic approximation EM"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = [
   "numpy",
@@ -29,6 +39,11 @@ viz = [
   "matplotlib",
   "pandas",
 ]
+
+[project.urls]
+Homepage = "https://github.com/junzezhou/SemiParametricDDE"
+Repository = "https://github.com/junzezhou/SemiParametricDDE"
+Issues = "https://github.com/junzezhou/SemiParametricDDE/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

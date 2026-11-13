@@ -11,3 +11,6 @@ src/semidde.egg-info/
 .ipynb_checkpoints/
 
 tmp/
+
+# study outputs written by scripts/ (kept outside the repository)
+results/
